@@ -619,6 +619,57 @@ pub unsafe extern "C" fn wgpu_window_take_resize(w: *mut u32, h: *mut u32) -> c_
     )
 }
 
+/// Read the window's current frame (persistent texture) back and write it as a
+/// PNG to `path`.  For clarity inspection / real-text golden tests.
+///
+/// # Safety
+/// `path` must be a valid NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn wgpu_window_dump_png(path: *const c_char) -> c_int {
+    if path.is_null() {
+        return -1;
+    }
+    let path = match std::ffi::CStr::from_ptr(path).to_str() {
+        Ok(p) => p.to_owned(),
+        Err(_) => return -1,
+    };
+    with_window(
+        |win| {
+            let Some(tex) = win.state.persistent.as_ref() else {
+                return -1;
+            };
+            let (w, h) = win.state.persistent_size;
+            let is_bgra = matches!(
+                win.state.format,
+                wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb
+            );
+            match crate::render::texture_to_rgba(&win.state.gpu, tex, w, h) {
+                Ok(mut px) => {
+                    if is_bgra {
+                        for p in px.chunks_exact_mut(4) {
+                            p.swap(0, 2); // BGRA -> RGBA
+                        }
+                    }
+                    match crate::render::encode_png(&px, w, h)
+                        .and_then(|png| std::fs::write(&path, png).map_err(|e| e.to_string()))
+                    {
+                        Ok(()) => 0,
+                        Err(e) => {
+                            eprintln!("wgpu_window_dump_png: {e}");
+                            -1
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("wgpu_window_dump_png: {e}");
+                    -1
+                }
+            }
+        },
+        -1,
+    )
+}
+
 /// Destroy the window and release GPU/Wayland resources.
 #[no_mangle]
 pub extern "C" fn wgpu_window_close() {

@@ -125,6 +125,17 @@ DEFUN ("wgpu--demo-rgba", Fwgpu__demo_rgba, Swgpu__demo_rgba, 0, 0, 0,
   return s;
 }
 
+DEFUN ("wgpu--window-dump", Fwgpu__window_dump, Swgpu__window_dump, 1, 1, 0,
+       doc: /* Write the live window's current frame to FILE as a PNG.
+For clarity inspection / real-text golden tests.  */)
+  (Lisp_Object file)
+{
+  CHECK_STRING (file);
+  if (wgpu_window_dump_png (SSDATA (ENCODE_FILE (file))) != 0)
+    error ("wgpu--window-dump: no window or readback failed");
+  return Qt;
+}
+
 DEFUN ("wgpu--frame-rgba", Fwgpu__frame_rgba, Swgpu__frame_rgba, 0, 2, 0,
        doc: /* Return WIDTHxHEIGHT offscreen-rendered pixels as RGBA8 bytes.
 A unibyte string of WIDTH*HEIGHT*4 bytes, row-major, top-down.  WIDTH and
@@ -363,6 +374,7 @@ syms_of_wgpufns (void)
   defsubr (&Swgpu__frame_rgba);
   defsubr (&Swgpu__draw_demo);
   defsubr (&Swgpu__demo_rgba);
+  defsubr (&Swgpu__window_dump);
   defsubr (&Sxw_display_color_p);
   defsubr (&Sx_display_grayscale_p);
   defsubr (&Sx_hide_tip);
