@@ -135,9 +135,23 @@ wgpu_glyph_string_colors (struct glyph_string *s, unsigned long *fg,
     }
 }
 
-/* Draw the face box around glyph string S (flat box; raised/sunken are
-   approximated as flat for now).  This is what makes the mode line look
-   right.  */
+/* Scale a packed pixel toward white (factor>1) or black (factor<1) for the
+   3D relief edges.  */
+static unsigned long
+wgpu_scale_pixel (unsigned long p, double factor)
+{
+  int r = (int) (((p >> 16) & 0xff) * factor);
+  int g = (int) (((p >> 8) & 0xff) * factor);
+  int b = (int) ((p & 0xff) * factor);
+  r = r > 255 ? 255 : r;
+  g = g > 255 ? 255 : g;
+  b = b > 255 ? 255 : b;
+  return ((unsigned long) r << 16) | ((unsigned long) g << 8) | b;
+}
+
+/* Draw the face box around glyph string S: a flat box for FACE_SIMPLE_BOX, or
+   a 3D raised/sunken relief (light top/left, dark bottom/right, swapped when
+   sunken) otherwise.  */
 static void
 wgpu_draw_glyph_string_box (struct glyph_string *s)
 {
@@ -154,20 +168,34 @@ wgpu_draw_glyph_string_box (struct glyph_string *s)
   bool right_p = (s->nchars > 0
 		  && s->first_glyph[s->nchars - 1].right_box_line_p);
 
-  float r, g, b;
-  wgpu_unpack_pixel (s->face->box_color, &r, &g, &b);
+  unsigned long top_left, bottom_right;
+  if (s->face->box == FACE_SIMPLE_BOX)
+    top_left = bottom_right = s->face->box_color;
+  else
+    {
+      /* Derive relief colors from the face background.  */
+      unsigned long light = wgpu_scale_pixel (s->face->background, 1.4);
+      unsigned long dark = wgpu_scale_pixel (s->face->background, 0.55);
+      bool raised = (s->face->box == FACE_RAISED_BOX);
+      top_left = raised ? light : dark;
+      bottom_right = raised ? dark : light;
+    }
+
+  float tr, tg, tb, br, bg2, bb;
+  wgpu_unpack_pixel (top_left, &tr, &tg, &tb);
+  wgpu_unpack_pixel (bottom_right, &br, &bg2, &bb);
   block_input ();
-  /* Top and bottom.  */
+  /* Top (light/box) and bottom (dark/box).  */
   wgpu_window_rect ((float) left, (float) top, (float) width, (float) hwidth,
-		    r, g, b, 1.0f);
+		    tr, tg, tb, 1.0f);
   wgpu_window_rect ((float) left, (float) (top + height - hwidth),
-		    (float) width, (float) hwidth, r, g, b, 1.0f);
+		    (float) width, (float) hwidth, br, bg2, bb, 1.0f);
   if (left_p)
     wgpu_window_rect ((float) left, (float) top, (float) vwidth,
-		      (float) height, r, g, b, 1.0f);
+		      (float) height, tr, tg, tb, 1.0f);
   if (right_p)
     wgpu_window_rect ((float) (left + width - vwidth), (float) top,
-		      (float) vwidth, (float) height, r, g, b, 1.0f);
+		      (float) vwidth, (float) height, br, bg2, bb, 1.0f);
   unblock_input ();
 }
 
