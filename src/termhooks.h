@@ -615,7 +615,7 @@ struct terminal
   void (*query_frame_background_color) (struct frame *f, Emacs_Color *bgcolor);
 
 #if defined (HAVE_X_WINDOWS) || defined (HAVE_NTGUI) || defined (HAVE_PGTK) \
-  || defined (HAVE_ANDROID)
+  || defined (HAVE_ANDROID) || defined (HAVE_WGPU)
   /* On frame F, translate pixel colors to RGB values for the NCOLORS
      colors in COLORS.  Use cached information, if available.  */
 
@@ -958,6 +958,9 @@ extern struct terminal *terminal_list;
 #elif defined (HAVE_ANDROID)
 #define TERMINAL_FONT_CACHE(t)						\
   (t->type == output_android ? t->display_info.android->name_list_element : Qnil)
+#elif defined (HAVE_WGPU)
+#define TERMINAL_FONT_CACHE(t)						\
+  (t->type == output_wgpu ? t->display_info.wgpu->name_list_element : Qnil)
 #endif
 
 extern struct terminal *decode_live_terminal (Lisp_Object);

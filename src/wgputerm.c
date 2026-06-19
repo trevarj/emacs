@@ -18,6 +18,20 @@ logic -- each live hook forwards to a wgpu_* FFI call.  */
 #include "dispextern.h"
 #include "wgputerm.h"
 
+/* Chain of all wgpu displays.  */
+struct wgpu_display_info *x_display_list;
+
+/* Return a human-readable name for KEYSYM.  Called from keyboard.c.
+   M1 stub: render the numeric keysym; xkbcommon-based names land with the
+   real keyboard path in M3.  */
+char *
+get_keysym_name (int keysym)
+{
+  static char value[16];
+  sprintf (value, "%d", keysym);
+  return value;
+}
+
 /* ------------------------------------------------------------------ */
 /* Terminal hooks (struct terminal).  M0: input-drain + stubs.        */
 /* ------------------------------------------------------------------ */
