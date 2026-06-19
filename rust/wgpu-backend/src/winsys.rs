@@ -30,8 +30,14 @@ use raw_window_handle::{
 };
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState},
-    delegate_compositor, delegate_output, delegate_registry, delegate_xdg_shell,
-    delegate_xdg_window,
+    data_device_manager::{
+        data_device::{DataDevice, DataDeviceHandler},
+        data_offer::{DataOfferHandler, DragOffer},
+        data_source::{CopyPasteSource, DataSourceHandler},
+        DataDeviceManagerState, ReadPipe, WritePipe,
+    },
+    delegate_compositor, delegate_data_device, delegate_output, delegate_registry,
+    delegate_xdg_shell, delegate_xdg_window,
     output::{OutputHandler, OutputState},
     registry::{ProvidesRegistryState, RegistryState},
     registry_handlers,
@@ -52,7 +58,9 @@ use smithay_client_toolkit::{
 use wayland_client::{
     globals::registry_queue_init,
     protocol::{
-        wl_keyboard::WlKeyboard, wl_output, wl_pointer::WlPointer, wl_seat::WlSeat, wl_surface,
+        wl_data_device::WlDataDevice, wl_data_device_manager::DndAction,
+        wl_data_source::WlDataSource, wl_keyboard::WlKeyboard, wl_output,
+        wl_pointer::WlPointer, wl_seat::WlSeat, wl_surface,
     },
     Connection, EventQueue, Proxy, QueueHandle,
 };
@@ -73,6 +81,15 @@ struct GlyphEntry {
     w: f32,
     h: f32,
 }
+
+/// MIME types we offer/accept for the text clipboard, in preference order.
+const CLIPBOARD_MIME: &[&str] = &[
+    "text/plain;charset=utf-8",
+    "text/plain",
+    "UTF8_STRING",
+    "STRING",
+    "TEXT",
+];
 
 /// Build the itimerspec for key repeat: first expire after `delay_ms`, then
 /// every `rate_ms`.  Both are clamped to >= 1ms so the timer always arms.
@@ -115,6 +132,15 @@ struct WinState {
     repeat_rate_ms: u32,
     /// Currently-held repeating key: (raw keycode, keysym, unichar).
     repeat: Option<(u32, u32, u32)>,
+    /// Most recent input-event serial (needed to set the clipboard selection).
+    serial: u32,
+    /// Clipboard (CLIPBOARD selection) support.
+    data_device_manager: Option<DataDeviceManagerState>,
+    data_device: Option<DataDevice>,
+    /// The source we currently own (kept alive so we keep the selection); the
+    /// bytes we hand out when another client pastes.
+    clipboard_source: Option<CopyPasteSource>,
+    clipboard_text: Vec<u8>,
     /// Pending input events for Emacs's read_socket.
     events: VecDeque<WgpuEvent>,
     window: Window,
@@ -211,6 +237,8 @@ impl WgpuWindow {
             .find(|f| !f.is_srgb())
             .unwrap_or(caps.formats[0]);
         let alpha_mode = caps.alpha_modes[0];
+        // Clipboard manager (optional: absent on compositors without it).
+        let data_device_manager = DataDeviceManagerState::bind(&globals, &qh).ok();
         // Prefer Mailbox: it never blocks get_current_texture (which, with
         // Fifo, can stall Emacs's main thread indefinitely when the window is
         // occluded/unfocused -- a hard freeze).  Fall back to Fifo.
@@ -238,6 +266,11 @@ impl WgpuWindow {
             repeat_delay_ms: 400,
             repeat_rate_ms: 33,
             repeat: None,
+            serial: 0,
+            data_device_manager,
+            data_device: None,
+            clipboard_source: None,
+            clipboard_text: Vec::new(),
             events: VecDeque::new(),
             window,
             surface,
@@ -260,6 +293,13 @@ impl WgpuWindow {
         // Roundtrip so the compositor sends the initial configure (sizes us).
         event_queue.roundtrip(&mut state).map_err(|e| format!("roundtrip: {e}"))?;
         event_queue.roundtrip(&mut state).ok();
+
+        // Now that seats are known, create the clipboard data device.
+        if let Some(mgr) = state.data_device_manager.as_ref() {
+            if let Some(seat) = state.seat_state.seats().next() {
+                state.data_device = Some(mgr.get_data_device(&qh, &seat));
+            }
+        }
 
         // Fall back to the output's scale if no scale_factor_changed arrived.
         if state.scale <= 1 {
@@ -288,6 +328,87 @@ impl WgpuWindow {
         self.state.pump_repeat();
         Ok(())
     }
+
+    /// Take ownership of the CLIPBOARD selection with `text`.
+    fn set_clipboard(&mut self, text: &[u8]) -> bool {
+        let Some(mgr) = self.state.data_device_manager.as_ref() else { return false };
+        let Some(dd) = self.state.data_device.as_ref() else { return false };
+        let source = mgr.create_copy_paste_source(&self.qh, CLIPBOARD_MIME.iter().copied());
+        source.set_selection(dd, self.state.serial);
+        self.state.clipboard_text = text.to_vec();
+        self.state.clipboard_source = Some(source);
+        let _ = self.conn.flush();
+        true
+    }
+
+    fn disown_clipboard(&mut self) {
+        self.state.clipboard_source = None;
+        self.state.clipboard_text.clear();
+    }
+
+    /// Read the current CLIPBOARD selection as bytes.  If we own it, return our
+    /// own bytes directly (avoids a self-pipe round-trip).
+    fn get_clipboard(&mut self) -> Option<Vec<u8>> {
+        if self.state.clipboard_source.is_some() {
+            return Some(self.state.clipboard_text.clone());
+        }
+        let offer = self.state.data_device.as_ref()?.data().selection_offer()?;
+        // Pick the first MIME type the offer actually advertises.
+        let mime = offer.with_mime_types(|types| {
+            CLIPBOARD_MIME
+                .iter()
+                .find(|m| types.iter().any(|t| t == *m))
+                .map(|m| m.to_string())
+        })?;
+        let pipe = offer.receive(mime).ok()?;
+        let _ = self.conn.flush();
+        let _ = self.event_queue.roundtrip(&mut self.state);
+        Some(read_pipe_timeout(&pipe, 500))
+    }
+}
+
+/// Read all data from a clipboard pipe, non-blocking with a total timeout so a
+/// misbehaving source can never hang Emacs's main loop.
+fn read_pipe_timeout(pipe: &ReadPipe, timeout_ms: u64) -> Vec<u8> {
+    use std::os::unix::io::AsRawFd;
+    use std::time::{Duration, Instant};
+
+    let fd = pipe.as_raw_fd();
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        if flags >= 0 {
+            libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+    }
+    let mut out = Vec::new();
+    let mut tmp = [0u8; 8192];
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let mut pfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
+        let pr = unsafe {
+            libc::poll(&mut pfd, 1, remaining.as_millis().min(i32::MAX as u128) as i32)
+        };
+        if pr <= 0 {
+            break; // timeout or error
+        }
+        let n = unsafe { libc::read(fd, tmp.as_mut_ptr() as *mut libc::c_void, tmp.len()) };
+        if n == 0 {
+            break; // EOF: source closed its end
+        } else if n > 0 {
+            out.extend_from_slice(&tmp[..n as usize]);
+        } else {
+            let e = std::io::Error::last_os_error();
+            match e.raw_os_error() {
+                Some(libc::EAGAIN) | Some(libc::EINTR) => continue,
+                _ => break,
+            }
+        }
+    }
+    out
 }
 
 impl WinState {
@@ -538,7 +659,15 @@ impl SeatHandler for WinState {
     fn seat_state(&mut self) -> &mut SeatState {
         &mut self.seat_state
     }
-    fn new_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: WlSeat) {}
+    fn new_seat(&mut self, _: &Connection, qh: &QueueHandle<Self>, seat: WlSeat) {
+        // Create the clipboard data device once a seat exists (the seat may
+        // appear after the window is opened).
+        if self.data_device.is_none() {
+            if let Some(mgr) = self.data_device_manager.as_ref() {
+                self.data_device = Some(mgr.get_data_device(qh, &seat));
+            }
+        }
+    }
     fn new_capability(&mut self, _: &Connection, qh: &QueueHandle<Self>, seat: WlSeat, capability: Capability) {
         if capability == Capability::Keyboard && self.keyboard.is_none() {
             match self.seat_state.get_keyboard(qh, &seat, None) {
@@ -570,7 +699,8 @@ impl SeatHandler for WinState {
 
 impl KeyboardHandler for WinState {
     fn enter(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlKeyboard,
-             _: &wl_surface::WlSurface, _: u32, _: &[u32], _: &[Keysym]) {
+             _: &wl_surface::WlSurface, serial: u32, _: &[u32], _: &[Keysym]) {
+        self.serial = serial;
         // Keyboard focus gained -> frame focus in (cursor goes solid).
         self.events.push_back(WgpuEvent::focus(true));
     }
@@ -583,7 +713,8 @@ impl KeyboardHandler for WinState {
     }
 
     fn press_key(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlKeyboard,
-                 _: u32, event: KeyEvent) {
+                 serial: u32, event: KeyEvent) {
+        self.serial = serial;
         let ks = event.keysym.raw();
         // Modifier/lock keys are tracked via update_modifiers; they must not
         // be delivered as keystrokes (otherwise e.g. Super_L = 0xffeb arrives
@@ -705,6 +836,44 @@ impl PointerHandler for WinState {
     }
 }
 
+impl DataDeviceHandler for WinState {
+    fn enter(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataDevice,
+             _: f64, _: f64, _: &wl_surface::WlSurface) {}
+    fn leave(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataDevice) {}
+    fn motion(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataDevice, _: f64, _: f64) {}
+    fn selection(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataDevice) {
+        // A new CLIPBOARD selection is available; we read it on demand in
+        // get_clipboard, so nothing to do here.
+    }
+    fn drop_performed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataDevice) {}
+}
+
+impl DataSourceHandler for WinState {
+    fn accept_mime(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataSource,
+                   _: Option<String>) {}
+    fn send_request(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataSource,
+                    _mime: String, mut fd: WritePipe) {
+        // Another client is pasting our selection: hand over the bytes.
+        use std::io::Write;
+        let _ = fd.write_all(&self.clipboard_text);
+        let _ = fd.flush();
+        // `fd` is dropped here, closing the write end.
+    }
+    fn cancelled(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataSource) {
+        // Lost ownership (another client took the selection).
+        self.clipboard_source = None;
+        self.clipboard_text.clear();
+    }
+    fn dnd_dropped(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataSource) {}
+    fn dnd_finished(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataSource) {}
+    fn action(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataSource, _: DndAction) {}
+}
+
+impl DataOfferHandler for WinState {
+    fn source_actions(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &mut DragOffer, _: DndAction) {}
+    fn selected_action(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &mut DragOffer, _: DndAction) {}
+}
+
 impl ProvidesRegistryState for WinState {
     fn registry(&mut self) -> &mut RegistryState {
         &mut self.registry_state
@@ -717,6 +886,7 @@ delegate_output!(WinState);
 delegate_seat!(WinState);
 delegate_keyboard!(WinState);
 delegate_pointer!(WinState);
+delegate_data_device!(WinState);
 delegate_xdg_shell!(WinState);
 delegate_xdg_window!(WinState);
 delegate_registry!(WinState);
@@ -977,6 +1147,82 @@ pub unsafe extern "C" fn wgpu_window_dump_png(path: *const c_char) -> c_int {
             }
         },
         -1,
+    )
+}
+
+// Holds the last clipboard read so we can hand C a pointer that stays valid
+// until the next call (C copies it immediately into a Lisp string).
+thread_local! {
+    static CLIPBOARD_BUF: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Take ownership of the CLIPBOARD selection with `len` bytes at `data`.
+/// Returns 0 on success, -1 if clipboard is unavailable.
+///
+/// # Safety
+/// `data` must point to at least `len` readable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn wgpu_window_set_clipboard(data: *const u8, len: usize) -> c_int {
+    if data.is_null() {
+        return -1;
+    }
+    let bytes = std::slice::from_raw_parts(data, len);
+    with_window(|win| if win.set_clipboard(bytes) { 0 } else { -1 }, -1)
+}
+
+/// Read the CLIPBOARD selection.  On success writes a pointer/length into
+/// *out_ptr/*out_len (valid until the next call) and returns 0; -1 if empty.
+///
+/// # Safety
+/// `out_ptr` and `out_len` must be valid pointers.
+#[no_mangle]
+pub unsafe extern "C" fn wgpu_window_get_clipboard(
+    out_ptr: *mut *const u8,
+    out_len: *mut usize,
+) -> c_int {
+    match with_window(|win| win.get_clipboard(), None) {
+        Some(bytes) => CLIPBOARD_BUF.with(|b| {
+            let mut b = b.borrow_mut();
+            *b = bytes;
+            if !out_ptr.is_null() {
+                *out_ptr = b.as_ptr();
+            }
+            if !out_len.is_null() {
+                *out_len = b.len();
+            }
+            0
+        }),
+        None => -1,
+    }
+}
+
+/// Release our ownership of the CLIPBOARD selection.
+#[no_mangle]
+pub extern "C" fn wgpu_window_disown_clipboard() {
+    with_window(|win| win.disown_clipboard(), ());
+}
+
+/// 1 if we own the CLIPBOARD selection, else 0.
+#[no_mangle]
+pub extern "C" fn wgpu_window_owns_clipboard() -> c_int {
+    with_window(|win| win.state.clipboard_source.is_some() as c_int, 0)
+}
+
+/// 1 if a CLIPBOARD selection exists (we or another client own it), else 0.
+#[no_mangle]
+pub extern "C" fn wgpu_window_clipboard_exists() -> c_int {
+    with_window(
+        |win| {
+            let owned = win.state.clipboard_source.is_some();
+            let foreign = win
+                .state
+                .data_device
+                .as_ref()
+                .map(|d| d.data().selection_offer().is_some())
+                .unwrap_or(false);
+            (owned || foreign) as c_int
+        },
+        0,
     )
 }
 

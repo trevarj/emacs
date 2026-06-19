@@ -488,6 +488,65 @@ M1 stub: tooltips are not implemented for the wgpu backend yet.  */)
   return Qnil;
 }
 
+/* ------------------------------------------------------------------ */
+/* Clipboard (CLIPBOARD selection).  Thin shims over the Rust Wayland   */
+/* data-device clipboard; the lisp methods in term/wgpu-win.el gate     */
+/* these to the CLIPBOARD selection (PRIMARY is not yet supported).     */
+/* ------------------------------------------------------------------ */
+
+DEFUN ("wgpu-own-selection-internal", Fwgpu_own_selection_internal,
+       Swgpu_own_selection_internal, 2, 3, 0,
+       doc: /* Assert ownership of the clipboard with VALUE (a string).
+SELECTION and FRAME are accepted for compatibility; only the system
+CLIPBOARD is supported.  */)
+  (Lisp_Object selection, Lisp_Object value, Lisp_Object frame)
+{
+  CHECK_STRING (value);
+  Lisp_Object enc = ENCODE_UTF_8 (value);
+  wgpu_window_set_clipboard ((const uint8_t *) SDATA (enc),
+			     (uintptr_t) SBYTES (enc));
+  return value;
+}
+
+DEFUN ("wgpu-disown-selection-internal", Fwgpu_disown_selection_internal,
+       Swgpu_disown_selection_internal, 1, 3, 0,
+       doc: /* Release ownership of the clipboard.  */)
+  (Lisp_Object selection, Lisp_Object time_object, Lisp_Object terminal)
+{
+  wgpu_window_disown_clipboard ();
+  return Qt;
+}
+
+DEFUN ("wgpu-get-selection-internal", Fwgpu_get_selection_internal,
+       Swgpu_get_selection_internal, 2, 4, 0,
+       doc: /* Return the clipboard text, or nil if empty.  */)
+  (Lisp_Object selection_symbol, Lisp_Object target_type,
+   Lisp_Object time_stamp, Lisp_Object terminal)
+{
+  const uint8_t *ptr = NULL;
+  uintptr_t len = 0;
+  if (wgpu_window_get_clipboard (&ptr, &len) != 0 || ptr == NULL || len == 0)
+    return Qnil;
+  Lisp_Object bytes = make_unibyte_string ((const char *) ptr, (ptrdiff_t) len);
+  return code_convert_string_norecord (bytes, Qutf_8, false);
+}
+
+DEFUN ("wgpu-selection-owner-p", Fwgpu_selection_owner_p,
+       Swgpu_selection_owner_p, 0, 2, 0,
+       doc: /* Return t if this Emacs owns the clipboard.  */)
+  (Lisp_Object selection, Lisp_Object terminal)
+{
+  return wgpu_window_owns_clipboard () ? Qt : Qnil;
+}
+
+DEFUN ("wgpu-selection-exists-p", Fwgpu_selection_exists_p,
+       Swgpu_selection_exists_p, 0, 2, 0,
+       doc: /* Return t if there is a clipboard selection.  */)
+  (Lisp_Object selection, Lisp_Object terminal)
+{
+  return wgpu_window_clipboard_exists () ? Qt : Qnil;
+}
+
 void
 syms_of_wgpufns (void)
 {
@@ -513,4 +572,9 @@ syms_of_wgpufns (void)
   defsubr (&Sx_display_backing_store);
   defsubr (&Sx_display_save_under);
   defsubr (&Sx_hide_tip);
+  defsubr (&Swgpu_own_selection_internal);
+  defsubr (&Swgpu_disown_selection_internal);
+  defsubr (&Swgpu_get_selection_internal);
+  defsubr (&Swgpu_selection_owner_p);
+  defsubr (&Swgpu_selection_exists_p);
 }

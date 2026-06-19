@@ -64,6 +64,44 @@
             default-frame-alist)))
   (setq wgpu-initialized t))
 
+;;; Selection / clipboard.
+;; Backed by the Wayland data-device (system CLIPBOARD).  PRIMARY is not yet
+;; supported, so we only act on the CLIPBOARD selection; other selections are
+;; no-ops here (kept in the kill ring as usual).
+
+(declare-function wgpu-own-selection-internal "wgpufns.c"
+                  (selection value &optional frame))
+(declare-function wgpu-disown-selection-internal "wgpufns.c"
+                  (selection &optional time-object terminal))
+(declare-function wgpu-get-selection-internal "wgpufns.c"
+                  (selection-symbol target-type &optional time-stamp terminal))
+(declare-function wgpu-selection-owner-p "wgpufns.c"
+                  (&optional selection terminal))
+(declare-function wgpu-selection-exists-p "wgpufns.c"
+                  (&optional selection terminal))
+
+(cl-defmethod gui-backend-set-selection (selection value
+                                         &context (window-system wgpu))
+  (if (not (eq selection 'CLIPBOARD))
+      ;; Let the default (kill-ring) handling stand for PRIMARY/SECONDARY.
+      'foreign-selection
+    (if value
+        (wgpu-own-selection-internal selection value)
+      (wgpu-disown-selection-internal selection))))
+
+(cl-defmethod gui-backend-get-selection (selection-symbol target-type
+                                         &context (window-system wgpu))
+  (when (eq selection-symbol 'CLIPBOARD)
+    (wgpu-get-selection-internal selection-symbol target-type)))
+
+(cl-defmethod gui-backend-selection-owner-p (selection
+                                             &context (window-system wgpu))
+  (and (eq selection 'CLIPBOARD) (wgpu-selection-owner-p selection)))
+
+(cl-defmethod gui-backend-selection-exists-p (selection
+                                              &context (window-system wgpu))
+  (and (eq selection 'CLIPBOARD) (wgpu-selection-exists-p selection)))
+
 ;; Any display name maps to the wgpu backend.
 (add-to-list 'display-format-alist '(".*" . wgpu))
 

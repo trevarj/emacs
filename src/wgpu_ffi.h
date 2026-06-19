@@ -309,6 +309,39 @@ int wgpu_window_take_resize(uint32_t *w, uint32_t *h);
 int wgpu_window_dump_png(const char *path);
 
 /**
+ * Take ownership of the CLIPBOARD selection with `len` bytes at `data`.
+ * Returns 0 on success, -1 if clipboard is unavailable.
+ *
+ * # Safety
+ * `data` must point to at least `len` readable bytes.
+ */
+int wgpu_window_set_clipboard(const uint8_t *data, uintptr_t len);
+
+/**
+ * Read the CLIPBOARD selection.  On success writes a pointer/length into
+ * *out_ptr/*out_len (valid until the next call) and returns 0; -1 if empty.
+ *
+ * # Safety
+ * `out_ptr` and `out_len` must be valid pointers.
+ */
+int wgpu_window_get_clipboard(const uint8_t **out_ptr, uintptr_t *out_len);
+
+/**
+ * Release our ownership of the CLIPBOARD selection.
+ */
+void wgpu_window_disown_clipboard(void);
+
+/**
+ * 1 if we own the CLIPBOARD selection, else 0.
+ */
+int wgpu_window_owns_clipboard(void);
+
+/**
+ * 1 if a CLIPBOARD selection exists (we or another client own it), else 0.
+ */
+int wgpu_window_clipboard_exists(void);
+
+/**
  * Destroy the window and release GPU/Wayland resources.
  */
 void wgpu_window_close(void);
