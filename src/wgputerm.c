@@ -19,6 +19,7 @@ logic of its own.  See wgpu-backend-plan.md.  */
 #include "dispextern.h"
 #include "font.h"
 #include "fontset.h"
+#include "composite.h"
 #include "wgputerm.h"
 
 /* Chain of all wgpu displays.  */
@@ -199,6 +200,90 @@ wgpu_draw_glyph_string_box (struct glyph_string *s)
   unblock_input ();
 }
 
+/* Draw the component glyphs of a composition at their composed positions
+   (combining marks, ligatures, complex scripts).  Ported from
+   pgtk_draw_composite_glyph_string_foreground.  */
+static void
+wgpu_draw_composite_glyph_string_foreground (struct glyph_string *s)
+{
+  int i, j, x;
+  struct font *font = s->font;
+
+  if (s->face && s->face->box != FACE_NO_BOX
+      && s->first_glyph->left_box_line_p)
+    x = s->x + max (s->face->box_vertical_line_width, 0);
+  else
+    x = s->x;
+
+  if (s->font_not_found_p)
+    {
+      /* Outline box for an unloadable composition.  */
+      if (s->cmp_from == 0)
+	{
+	  float r, g, b;
+	  wgpu_unpack_pixel (s->face->foreground, &r, &g, &b);
+	  int w = s->width - 1, h = s->height - 1;
+	  wgpu_window_rect ((float) x, (float) s->y, (float) w, 1.0f, r, g, b, 1.0f);
+	  wgpu_window_rect ((float) x, (float) (s->y + h), (float) w, 1.0f, r, g, b, 1.0f);
+	  wgpu_window_rect ((float) x, (float) s->y, 1.0f, (float) h, r, g, b, 1.0f);
+	  wgpu_window_rect ((float) (x + w), (float) s->y, 1.0f, (float) h, r, g, b, 1.0f);
+	}
+    }
+  else if (!s->first_glyph->u.cmp.automatic)
+    {
+      int y = s->ybase;
+      for (i = 0, j = s->cmp_from; i < s->nchars; i++, j++)
+	if (COMPOSITION_GLYPH (s->cmp, j) != '\t')
+	  {
+	    int xx = x + s->cmp->offsets[j * 2];
+	    int yy = y - s->cmp->offsets[j * 2 + 1];
+	    font->driver->draw (s, j, j + 1, xx, yy, false);
+	    if (s->face->overstrike)
+	      font->driver->draw (s, j, j + 1, xx + 1, yy, false);
+	  }
+    }
+  else
+    {
+      Lisp_Object gstring = composition_gstring_from_id (s->cmp_id);
+      Lisp_Object glyph;
+      int y = s->ybase;
+      int width = 0;
+
+      for (i = j = s->cmp_from; i < s->cmp_to; i++)
+	{
+	  glyph = LGSTRING_GLYPH (gstring, i);
+	  if (NILP (LGLYPH_ADJUSTMENT (glyph)))
+	    width += LGLYPH_WIDTH (glyph);
+	  else
+	    {
+	      int xoff, yoff, wadjust;
+	      if (j < i)
+		{
+		  font->driver->draw (s, j, i, x, y, false);
+		  if (s->face->overstrike)
+		    font->driver->draw (s, j, i, x + 1, y, false);
+		  x += width;
+		}
+	      xoff = LGLYPH_XOFF (glyph);
+	      yoff = LGLYPH_YOFF (glyph);
+	      wadjust = LGLYPH_WADJUST (glyph);
+	      font->driver->draw (s, i, i + 1, x + xoff, y + yoff, false);
+	      if (s->face->overstrike)
+		font->driver->draw (s, i, i + 1, x + xoff + 1, y + yoff, false);
+	      x += wadjust;
+	      j = i + 1;
+	      width = 0;
+	    }
+	}
+      if (j < i)
+	{
+	  font->driver->draw (s, j, i, x, y, false);
+	  if (s->face->overstrike)
+	    font->driver->draw (s, j, i, x + 1, y, false);
+	}
+    }
+}
+
 static void
 wgpu_draw_glyph_string (struct glyph_string *s)
 {
@@ -229,7 +314,9 @@ wgpu_draw_glyph_string (struct glyph_string *s)
 
 	/* Glyphs (background already drawn above).  */
 	struct font *font = s->font;
-	if (font && font->driver && font->driver->draw)
+	if (s->first_glyph->type == COMPOSITE_GLYPH)
+	  wgpu_draw_composite_glyph_string_foreground (s);
+	else if (font && font->driver && font->driver->draw)
 	  {
 	    int y = s->ybase - font->baseline_offset;
 	    font->driver->draw (s, 0, s->nchars, s->x, y, false);
