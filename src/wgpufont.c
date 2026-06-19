@@ -43,6 +43,12 @@ struct wgpu_glyph
   int left, top;    /* FreeType bitmap bearings */
   int width, height;
   int advance;      /* pen advance in pixels */
+  /* Cached text metrics (mvalid: 0 unknown, 1 valid, 2 invalid code).  These
+     are computed with the autohinter, never the TrueType bytecode interpreter
+     -- TT_RunIns can be pathologically slow and freezes redisplay/mouse
+     position calculations (which call text_extents per glyph, uncached).  */
+  signed char mvalid;
+  int m_advance, m_lbearing, m_rbearing, m_ascent, m_descent;
 };
 
 static Lisp_Object
@@ -74,7 +80,10 @@ wgpufont_open (struct frame *f, Lisp_Object entity, int pixel_size)
   unsigned n = (face->num_glyphs > 0) ? (unsigned) face->num_glyphs : 256;
   struct wgpu_glyph *cache = xnmalloc (n, sizeof *cache);
   for (unsigned i = 0; i < n; i++)
-    cache[i].id = -1;
+    {
+      cache[i].id = -1;
+      cache[i].mvalid = 0;
+    }
   info->glyph_cache = cache;
   info->glyph_cache_size = n;
 
@@ -108,7 +117,9 @@ wgpufont_get_glyph (struct font_info *info, unsigned code)
 
   FT_Face face = info->ft_size->face;
   FT_Activate_Size (info->ft_size);
-  if (FT_Load_Glyph (face, code, FT_LOAD_RENDER) != 0)
+  /* FORCE_AUTOHINT: never run the font's TrueType bytecode (TT_RunIns),
+     which can hang; keeps advances consistent with wgpufont_text_extents.  */
+  if (FT_Load_Glyph (face, code, FT_LOAD_RENDER | FT_LOAD_FORCE_AUTOHINT) != 0)
     return NULL;
 
   FT_GlyphSlot g = face->glyph;
@@ -198,6 +209,73 @@ wgpufont_draw (struct glyph_string *s, int from, int to, int x, int y,
   return len;
 }
 
+/* Cached glyph metrics, computed with the autohinter (no TT bytecode).  */
+static struct wgpu_glyph *
+wgpufont_metrics (struct font_info *info, unsigned code)
+{
+  if (!info->glyph_cache || code >= info->glyph_cache_size)
+    return NULL;
+  struct wgpu_glyph *gc = &((struct wgpu_glyph *) info->glyph_cache)[code];
+  if (gc->mvalid)
+    return gc->mvalid == 1 ? gc : NULL;
+
+  FT_Face face = info->ft_size->face;
+  FT_Activate_Size (info->ft_size);
+  if (FT_Load_Glyph (face, code, FT_LOAD_FORCE_AUTOHINT) != 0)
+    {
+      gc->mvalid = 2;
+      return NULL;
+    }
+  FT_Glyph_Metrics *m = &face->glyph->metrics;
+  gc->m_advance = m->horiAdvance >> 6;
+  gc->m_lbearing = m->horiBearingX >> 6;
+  gc->m_rbearing = (m->horiBearingX + m->width) >> 6;
+  gc->m_ascent = m->horiBearingY >> 6;
+  gc->m_descent = (m->height - m->horiBearingY) >> 6;
+  gc->mvalid = 1;
+  return gc;
+}
+
+/* Like ftfont_text_extents but using cached, autohinted metrics so it never
+   runs the (potentially hanging) TrueType bytecode interpreter.  */
+static void
+wgpufont_text_extents (struct font *font, const unsigned int *code,
+		       int nglyphs, struct font_metrics *metrics)
+{
+  struct font_info *info = (struct font_info *) font;
+  int width = 0;
+  bool first = true;
+
+  memset (metrics, 0, sizeof *metrics);
+  for (int i = 0; i < nglyphs; i++)
+    {
+      struct wgpu_glyph *gc = wgpufont_metrics (info, code[i]);
+      if (gc)
+	{
+	  if (first)
+	    {
+	      metrics->lbearing = gc->m_lbearing;
+	      metrics->rbearing = gc->m_rbearing;
+	      metrics->ascent = gc->m_ascent;
+	      metrics->descent = gc->m_descent;
+	      first = false;
+	    }
+	  if (metrics->lbearing > width + gc->m_lbearing)
+	    metrics->lbearing = width + gc->m_lbearing;
+	  if (metrics->rbearing < width + gc->m_rbearing)
+	    metrics->rbearing = width + gc->m_rbearing;
+	  if (metrics->ascent < gc->m_ascent)
+	    metrics->ascent = gc->m_ascent;
+	  if (metrics->descent > gc->m_descent)
+	    metrics->descent = gc->m_descent;
+	  width += gc->m_advance;
+	}
+      else
+	width += font->space_width;
+    }
+  metrics->width = width;
+}
+
 void
 register_wgpufont_driver (struct frame *f)
 {
@@ -216,7 +294,7 @@ syms_of_wgpufont_for_pdumper (void)
   wgpu_font_driver.close_font = wgpufont_close;
   wgpu_font_driver.has_char = ftfont_has_char;
   wgpu_font_driver.encode_char = ftfont_encode_char;
-  wgpu_font_driver.text_extents = ftfont_text_extents;
+  wgpu_font_driver.text_extents = wgpufont_text_extents;
   wgpu_font_driver.draw = wgpufont_draw;
   wgpu_font_driver.get_bitmap = ftfont_get_bitmap;
   wgpu_font_driver.anchor_point = ftfont_anchor_point;
