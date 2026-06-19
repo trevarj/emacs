@@ -134,7 +134,13 @@ wgpufont_get_glyph (struct font_info *info, unsigned code)
   int64_t id = wgpu_window_atlas_upload (w, h, buf, (size_t) w * h);
   xfree (buf);
   if (id < 0)
-    return NULL;
+    {
+      /* Atlas full (or upload failed): cache as "skip" so we don't
+	 re-rasterize and re-attempt every redisplay, which would grind
+	 redisplay to a halt.  The advance is still set, so layout is fine.  */
+      gc->id = -2;
+      return gc;
+    }
   gc->id = id;
   return gc;
 }

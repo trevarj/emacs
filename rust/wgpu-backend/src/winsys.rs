@@ -36,7 +36,7 @@ use smithay_client_toolkit::{
     registry::{ProvidesRegistryState, RegistryState},
     registry_handlers,
     seat::{
-        keyboard::{KeyEvent, KeyboardHandler, Keysym, Modifiers},
+        keyboard::{KeyEvent, KeyboardHandler, Keysym, Modifiers, RepeatInfo},
         pointer::{PointerEvent, PointerEventKind, PointerHandler, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT},
         Capability, SeatHandler, SeatState,
     },
@@ -74,6 +74,19 @@ struct GlyphEntry {
     h: f32,
 }
 
+/// Build the itimerspec for key repeat: first expire after `delay_ms`, then
+/// every `rate_ms`.  Both are clamped to >= 1ms so the timer always arms.
+fn repeat_itimerspec(delay_ms: u32, rate_ms: u32) -> libc::itimerspec {
+    let to_ts = |ms: u32| libc::timespec {
+        tv_sec: (ms / 1000) as libc::time_t,
+        tv_nsec: ((ms % 1000) * 1_000_000) as libc::c_long,
+    };
+    libc::itimerspec {
+        it_interval: to_ts(rate_ms.max(1)),
+        it_value: to_ts(delay_ms.max(1)),
+    }
+}
+
 /// True for X/xkb modifier and lock keysyms, which must not be delivered as
 /// keystrokes (their state is tracked via update_modifiers).
 fn is_modifier_keysym(ks: u32) -> bool {
@@ -95,6 +108,13 @@ struct WinState {
     pointer_pos: (i32, i32),
     /// Current modifier mask (WGPU_MOD_*).
     mods: u32,
+    /// Key repeat (Wayland delegates auto-repeat to the client).  We use a
+    /// timerfd that Emacs selects on; when it fires we re-emit the held key.
+    timer_fd: i32,
+    repeat_delay_ms: u32,
+    repeat_rate_ms: u32,
+    /// Currently-held repeating key: (raw keycode, keysym, unichar).
+    repeat: Option<(u32, u32, u32)>,
     /// Pending input events for Emacs's read_socket.
     events: VecDeque<WgpuEvent>,
     window: Window,
@@ -103,6 +123,7 @@ struct WinState {
     renderer: Renderer,
     format: wgpu::TextureFormat,
     alpha_mode: wgpu::CompositeAlphaMode,
+    present_mode: wgpu::PresentMode,
     /// Persistent frame texture, preserved across incremental updates.
     persistent: Option<wgpu::Texture>,
     persistent_size: (u32, u32),
@@ -190,6 +211,14 @@ impl WgpuWindow {
             .find(|f| !f.is_srgb())
             .unwrap_or(caps.formats[0]);
         let alpha_mode = caps.alpha_modes[0];
+        // Prefer Mailbox: it never blocks get_current_texture (which, with
+        // Fifo, can stall Emacs's main thread indefinitely when the window is
+        // occluded/unfocused -- a hard freeze).  Fall back to Fifo.
+        let present_mode = if caps.present_modes.contains(&wgpu::PresentMode::Mailbox) {
+            wgpu::PresentMode::Mailbox
+        } else {
+            wgpu::PresentMode::Fifo
+        };
         let renderer = Renderer::new(&gpu, format);
 
         let mut state = WinState {
@@ -200,6 +229,15 @@ impl WgpuWindow {
             pointer: None,
             pointer_pos: (0, 0),
             mods: 0,
+            // CLOCK_MONOTONIC, non-blocking so draining never stalls Emacs.
+            timer_fd: unsafe {
+                libc::timerfd_create(libc::CLOCK_MONOTONIC,
+                                     libc::TFD_NONBLOCK | libc::TFD_CLOEXEC)
+            },
+            // Sensible defaults until the compositor sends repeat_info.
+            repeat_delay_ms: 400,
+            repeat_rate_ms: 33,
+            repeat: None,
             events: VecDeque::new(),
             window,
             surface,
@@ -207,6 +245,7 @@ impl WgpuWindow {
             renderer,
             format,
             alpha_mode,
+            present_mode,
             persistent: None,
             persistent_size: (0, 0),
             size: (800, 600),
@@ -245,11 +284,53 @@ impl WgpuWindow {
         self.event_queue
             .dispatch_pending(&mut self.state)
             .map_err(|e| format!("dispatch: {e}"))?;
+        // Drain the key-repeat timerfd (it may be why Emacs woke us).
+        self.state.pump_repeat();
         Ok(())
     }
 }
 
 impl WinState {
+    /// Arm the repeat timerfd: first fire after `delay`, then every `rate` ms.
+    fn arm_repeat(&self) {
+        if self.timer_fd < 0 {
+            return;
+        }
+        let spec = repeat_itimerspec(self.repeat_delay_ms, self.repeat_rate_ms);
+        unsafe { libc::timerfd_settime(self.timer_fd, 0, &spec, std::ptr::null_mut()) };
+    }
+
+    /// Disarm the repeat timerfd (no more repeats) and forget the held key.
+    fn disarm_repeat(&mut self) {
+        self.repeat = None;
+        if self.timer_fd < 0 {
+            return;
+        }
+        let spec: libc::itimerspec = unsafe { std::mem::zeroed() };
+        unsafe { libc::timerfd_settime(self.timer_fd, 0, &spec, std::ptr::null_mut()) };
+    }
+
+    /// Drain the repeat timerfd; for each expiration, re-emit the held key.
+    fn pump_repeat(&mut self) {
+        if self.timer_fd < 0 {
+            return;
+        }
+        let mut buf = [0u8; 8];
+        let n = unsafe {
+            libc::read(self.timer_fd, buf.as_mut_ptr() as *mut libc::c_void, 8)
+        };
+        if n != 8 {
+            return; // EAGAIN (not fired) or error
+        }
+        let expirations = u64::from_ne_bytes(buf);
+        if let Some((_, ks, unichar)) = self.repeat {
+            // Cap bursts so a stalled main loop doesn't flood the queue.
+            for _ in 0..expirations.min(4) {
+                self.events.push_back(WgpuEvent::key(ks, unichar, self.mods));
+            }
+        }
+    }
+
     fn configure_surface(&mut self) {
         let config = wgpu::SurfaceConfiguration {
             // COPY_DST so we can copy the persistent texture into the frame.
@@ -257,7 +338,7 @@ impl WinState {
             format: self.format,
             width: self.size.0.max(1),
             height: self.size.1.max(1),
-            present_mode: wgpu::PresentMode::Fifo,
+            present_mode: self.present_mode,
             alpha_mode: self.alpha_mode,
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
@@ -491,7 +572,10 @@ impl KeyboardHandler for WinState {
     fn enter(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlKeyboard,
              _: &wl_surface::WlSurface, _: u32, _: &[u32], _: &[Keysym]) {}
     fn leave(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlKeyboard,
-             _: &wl_surface::WlSurface, _: u32) {}
+             _: &wl_surface::WlSurface, _: u32) {
+        // Lost focus: stop repeating so a held key doesn't keep firing.
+        self.disarm_repeat();
+    }
 
     fn press_key(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlKeyboard,
                  _: u32, event: KeyEvent) {
@@ -509,10 +593,35 @@ impl KeyboardHandler for WinState {
             .map(|c| c as u32)
             .unwrap_or(0);
         self.events.push_back(WgpuEvent::key(ks, unichar, self.mods));
+        // Begin auto-repeat for this key (Wayland leaves repeat to the client).
+        if self.repeat_rate_ms > 0 {
+            self.repeat = Some((event.raw_code, ks, unichar));
+            self.arm_repeat();
+        }
     }
 
     fn release_key(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlKeyboard,
-                   _: u32, _: KeyEvent) {}
+                   _: u32, event: KeyEvent) {
+        // Only stop repeating if the released key is the one repeating; this
+        // keeps a newer held key repeating if an older one is let go.
+        if matches!(self.repeat, Some((rc, _, _)) if rc == event.raw_code) {
+            self.disarm_repeat();
+        }
+    }
+
+    fn update_repeat_info(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlKeyboard,
+                          info: RepeatInfo) {
+        match info {
+            RepeatInfo::Repeat { rate, delay } => {
+                self.repeat_rate_ms = (1000 / rate.get()).max(1);
+                self.repeat_delay_ms = delay;
+            }
+            RepeatInfo::Disable => {
+                self.repeat_rate_ms = 0;
+                self.disarm_repeat();
+            }
+        }
+    }
 
     fn update_modifiers(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlKeyboard,
                         _: u32, modifiers: Modifiers, _: u32) {
@@ -644,6 +753,13 @@ pub unsafe extern "C" fn wgpu_window_open(title: *const c_char) -> c_int {
 #[no_mangle]
 pub extern "C" fn wgpu_window_fd() -> c_int {
     with_window(|win| win.conn.backend().poll_fd().as_raw_fd(), -1)
+}
+
+/// Key-repeat timerfd for Emacs to select on (so it wakes to emit repeats).
+/// -1 if unavailable.
+#[no_mangle]
+pub extern "C" fn wgpu_window_timer_fd() -> c_int {
+    with_window(|win| win.state.timer_fd, -1)
 }
 
 /// Process pending Wayland events. Returns 1 if the compositor asked the
@@ -863,4 +979,52 @@ pub unsafe extern "C" fn wgpu_window_dump_png(path: *const c_char) -> c_int {
 #[no_mangle]
 pub extern "C" fn wgpu_window_close() {
     WINDOW.with(|w| *w.borrow_mut() = None);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::repeat_itimerspec;
+
+    #[test]
+    fn itimerspec_splits_milliseconds() {
+        let s = repeat_itimerspec(1500, 33);
+        assert_eq!(s.it_value.tv_sec, 1);
+        assert_eq!(s.it_value.tv_nsec, 500 * 1_000_000);
+        assert_eq!(s.it_interval.tv_sec, 0);
+        assert_eq!(s.it_interval.tv_nsec, 33 * 1_000_000);
+    }
+
+    #[test]
+    fn zero_clamps_to_one_ms() {
+        let s = repeat_itimerspec(0, 0);
+        assert_eq!(s.it_value.tv_nsec, 1_000_000);
+        assert_eq!(s.it_interval.tv_nsec, 1_000_000);
+    }
+
+    // End-to-end of the OS mechanism we rely on for repeat: arm a timerfd the
+    // same way arm_repeat does, and confirm it fires repeatedly so pump_repeat
+    // can drain it.
+    #[test]
+    fn timerfd_arms_and_repeats() {
+        let fd = unsafe {
+            libc::timerfd_create(libc::CLOCK_MONOTONIC,
+                                 libc::TFD_NONBLOCK | libc::TFD_CLOEXEC)
+        };
+        assert!(fd >= 0, "timerfd_create failed");
+        let spec = repeat_itimerspec(30, 20);
+        let rc = unsafe { libc::timerfd_settime(fd, 0, &spec, std::ptr::null_mut()) };
+        assert_eq!(rc, 0, "timerfd_settime failed");
+
+        // Before the delay elapses it has not fired (non-blocking read => EAGAIN).
+        let mut buf = [0u8; 8];
+        let early = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, 8) };
+        assert!(early < 0, "timer fired too early");
+
+        std::thread::sleep(std::time::Duration::from_millis(120));
+        let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, 8) };
+        assert_eq!(n, 8, "expected an expiration count");
+        let count = u64::from_ne_bytes(buf);
+        assert!(count >= 1, "timer should have fired, got {count}");
+        unsafe { libc::close(fd) };
+    }
 }

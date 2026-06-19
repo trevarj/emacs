@@ -17,7 +17,9 @@ use bytemuck::{Pod, Zeroable};
 
 use crate::render::{create_target, texture_to_rgba, Gpu};
 
-const ATLAS_SIZE: u32 = 1024;
+// 2048² R8 coverage atlas (~4 MiB): enough headroom for many fonts/sizes
+// (bold, italic, multiple scales) before the shelf packer fills up.
+const ATLAS_SIZE: u32 = 2048;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
