@@ -37,8 +37,48 @@ Used by the wgpu backend's golden-image test harness.  */)
   return Qnil;
 }
 
+/* Return the wgpu display info for OBJECT (a frame, terminal, display name,
+   or nil for the default).  Signals if there is no wgpu display.
+   M1 stub: only the default display is supported.  */
+struct wgpu_display_info *
+check_x_display_info (Lisp_Object object)
+{
+  if (!x_display_list)
+    error ("There is no wgpu display");
+  return x_display_list;
+}
+
+DEFUN ("xw-display-color-p", Fxw_display_color_p, Sxw_display_color_p, 0, 1, 0,
+       doc: /* Return t if the display supports color.
+M1 stub: the wgpu backend always reports a color display.  */)
+  (Lisp_Object terminal)
+{
+  return Qt;
+}
+
+DEFUN ("x-display-grayscale-p", Fx_display_grayscale_p, Sx_display_grayscale_p,
+       0, 1, 0,
+       doc: /* Return t if the display supports shades of gray.
+M1 stub.  */)
+  (Lisp_Object terminal)
+{
+  return Qnil;
+}
+
+DEFUN ("x-hide-tip", Fx_hide_tip, Sx_hide_tip, 0, 0, 0,
+       doc: /* Hide the current tooltip window, if there is any.
+Value is t if tooltip was open, nil otherwise.
+M1 stub: tooltips are not implemented for the wgpu backend yet.  */)
+  (void)
+{
+  return Qnil;
+}
+
 void
 syms_of_wgpufns (void)
 {
   defsubr (&Swgpu_dump_frame);
+  defsubr (&Sxw_display_color_p);
+  defsubr (&Sx_display_grayscale_p);
+  defsubr (&Sx_hide_tip);
 }

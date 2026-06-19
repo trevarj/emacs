@@ -657,6 +657,7 @@ struct frame
     struct w32_output *w32;		/* From w32term.h.  */
     struct ns_output *ns;		/* From nsterm.h.  */
     struct pgtk_output *pgtk;		/* From pgtkterm.h. */
+    struct wgpu_output *wgpu;		/* From wgputerm.h. */
     struct haiku_output *haiku;		/* From haikuterm.h. */
     struct android_output *android;	/* From androidterm.h.  */
   }

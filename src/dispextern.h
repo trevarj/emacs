@@ -157,6 +157,16 @@ typedef XImagePtr XImagePtr_or_DC;
 #ifdef HAVE_WGPU
 #include "wgpugui.h"
 typedef struct wgpu_display_info Display_Info;
+/* In-memory image, like the USE_CAIRO path: the wgpu backend uploads these
+   to GPU textures rather than handing them to a server.  */
+typedef struct
+{
+  int width, height;		/* size of image */
+  char *data;			/* pointer to image data */
+  int bytes_per_line;		/* accelerator to next line */
+  int bits_per_pixel;		/* bits per pixel (ZPixmap) */
+} *Emacs_Pix_Container;
+typedef Emacs_Pix_Container Emacs_Pixmap;
 typedef Emacs_Pixmap XImagePtr;
 typedef XImagePtr XImagePtr_or_DC;
 #endif /* HAVE_WGPU */
@@ -3757,7 +3767,7 @@ ptrdiff_t lookup_image (struct frame *, Lisp_Object, int);
 Lisp_Object image_spec_value (Lisp_Object, Lisp_Object, bool *);
 
 #if defined HAVE_X_WINDOWS || defined USE_CAIRO || defined HAVE_NS \
-  || defined HAVE_HAIKU || defined HAVE_ANDROID
+  || defined HAVE_HAIKU || defined HAVE_ANDROID || defined HAVE_WGPU
 #define RGB_PIXEL_COLOR unsigned long
 #endif
 

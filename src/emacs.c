@@ -2431,6 +2431,12 @@ Using an Emacs configured with --with-x-toolkit=lucid does not have this problem
       syms_of_fontset ();
       syms_of_xsettings ();
 #endif /* HAVE_PGTK */
+#ifdef HAVE_WGPU
+      syms_of_wgputerm ();
+      syms_of_wgpufns ();
+      syms_of_wgpufont ();
+      syms_of_fontset ();
+#endif /* HAVE_WGPU */
 #ifdef HAVE_HAIKU
       syms_of_haikuterm ();
       syms_of_haikufns ();
