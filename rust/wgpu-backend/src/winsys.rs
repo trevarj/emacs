@@ -1108,6 +1108,25 @@ pub extern "C" fn wgpu_window_present() {
     with_window(|win| win.state.present(), ());
 }
 
+/// Set the window (xdg_toplevel) title.  `title` is a NUL-terminated C string.
+///
+/// # Safety
+/// `title` must be a valid NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn wgpu_window_set_title(title: *const c_char) {
+    if title.is_null() {
+        return;
+    }
+    let t = std::ffi::CStr::from_ptr(title).to_string_lossy().into_owned();
+    with_window(
+        |win| {
+            win.state.window.set_title(&t);
+            let _ = win.conn.flush();
+        },
+        (),
+    );
+}
+
 /// Set the pointer cursor shape (codes match the C `wgpu_cursor_shape` enum).
 #[no_mangle]
 pub extern "C" fn wgpu_window_set_cursor(code: c_int) {

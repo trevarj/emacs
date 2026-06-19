@@ -284,6 +284,14 @@ void wgpu_window_glyph(int64_t id, float x, float y, float r, float g, float b, 
 void wgpu_window_present(void);
 
 /**
+ * Set the window (xdg_toplevel) title.  `title` is a NUL-terminated C string.
+ *
+ * # Safety
+ * `title` must be a valid NUL-terminated C string.
+ */
+void wgpu_window_set_title(const char *title);
+
+/**
  * Set the pointer cursor shape (codes match the C `wgpu_cursor_shape` enum).
  */
 void wgpu_window_set_cursor(int code);

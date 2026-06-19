@@ -671,6 +671,72 @@ wgpu_set_cursor_color (struct frame *f, Lisp_Object arg, Lisp_Object oldval)
     }
 }
 
+/* ---- Frame name / title (xdg_toplevel.set_title) ---------------------- */
+
+static void
+wgpu_set_name_internal (struct frame *f, Lisp_Object name)
+{
+  Lisp_Object encoded = ENCODE_UTF_8 (name);
+  block_input ();
+  wgpu_window_set_title (SSDATA (encoded));
+  unblock_input ();
+}
+
+static void
+wgpu_set_name (struct frame *f, Lisp_Object name, int explicit)
+{
+  /* Lisp requests override redisplay requests.  */
+  if (explicit)
+    {
+      if (f->explicit_name && NILP (name))
+	update_mode_lines = 12;
+      f->explicit_name = !NILP (name);
+    }
+  else if (f->explicit_name)
+    return;
+
+  if (NILP (name))
+    name = build_string ("GNU Emacs");
+  else
+    CHECK_STRING (name);
+
+  if (!NILP (Fstring_equal (name, f->name)))
+    return;
+
+  fset_name (f, name);
+
+  /* Title overrides explicit name.  */
+  if (!NILP (f->title))
+    name = f->title;
+  wgpu_set_name_internal (f, name);
+}
+
+static void
+wgpu_explicitly_set_name (struct frame *f, Lisp_Object arg, Lisp_Object oldval)
+{
+  wgpu_set_name (f, arg, true);
+}
+
+static void
+wgpu_implicitly_set_name (struct frame *f, Lisp_Object arg, Lisp_Object oldval)
+{
+  wgpu_set_name (f, arg, false);
+}
+
+static void
+wgpu_set_title (struct frame *f, Lisp_Object name, Lisp_Object old_name)
+{
+  if (EQ (name, f->title))
+    return;
+  update_mode_lines = 22;
+  fset_title (f, name);
+  if (NILP (name))
+    name = f->name;
+  else
+    CHECK_STRING (name);
+  wgpu_set_name_internal (f, name);
+}
+
 /* Positional, indexed by frame parameter (mirrors pgtk_frame_parm_handlers).
    gui_set_* are the shared generic handlers; backend-specific decorations are
    NULL at M2.  */
@@ -692,10 +758,10 @@ frame_parm_handler wgpu_frame_parm_handlers[] = {
   gui_set_bottom_divider_width,
   NULL,				/* menu_bar_lines */
   NULL,				/* mouse_color */
-  NULL,				/* explicitly_set_name */
+  wgpu_explicitly_set_name,
   gui_set_scroll_bar_width,
   gui_set_scroll_bar_height,
-  NULL,				/* title */
+  wgpu_set_title,
   gui_set_unsplittable,
   gui_set_vertical_scroll_bars,
   gui_set_horizontal_scroll_bars,
@@ -1144,6 +1210,7 @@ wgpu_create_terminal (struct wgpu_display_info *dpyinfo)
   terminal->read_socket_hook = wgpu_read_socket;
   terminal->mouse_position_hook = wgpu_mouse_position;
   terminal->frame_rehighlight_hook = wgpu_frame_rehighlight_hook;
+  terminal->implicit_set_name_hook = wgpu_implicitly_set_name;
   terminal->frame_up_to_date_hook = wgpu_frame_up_to_date;
   terminal->delete_terminal_hook = wgpu_delete_terminal;
   terminal->get_string_resource_hook = wgpu_get_string_resource;
