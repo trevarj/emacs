@@ -284,6 +284,90 @@ wgpu_draw_composite_glyph_string_foreground (struct glyph_string *s)
     }
 }
 
+/* Draw glyphless characters (undisplayable codepoints / control chars) as a
+   thin box optionally containing the hex code or an acronym, like the other
+   backends.  Ported from pgtk_draw_glyphless_glyph_string_foreground.  */
+static void
+wgpu_draw_glyphless_glyph_string_foreground (struct glyph_string *s)
+{
+  struct glyph *glyph = s->first_glyph;
+  unsigned char2b[8];
+  int x, i, j;
+
+  if (s->face && s->face->box != FACE_NO_BOX
+      && s->first_glyph->left_box_line_p)
+    x = s->x + max (s->face->box_vertical_line_width, 0);
+  else
+    x = s->x;
+
+  s->char2b = char2b;
+
+  float fr, fg_, fb;
+  wgpu_unpack_pixel (s->face->foreground, &fr, &fg_, &fb);
+
+  for (i = 0; i < s->nchars; i++, glyph++)
+    {
+      char buf[7];
+      char *str = NULL;
+      int len = glyph->u.glyphless.len;
+
+      if (glyph->u.glyphless.method == GLYPHLESS_DISPLAY_ACRONYM)
+	{
+	  if (len > 0
+	      && CHAR_TABLE_P (Vglyphless_char_display)
+	      && (CHAR_TABLE_EXTRA_SLOTS (XCHAR_TABLE (Vglyphless_char_display))
+		  >= 1))
+	    {
+	      Lisp_Object acronym
+		= (!glyph->u.glyphless.for_no_font
+		   ? CHAR_TABLE_REF (Vglyphless_char_display,
+				     glyph->u.glyphless.ch)
+		   : XCHAR_TABLE (Vglyphless_char_display)->extras[0]);
+	      if (CONSP (acronym))
+		acronym = XCAR (acronym);
+	      if (STRINGP (acronym))
+		str = SSDATA (acronym);
+	    }
+	}
+      else if (glyph->u.glyphless.method == GLYPHLESS_DISPLAY_HEX_CODE)
+	{
+	  unsigned int ch = glyph->u.glyphless.ch;
+	  sprintf (buf, "%0*X", ch < 0x10000 ? 4 : 6, ch);
+	  str = buf;
+	}
+
+      if (str)
+	{
+	  int upper_len = (len + 1) / 2;
+	  for (j = 0; j < len && j < 8; j++)
+	    char2b[j]
+	      = s->font->driver->encode_char (s->font, str[j]) & 0xFFFF;
+	  s->font->driver->draw (s, 0, upper_len,
+				 x + glyph->slice.glyphless.upper_xoff,
+				 s->ybase + glyph->slice.glyphless.upper_yoff,
+				 false);
+	  s->font->driver->draw (s, upper_len, len,
+				 x + glyph->slice.glyphless.lower_xoff,
+				 s->ybase + glyph->slice.glyphless.lower_yoff,
+				 false);
+	}
+
+      if (glyph->u.glyphless.method != GLYPHLESS_DISPLAY_THIN_SPACE)
+	{
+	  /* Outline box.  */
+	  int bx = x, by = s->ybase - glyph->ascent;
+	  int bw = glyph->pixel_width - 1, bh = glyph->ascent + glyph->descent - 1;
+	  wgpu_window_rect ((float) bx, (float) by, (float) bw, 1.0f, fr, fg_, fb, 1.0f);
+	  wgpu_window_rect ((float) bx, (float) (by + bh), (float) bw, 1.0f, fr, fg_, fb, 1.0f);
+	  wgpu_window_rect ((float) bx, (float) by, 1.0f, (float) bh, fr, fg_, fb, 1.0f);
+	  wgpu_window_rect ((float) (bx + bw), (float) by, 1.0f, (float) bh, fr, fg_, fb, 1.0f);
+	}
+      x += glyph->pixel_width;
+    }
+
+  s->char2b = NULL;
+}
+
 static void
 wgpu_draw_glyph_string (struct glyph_string *s)
 {
@@ -353,10 +437,29 @@ wgpu_draw_glyph_string (struct glyph_string *s)
       }
       break;
 
-    case IMAGE_GLYPH:
     case GLYPHLESS_GLYPH:
+      {
+	/* Background, then the box + hex/acronym.  */
+	if (!s->background_filled_p && !s->for_overlaps)
+	  {
+	    float r, g, b;
+	    wgpu_unpack_pixel (bg, &r, &g, &b);
+	    block_input ();
+	    wgpu_window_rect ((float) s->x, (float) s->y,
+			      (float) s->background_width, (float) s->height,
+			      r, g, b, 1.0f);
+	    unblock_input ();
+	    s->background_filled_p = true;
+	  }
+	block_input ();
+	wgpu_draw_glyphless_glyph_string_foreground (s);
+	unblock_input ();
+      }
+      break;
+
+    case IMAGE_GLYPH:
     default:
-      /* Images/glyphless not yet drawn.  */
+      /* Images not yet drawn.  */
       break;
     }
 }
