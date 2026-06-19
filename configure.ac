@@ -4682,7 +4682,7 @@ if test "${HAVE_X11}" = "yes"; then
     fi
   fi
 else # "${HAVE_X11}" != "yes"
-  if test $window_system = pgtk; then
+  if test $window_system = pgtk || test $window_system = wgpu; then
     EMACS_CHECK_MODULES([FONTCONFIG], [fontconfig >= 2.2.0])
     EMACS_CHECK_MODULES([FREETYPE], [freetype2])
     if test "$HAVE_FONTCONFIG" != yes -o "$HAVE_FREETYPE" != yes; then
@@ -4722,6 +4722,7 @@ else
 fi
 if test "${HAVE_X11}" = "yes" && test "${HAVE_FREETYPE}" = "yes" \
         || test "$window_system" = "pgtk" \
+        || test "$window_system" = "wgpu" \
         || test "${HAVE_W32}" = "yes" \
 	|| test "$REALLY_ANDROID" = "yes"; then
   if test "${with_harfbuzz}" != "no"; then
@@ -7243,6 +7244,10 @@ fi
 
 if test "${window_system}" = "pgtk"; then
    FONT_OBJ="ftfont.o ftcrfont.o"
+fi
+
+if test "${window_system}" = "wgpu"; then
+   FONT_OBJ="ftfont.o"
 fi
 
 if test "${HAVE_BE_APP}" = "yes" ; then

@@ -76,6 +76,12 @@ struct font_info
   /* Font metrics cache.  */
   struct font_metrics **metrics;
   short metrics_nrows;
+#elif defined (HAVE_WGPU)
+  /* The wgpu backend rasterizes glyphs via FreeType and caches them in a
+     GPU atlas; this maps glyph code -> atlas entry (id + bearings +
+     advance).  Opaque here (struct wgpu_glyph in wgpufont.c).  */
+  void *glyph_cache;
+  unsigned glyph_cache_size;
 #else
   /* These are used by the XFT backend.  */
   Display *display;
