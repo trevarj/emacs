@@ -1,0 +1,21 @@
+[package]
+name = "wgpu-backend"
+version = "0.1.0"
+edition = "2021"
+description = "Wayland + wgpu graphical backend for Emacs (FFI staticlib)."
+license = "GPL-3.0-or-later"
+publish = false
+
+[lib]
+# Produces libwgpu_backend.a, linked into the emacs binary.
+name = "wgpu_backend"
+crate-type = ["staticlib"]
+
+# M0 has no external dependencies on purpose: the crate builds fully offline so
+# the scaffold is reproducible under Guix before any vendoring is needed.
+# wgpu, smithay-client-toolkit, xkbcommon, etc. arrive in M1+ via `cargo vendor`.
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1

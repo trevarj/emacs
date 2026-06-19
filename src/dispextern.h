@@ -154,6 +154,13 @@ typedef Emacs_Pixmap XImagePtr;
 typedef XImagePtr XImagePtr_or_DC;
 #endif /* HAVE_PGTK */
 
+#ifdef HAVE_WGPU
+#include "wgpugui.h"
+typedef struct wgpu_display_info Display_Info;
+typedef Emacs_Pixmap XImagePtr;
+typedef XImagePtr XImagePtr_or_DC;
+#endif /* HAVE_WGPU */
+
 #ifdef HAVE_HAIKU
 #include "haikugui.h"
 typedef struct haiku_display_info Display_Info;

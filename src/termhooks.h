@@ -63,6 +63,7 @@ enum output_method
   output_w32,
   output_ns,
   output_pgtk,
+  output_wgpu,
   output_haiku,
   output_android,
 };
@@ -537,6 +538,7 @@ struct terminal
     struct w32_display_info *w32;		/* w32term.h */
     struct ns_display_info *ns;			/* nsterm.h */
     struct pgtk_display_info *pgtk;		/* pgtkterm.h */
+    struct wgpu_display_info *wgpu;		/* wgputerm.h */
     struct haiku_display_info *haiku;		/* haikuterm.h */
     struct android_display_info *android;	/* androidterm.h */
   } display_info;

@@ -314,6 +314,8 @@ See also `frame-live-p'.  */)
       return Qns;
     case output_pgtk:
       return Qpgtk;
+    case output_wgpu:
+      return Qwgpu;
     case output_haiku:
       return Qhaiku;
     case output_android:
@@ -7256,6 +7258,7 @@ syms_of_frame (void)
   DEFSYM (Qpc, "pc");
   DEFSYM (Qns, "ns");
   DEFSYM (Qpgtk, "pgtk");
+  DEFSYM (Qwgpu, "wgpu");
   DEFSYM (Qhaiku, "haiku");
   DEFSYM (Qandroid, "android");
   DEFSYM (Qvisible, "visible");
