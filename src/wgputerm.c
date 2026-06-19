@@ -370,28 +370,122 @@ wgpu_scroll_run (struct window *w, struct run *run)
 static void wgpu_after_update_window_line (struct window *w, struct glyph_row *r) {}
 static void wgpu_flush_display (struct frame *f) {}
 
-/* Clear the fringe background so stale pixels (e.g. a region highlight that
-   reached the fringe) don't linger.  The actual fringe bitmaps (continuation
-   arrows, etc.) are not yet rendered.  */
+/* Fringe bitmaps (continuation/truncation arrows, empty-line and buffer
+   boundary indicators).  We keep the raw bits (copied at define time, since
+   define may run before the window/atlas exists) and lazily rasterize them
+   into the glyph atlas on first draw.  */
+struct wgpu_fringe_bmp
+{
+  unsigned short *bits;
+  int h, wd;
+  int64_t atlas_id;		/* -1 until uploaded */
+};
+static struct wgpu_fringe_bmp *wgpu_fringe_bmps;
+static int wgpu_fringe_bmp_max;
+
+static void
+wgpu_define_fringe_bitmap (int which, unsigned short *bits, int h, int wd)
+{
+  if (which >= wgpu_fringe_bmp_max)
+    {
+      int old = wgpu_fringe_bmp_max;
+      wgpu_fringe_bmp_max = which + 20;
+      wgpu_fringe_bmps = xrealloc (wgpu_fringe_bmps,
+				   wgpu_fringe_bmp_max * sizeof *wgpu_fringe_bmps);
+      memset (&wgpu_fringe_bmps[old], 0,
+	      (wgpu_fringe_bmp_max - old) * sizeof *wgpu_fringe_bmps);
+    }
+  struct wgpu_fringe_bmp *fb = &wgpu_fringe_bmps[which];
+  xfree (fb->bits);
+  fb->bits = xnmalloc (h, sizeof (unsigned short));
+  memcpy (fb->bits, bits, h * sizeof (unsigned short));
+  fb->h = h;
+  fb->wd = wd;
+  fb->atlas_id = -1;
+}
+
+static void
+wgpu_destroy_fringe_bitmap (int which)
+{
+  if (which < 0 || which >= wgpu_fringe_bmp_max)
+    return;
+  struct wgpu_fringe_bmp *fb = &wgpu_fringe_bmps[which];
+  xfree (fb->bits);
+  fb->bits = NULL;
+  fb->h = fb->wd = 0;
+  fb->atlas_id = -1;
+}
+
+/* Rasterize fringe bitmap WHICH to an R8 coverage and upload it to the atlas,
+   caching the id.  Bit order matches the other backends (pixel COL set iff
+   bit COL of the row word is set).  Returns the atlas id, or -1.  */
+static int64_t
+wgpu_fringe_atlas_id (int which)
+{
+  if (which <= 0 || which >= wgpu_fringe_bmp_max)
+    return -1;
+  struct wgpu_fringe_bmp *fb = &wgpu_fringe_bmps[which];
+  if (!fb->bits || fb->h <= 0 || fb->wd <= 0)
+    return -1;
+  if (fb->atlas_id >= 0)
+    return fb->atlas_id;
+
+  unsigned char *cov = xnmalloc (fb->wd, fb->h);
+  for (int row = 0; row < fb->h; row++)
+    for (int col = 0; col < fb->wd; col++)
+      cov[row * fb->wd + col] = ((fb->bits[row] >> col) & 1) ? 255 : 0;
+  fb->atlas_id = wgpu_window_atlas_upload (fb->wd, fb->h, cov,
+					   (size_t) fb->wd * fb->h);
+  xfree (cov);
+  return fb->atlas_id;
+}
+
 static void
 wgpu_draw_fringe_bitmap (struct window *w, struct glyph_row *row,
 			 struct draw_fringe_bitmap_params *p)
 {
   struct frame *f = XFRAME (WINDOW_FRAME (w));
-  if (p->bx < 0 || p->nx <= 0 || p->ny <= 0)
-    return;
-  unsigned long bg = (p->face ? p->face->background
-		      : FRAME_BACKGROUND_PIXEL (f));
-  float r, g, b;
-  wgpu_unpack_pixel (bg, &r, &g, &b);
+  struct face *face = p->face;
+
   block_input ();
-  wgpu_window_rect ((float) p->bx, (float) p->by, (float) p->nx,
-		    (float) p->ny, r, g, b, 1.0f);
+
+  /* Background behind the bitmap.  */
+  if (p->bx >= 0 && !p->overlay_p && p->nx > 0 && p->ny > 0)
+    {
+      unsigned long bg = face ? face->background : FRAME_BACKGROUND_PIXEL (f);
+      float r, g, b;
+      wgpu_unpack_pixel (bg, &r, &g, &b);
+      wgpu_window_rect ((float) p->bx, (float) p->by, (float) p->nx,
+			(float) p->ny, r, g, b, 1.0f);
+    }
+
+  /* The bitmap itself.  */
+  if (p->which)
+    {
+      /* Lazily define the bitmap if it was registered while no GUI frame
+	 existed (e.g. a package loaded under a daemon).  */
+      if (p->which >= wgpu_fringe_bmp_max || !wgpu_fringe_bmps[p->which].bits)
+	gui_define_fringe_bitmap (f, p->which);
+      int64_t id = wgpu_fringe_atlas_id (p->which);
+      if (id >= 0)
+	{
+	  unsigned long fg
+	    = (p->cursor_p
+	       ? (p->overlay_p
+		  ? (face ? face->background : FRAME_BACKGROUND_PIXEL (f))
+		  : FRAME_CURSOR_COLOR (f))
+	       : (face ? face->foreground : FRAME_FOREGROUND_PIXEL (f)));
+	  float r, g, b;
+	  wgpu_unpack_pixel (fg, &r, &g, &b);
+	  /* Offset by -dh so visible rows [dh, dh+h) land at p->y (partial
+	     rows at window edges; dh is 0 in the common case).  */
+	  wgpu_window_glyph (id, (float) p->x, (float) (p->y - p->dh),
+			     r, g, b, 1.0f);
+	}
+    }
+
   unblock_input ();
 }
-static void wgpu_define_fringe_bitmap (int which, unsigned short *bits,
-				       int h, int wd) {}
-static void wgpu_destroy_fringe_bitmap (int which) {}
 
 /* Fill a frame-relative rectangle with a packed pixel color.  */
 static void
@@ -1047,7 +1141,11 @@ wgpu_create_terminal (struct wgpu_display_info *dpyinfo)
   terminal->query_colors = wgpu_query_colors;
   terminal->query_frame_background_color = wgpu_query_frame_background_color;
 
-  /* M3+: focus/visibility/size/scroll-bar/menu hooks.  */
+  /* Define the standard fringe bitmaps (continuation/truncation arrows,
+     empty-line and buffer-boundary indicators).  */
+  gui_init_fringe (terminal->rif);
+
+  /* M3+: visibility/size/scroll-bar/menu hooks.  */
   return terminal;
 }
 
