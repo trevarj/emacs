@@ -1545,6 +1545,19 @@ wgpu_new_font (struct frame *f, Lisp_Object font_object, int fontset)
   return font_object;
 }
 
+/* Popup menus are not yet implemented for the wgpu backend.  menu.c calls
+   menu_show_hook UNCONDITIONALLY for window-system frames, so a NULL hook
+   crashes when a mode-line element (major/minor-mode lighter, buffer name,
+   ...) pops up a menu.  Return "no selection" instead of crashing.  */
+static Lisp_Object
+wgpu_menu_show (struct frame *f, int x, int y, int menuflags,
+		Lisp_Object title, const char **error_name)
+{
+  if (error_name)
+    *error_name = NULL;
+  return Qnil;
+}
+
 struct terminal *
 wgpu_create_terminal (struct wgpu_display_info *dpyinfo)
 {
@@ -1560,6 +1573,7 @@ wgpu_create_terminal (struct wgpu_display_info *dpyinfo)
   terminal->mouse_position_hook = wgpu_mouse_position;
   terminal->frame_rehighlight_hook = wgpu_frame_rehighlight_hook;
   terminal->implicit_set_name_hook = wgpu_implicitly_set_name;
+  terminal->menu_show_hook = wgpu_menu_show;
   terminal->frame_up_to_date_hook = wgpu_frame_up_to_date;
   terminal->delete_terminal_hook = wgpu_delete_terminal;
   terminal->get_string_resource_hook = wgpu_get_string_resource;
