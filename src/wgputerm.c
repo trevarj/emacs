@@ -369,15 +369,87 @@ wgpu_frame_up_to_date (struct frame *f)
 
 /* Drain Wayland events.  M2: only window lifecycle (configure/close); keyboard
    input is M3.  */
+/* Find a live wgpu frame on TERMINAL (M2: there is a single one).  */
+static struct frame *
+wgpu_any_frame (struct terminal *terminal)
+{
+  Lisp_Object tail, frame;
+  FOR_EACH_FRAME (tail, frame)
+    {
+      struct frame *f = XFRAME (frame);
+      if (FRAME_WGPU_P (f) && FRAME_LIVE_P (f)
+	  && FRAME_TERMINAL (f) == terminal)
+	return f;
+    }
+  return NULL;
+}
+
 static int
 wgpu_read_socket (struct terminal *terminal, struct input_event *hold_quit)
 {
+  enum { BATCH = 64 };
+  WgpuEvent evs[BATCH];
+  uint32_t ww = 0, wh = 0;
+
   block_input ();
-  int closed = wgpu_window_dispatch ();
+  wgpu_window_dispatch ();		/* M3: close -> DELETE_WINDOW_EVENT.  */
+  bool resized = wgpu_window_take_resize (&ww, &wh) != 0;
+  int nev = wgpu_window_poll_events (evs, BATCH);
   unblock_input ();
-  (void) closed; /* M3: translate close -> DELETE_WINDOW_EVENT.  */
-  (void) hold_quit;
-  return 0;
+
+  struct frame *f = wgpu_any_frame (terminal);
+  int count = 0;
+
+  if (f && resized && ww >= 16 && wh >= 16)
+    {
+      change_frame_size (f, FRAME_PIXEL_TO_TEXT_WIDTH (f, ww),
+			 FRAME_PIXEL_TO_TEXT_HEIGHT (f, wh), false, true, false);
+      SET_FRAME_GARBAGED (f);
+    }
+
+  for (int i = 0; f && i < nev; i++)
+    {
+      struct input_event ie;
+      EVENT_INIT (ie);
+      XSETFRAME (ie.frame_or_window, f);
+
+      int mods = 0;
+      uint32_t b = evs[i].modifiers;
+      if (b & WGPU_MOD_CTRL)
+	mods |= ctrl_modifier;
+      if (b & WGPU_MOD_ALT)
+	mods |= meta_modifier;
+      if (b & WGPU_MOD_LOGO)
+	mods |= super_modifier;
+
+      uint32_t cp = evs[i].unichar, ks = evs[i].keysym;
+      if (cp != 0 && mods == 0)
+	{
+	  /* Plain printable text (shift already applied).  */
+	  ie.kind = (cp < 128) ? ASCII_KEYSTROKE_EVENT
+		    : MULTIBYTE_CHAR_KEYSTROKE_EVENT;
+	  ie.code = cp;
+	}
+      else if (ks >= 0x20 && ks <= 0x7e)
+	{
+	  /* Printable base key with modifiers, e.g. C-x.  */
+	  ie.kind = ASCII_KEYSTROKE_EVENT;
+	  ie.code = ks;
+	  ie.modifiers = mods;
+	}
+      else
+	{
+	  /* Function/navigation key: the xkb keysym matches X, which
+	     keyboard.c maps to a Lisp symbol.  */
+	  ie.kind = NON_ASCII_KEYSTROKE_EVENT;
+	  ie.code = ks;
+	  ie.modifiers = mods;
+	}
+      kbd_buffer_store_event_hold (&ie, hold_quit);
+      count++;
+    }
+
+  return count;
 }
 
 static void

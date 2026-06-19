@@ -16,28 +16,43 @@
 #define WGPU_ERR_INIT -1
 
 /**
+ * Modifier bits (our own encoding; translated to Emacs modifiers on the C
+ * side).  Shift is reported but usually already baked into `unichar`.
+ */
+#define WGPU_MOD_SHIFT (1 << 0)
+
+#define WGPU_MOD_CTRL (1 << 1)
+
+#define WGPU_MOD_ALT (1 << 2)
+
+#define WGPU_MOD_LOGO (1 << 3)
+
+/**
  * Kind of input event. ABI-stable: values must not be reordered.
  */
 typedef enum {
-  WgpuEventKind_Key = 0,
-  WgpuEventKind_Resize = 1,
-  WgpuEventKind_FocusIn = 2,
-  WgpuEventKind_FocusOut = 3,
+  WgpuEventKind_KeyPress = 0,
+  WgpuEventKind_FocusIn = 1,
+  WgpuEventKind_FocusOut = 2,
 } WgpuEventKind;
 
 /**
  * A backend input event, ABI-stable for the C side.
- *
- * `a`/`b` are kind-dependent payload slots (kept generic so the C struct stays
- * fixed-size as event kinds gain fields):
- * - `Key`:    `a` = keysym, `b` = modifier mask
- * - `Resize`: `a` = width px, `b` = height px
- * - focus:    unused
  */
 typedef struct {
   WgpuEventKind kind;
-  uint32_t a;
-  uint32_t b;
+  /**
+   * xkb/X keysym (KeyPress).
+   */
+  uint32_t keysym;
+  /**
+   * Unicode codepoint, or 0 if the key produced no text (KeyPress).
+   */
+  uint32_t unichar;
+  /**
+   * Modifier mask (WGPU_MOD_*).
+   */
+  uint32_t modifiers;
 } WgpuEvent;
 
 #ifdef __cplusplus
@@ -191,6 +206,15 @@ void wgpu_window_size(uint32_t *w, uint32_t *h);
 int64_t wgpu_window_atlas_upload(uint32_t w, uint32_t h, const uint8_t *data, uintptr_t len);
 
 /**
+ * Drain up to `max` pending input events into `buf`; returns the count.
+ * Called from read_socket_hook.
+ *
+ * # Safety
+ * `buf` must point to writable storage for at least `max` `WgpuEvent`s.
+ */
+int wgpu_window_poll_events(WgpuEvent *buf, int max);
+
+/**
  * Start a new batch of draw commands.
  */
 void wgpu_window_begin(void);
@@ -209,6 +233,16 @@ void wgpu_window_glyph(int64_t id, float x, float y, float r, float g, float b, 
  * Composite the recorded commands and present to the window.
  */
 void wgpu_window_present(void);
+
+/**
+ * If the compositor asked for a new size since the last call, write it to
+ * *w/*h and return 1; else return 0. Emacs calls this from read_socket and
+ * resizes the frame accordingly.
+ *
+ * # Safety
+ * `w` and `h` must be valid pointers.
+ */
+int wgpu_window_take_resize(uint32_t *w, uint32_t *h);
 
 /**
  * Destroy the window and release GPU/Wayland resources.

@@ -19,6 +19,7 @@
 //! from one thread, so no locking or Send/Sync is needed.
 
 use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::mem::ManuallyDrop;
 use std::os::raw::{c_char, c_int};
 use std::os::unix::io::AsRawFd;
@@ -34,6 +35,10 @@ use smithay_client_toolkit::{
     output::{OutputHandler, OutputState},
     registry::{ProvidesRegistryState, RegistryState},
     registry_handlers,
+    seat::{
+        keyboard::{KeyEvent, KeyboardHandler, Keysym, Modifiers},
+        Capability, SeatHandler, SeatState,
+    },
     shell::{
         xdg::{
             window::{Window, WindowConfigure, WindowDecorations, WindowHandler},
@@ -41,13 +46,15 @@ use smithay_client_toolkit::{
         },
         WaylandSurface,
     },
+    delegate_seat, delegate_keyboard,
 };
 use wayland_client::{
     globals::registry_queue_init,
-    protocol::{wl_output, wl_surface},
+    protocol::{wl_keyboard::WlKeyboard, wl_output, wl_seat::WlSeat, wl_surface},
     Connection, EventQueue, Proxy, QueueHandle,
 };
 
+use crate::event::{WgpuEvent, WGPU_MOD_ALT, WGPU_MOD_CTRL, WGPU_MOD_LOGO, WGPU_MOD_SHIFT};
 use crate::gpu2d::{DrawCmd, Renderer};
 use crate::render::Gpu;
 
@@ -68,6 +75,12 @@ struct GlyphEntry {
 struct WinState {
     registry_state: RegistryState,
     output_state: OutputState,
+    seat_state: SeatState,
+    keyboard: Option<WlKeyboard>,
+    /// Current modifier mask (WGPU_MOD_*).
+    mods: u32,
+    /// Pending input events for Emacs's read_socket.
+    events: VecDeque<WgpuEvent>,
     window: Window,
     surface: wgpu::Surface<'static>,
     gpu: Gpu,
@@ -78,6 +91,8 @@ struct WinState {
     persistent: Option<wgpu::Texture>,
     persistent_size: (u32, u32),
     size: (u32, u32),
+    /// New size the compositor asked for, pending delivery to Emacs.
+    pending_resize: Option<(u32, u32)>,
     configured: bool,
     close_requested: bool,
     /// Draw commands recorded since the last present.
@@ -155,6 +170,10 @@ impl WgpuWindow {
         let mut state = WinState {
             registry_state: RegistryState::new(&globals),
             output_state: OutputState::new(&globals, &qh),
+            seat_state: SeatState::new(&globals, &qh),
+            keyboard: None,
+            mods: 0,
+            events: VecDeque::new(),
             window,
             surface,
             gpu,
@@ -164,6 +183,7 @@ impl WgpuWindow {
             persistent: None,
             persistent_size: (0, 0),
             size: (800, 600),
+            pending_resize: None,
             configured: false,
             close_requested: false,
             cmds: Vec::new(),
@@ -239,7 +259,8 @@ impl WinState {
 
         let frame = match self.surface.get_current_texture() {
             Ok(f) => f,
-            Err(_) => {
+            Err(e) => {
+                eprintln!("WGPUDBG get_current_texture err: {e:?}; reconfiguring");
                 self.configure_surface();
                 return;
             }
@@ -302,6 +323,8 @@ impl WindowHandler for WinState {
             self.size = (w.get(), h.get());
         }
         self.configure_surface();
+        // Tell Emacs to resize the frame to match.
+        self.pending_resize = Some(self.size);
     }
 }
 
@@ -314,15 +337,72 @@ impl OutputHandler for WinState {
     fn output_destroyed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
 }
 
+impl SeatHandler for WinState {
+    fn seat_state(&mut self) -> &mut SeatState {
+        &mut self.seat_state
+    }
+    fn new_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: WlSeat) {}
+    fn new_capability(&mut self, _: &Connection, qh: &QueueHandle<Self>, seat: WlSeat, capability: Capability) {
+        if capability == Capability::Keyboard && self.keyboard.is_none() {
+            match self.seat_state.get_keyboard(qh, &seat, None) {
+                Ok(kbd) => self.keyboard = Some(kbd),
+                Err(e) => eprintln!("wgpu: get_keyboard failed: {e}"),
+            }
+        }
+    }
+    fn remove_capability(&mut self, _: &Connection, _: &QueueHandle<Self>, _: WlSeat, capability: Capability) {
+        if capability == Capability::Keyboard {
+            if let Some(kbd) = self.keyboard.take() {
+                kbd.release ();
+            }
+        }
+    }
+    fn remove_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: WlSeat) {}
+}
+
+impl KeyboardHandler for WinState {
+    fn enter(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlKeyboard,
+             _: &wl_surface::WlSurface, _: u32, _: &[u32], _: &[Keysym]) {}
+    fn leave(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlKeyboard,
+             _: &wl_surface::WlSurface, _: u32) {}
+
+    fn press_key(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlKeyboard,
+                 _: u32, event: KeyEvent) {
+        let unichar = event
+            .utf8
+            .as_ref()
+            .and_then(|s| s.chars().next())
+            .map(|c| c as u32)
+            .unwrap_or(0);
+        self.events
+            .push_back(WgpuEvent::key(event.keysym.raw(), unichar, self.mods));
+    }
+
+    fn release_key(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlKeyboard,
+                   _: u32, _: KeyEvent) {}
+
+    fn update_modifiers(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlKeyboard,
+                        _: u32, modifiers: Modifiers, _: u32) {
+        let mut m = 0;
+        if modifiers.ctrl { m |= WGPU_MOD_CTRL; }
+        if modifiers.alt { m |= WGPU_MOD_ALT; }
+        if modifiers.shift { m |= WGPU_MOD_SHIFT; }
+        if modifiers.logo { m |= WGPU_MOD_LOGO; }
+        self.mods = m;
+    }
+}
+
 impl ProvidesRegistryState for WinState {
     fn registry(&mut self) -> &mut RegistryState {
         &mut self.registry_state
     }
-    registry_handlers![OutputState];
+    registry_handlers![OutputState, SeatState];
 }
 
 delegate_compositor!(WinState);
 delegate_output!(WinState);
+delegate_seat!(WinState);
+delegate_keyboard!(WinState);
 delegate_xdg_shell!(WinState);
 delegate_xdg_window!(WinState);
 delegate_registry!(WinState);
@@ -425,6 +505,29 @@ pub unsafe extern "C" fn wgpu_window_atlas_upload(w: u32, h: u32, data: *const u
     )
 }
 
+/// Drain up to `max` pending input events into `buf`; returns the count.
+/// Called from read_socket_hook.
+///
+/// # Safety
+/// `buf` must point to writable storage for at least `max` `WgpuEvent`s.
+#[no_mangle]
+pub unsafe extern "C" fn wgpu_window_poll_events(buf: *mut WgpuEvent, max: c_int) -> c_int {
+    if buf.is_null() || max <= 0 {
+        return 0;
+    }
+    let out = std::slice::from_raw_parts_mut(buf, max as usize);
+    with_window(
+        |win| {
+            let n = out.len().min(win.state.events.len());
+            for slot in out.iter_mut().take(n) {
+                *slot = win.state.events.pop_front().unwrap();
+            }
+            n as c_int
+        },
+        0,
+    )
+}
+
 /// Start a new batch of draw commands.
 #[no_mangle]
 pub extern "C" fn wgpu_window_begin() {
@@ -457,6 +560,31 @@ pub extern "C" fn wgpu_window_glyph(id: i64, x: f32, y: f32, r: f32, g: f32, b: 
 #[no_mangle]
 pub extern "C" fn wgpu_window_present() {
     with_window(|win| win.state.present(), ());
+}
+
+/// If the compositor asked for a new size since the last call, write it to
+/// *w/*h and return 1; else return 0. Emacs calls this from read_socket and
+/// resizes the frame accordingly.
+///
+/// # Safety
+/// `w` and `h` must be valid pointers.
+#[no_mangle]
+pub unsafe extern "C" fn wgpu_window_take_resize(w: *mut u32, h: *mut u32) -> c_int {
+    with_window(
+        |win| match win.state.pending_resize.take() {
+            Some((rw, rh)) => {
+                if !w.is_null() {
+                    *w = rw;
+                }
+                if !h.is_null() {
+                    *h = rh;
+                }
+                1
+            }
+            None => 0,
+        },
+        0,
+    )
 }
 
 /// Destroy the window and release GPU/Wayland resources.

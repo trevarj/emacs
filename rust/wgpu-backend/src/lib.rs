@@ -176,7 +176,7 @@ mod tests {
     #[test]
     fn poll_events_handles_null_and_zero() {
         assert_eq!(unsafe { wgpu_backend_poll_events(std::ptr::null_mut(), 0) }, 0);
-        let mut buf = [WgpuEvent::key(0, 0); 4];
+        let mut buf = [WgpuEvent::key(0, 0, 0); 4];
         assert_eq!(unsafe { wgpu_backend_poll_events(buf.as_mut_ptr(), 4) }, 0);
     }
 }

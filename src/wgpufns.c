@@ -276,15 +276,10 @@ DEFUN ("x-create-frame", Fx_create_frame, Sx_create_frame, 1, 1, 0,
   gui_default_parameter (f, parms, Qtitle, Qnil, "title", "Title",
 			 RES_TYPE_STRING);
 
-  /* Size the frame to the actual Wayland window (opened in wgpu_term_init).  */
-  {
-    uint32_t ww = 0, wh = 0;
-    wgpu_window_size (&ww, &wh);
-    if (ww >= 32 && wh >= 32)
-      adjust_frame_size (f, ww, wh, 0, false, Qx_create_frame_1);
-    else
-      gui_figure_window_size (f, parms, true, true);
-  }
+  /* Pick an initial size; the compositor's configure (delivered via
+     read_socket as a resize) sizes the frame to the real window shortly
+     after.  */
+  gui_figure_window_size (f, parms, true, true);
 
   gui_default_parameter (f, parms, Qcursor_type, Qbox,
 			 "cursorType", "CursorType", RES_TYPE_SYMBOL);
