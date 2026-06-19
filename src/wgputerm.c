@@ -423,7 +423,12 @@ wgpu_read_socket (struct terminal *terminal, struct input_event *hold_quit)
 	mods |= super_modifier;
 
       uint32_t cp = evs[i].unichar, ks = evs[i].keysym;
-      if (cp != 0 && mods == 0)
+      /* Treat only genuinely printable codepoints as text; control chars
+	 (Backspace -> ^H, Tab, Return, Escape, ...) must go through the
+	 keysym path so they map to <backspace>, <tab>, etc. rather than
+	 C-h, C-i, ...  */
+      bool printable = cp >= 32 && cp != 127;
+      if (printable && mods == 0)
 	{
 	  /* Plain printable text (shift already applied).  */
 	  ie.kind = (cp < 128) ? ASCII_KEYSTROKE_EVENT
