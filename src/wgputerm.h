@@ -249,6 +249,10 @@ extern void syms_of_wgpufont (void);
 /* Font driver registration.  */
 extern void register_wgpufont_driver (struct frame *f);
 
+/* RIF default-font hook + pixel helper, used by frame creation.  */
+extern void wgpu_default_font_parameter (struct frame *f, Lisp_Object parms);
+extern void wgpu_unpack_pixel (unsigned long pixel, float *r, float *g, float *b);
+
 /* Backend Lisp functions called from the generic core (menu.c, xfaces.c).  */
 extern Lisp_Object Fx_hide_tip (void);
 extern Lisp_Object Fxw_display_color_p (Lisp_Object terminal);

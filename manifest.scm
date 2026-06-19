@@ -38,4 +38,6 @@
          "mesa"
          ;; Text stack reused from Emacs's font driver
          "freetype"
-         "harfbuzz"))))
+         "harfbuzz"
+         ;; A font so fontconfig can resolve the default frame font.
+         "font-dejavu"))))
