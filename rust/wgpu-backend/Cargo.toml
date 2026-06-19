@@ -27,6 +27,7 @@ wayland-backend = { version = "0.3", features = ["client_system"] }
 png = "0.17"               # encode offscreen frames for golden-image tests
 bytemuck = { version = "1", features = ["derive"] }  # vertex POD casts
 log = "0.4"
+libc = "0.2"               # timerfd for client-side key repeat
 
 [profile.release]
 opt-level = 3

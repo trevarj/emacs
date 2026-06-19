@@ -928,6 +928,10 @@ wgpu_term_init (Lisp_Object display_name)
   int fd = wgpu_window_fd ();
   if (fd >= 0)
     add_keyboard_wait_descriptor (fd);
+  /* Also wake on the key-repeat timerfd so held keys repeat.  */
+  int tfd = wgpu_window_timer_fd ();
+  if (tfd >= 0)
+    add_keyboard_wait_descriptor (tfd);
 
   unblock_input ();
   return dpyinfo;

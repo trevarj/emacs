@@ -218,6 +218,12 @@ int wgpu_window_open(const char *title);
 int wgpu_window_fd(void);
 
 /**
+ * Key-repeat timerfd for Emacs to select on (so it wakes to emit repeats).
+ * -1 if unavailable.
+ */
+int wgpu_window_timer_fd(void);
+
+/**
  * Process pending Wayland events. Returns 1 if the compositor asked the
  * window to close, else 0 (negative on error).
  */
