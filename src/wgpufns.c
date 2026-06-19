@@ -232,6 +232,18 @@ DEFUN ("x-create-frame", Fx_create_frame, Sx_create_frame, 1, 1, 0,
   FRAME_BACKGROUND_PIXEL (f) = 0xffffff;
   FRAME_X_OUTPUT (f)->cursor_color = 0x000000;
 
+  /* Pointer cursor shapes (resolved to cursor-shape-v1 in Rust).  */
+  FRAME_X_OUTPUT (f)->text_cursor = (Emacs_Cursor) (intptr_t) WGPU_CURSOR_TEXT;
+  FRAME_X_OUTPUT (f)->nontext_cursor = (Emacs_Cursor) (intptr_t) WGPU_CURSOR_DEFAULT;
+  FRAME_X_OUTPUT (f)->modeline_cursor = (Emacs_Cursor) (intptr_t) WGPU_CURSOR_DEFAULT;
+  FRAME_X_OUTPUT (f)->hand_cursor = (Emacs_Cursor) (intptr_t) WGPU_CURSOR_HAND;
+  FRAME_X_OUTPUT (f)->hourglass_cursor = (Emacs_Cursor) (intptr_t) WGPU_CURSOR_WAIT;
+  FRAME_X_OUTPUT (f)->horizontal_drag_cursor
+    = (Emacs_Cursor) (intptr_t) WGPU_CURSOR_HRESIZE;
+  FRAME_X_OUTPUT (f)->vertical_drag_cursor
+    = (Emacs_Cursor) (intptr_t) WGPU_CURSOR_VRESIZE;
+  FRAME_X_OUTPUT (f)->current_cursor = (Emacs_Cursor) (intptr_t) WGPU_CURSOR_DEFAULT;
+
   if (BASE_EQ (name, Qunbound) || NILP (name))
     {
       fset_name (f, build_string ("wgpu"));

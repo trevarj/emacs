@@ -574,7 +574,18 @@ wgpu_draw_window_divider (struct window *w, int x0, int x1, int y0, int y1)
   unblock_input ();
 }
 
-static void wgpu_define_frame_cursor (struct frame *f, Emacs_Cursor cursor) {}
+/* Set the pointer cursor shape for frame F (I-beam over text, arrow over the
+   mode line, hand over buttons, etc.).  CURSOR encodes a wgpu_cursor_shape.  */
+static void
+wgpu_define_frame_cursor (struct frame *f, Emacs_Cursor cursor)
+{
+  if (FRAME_OUTPUT_DATA (f)->current_cursor == cursor)
+    return;
+  FRAME_OUTPUT_DATA (f)->current_cursor = cursor;
+  block_input ();
+  wgpu_window_set_cursor ((int) (intptr_t) cursor);
+  unblock_input ();
+}
 static void wgpu_show_hourglass (struct frame *f) {}
 static void wgpu_hide_hourglass (struct frame *f) {}
 
