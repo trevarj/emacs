@@ -17,13 +17,52 @@ logic of its own.  See wgpu-backend-plan.md.  */
 #include "termchar.h"
 #include "termhooks.h"
 #include "dispextern.h"
+#include <stdarg.h>
 #include "font.h"
 #include "fontset.h"
 #include "composite.h"
+#include "systime.h"
 #include "wgputerm.h"
 
 /* Chain of all wgpu displays.  */
 struct wgpu_display_info *x_display_list;
+
+/* ------------------------------------------------------------------ */
+/* Debug logging (enable with the WGPU_DEBUG env var).  Writes to        */
+/* /tmp/wgpu-debug.log with a monotonic timestamp, flushed per line so a  */
+/* crash/freeze preserves the last entry.  Shared with the Rust side.     */
+/* ------------------------------------------------------------------ */
+static int wgpu_log_state = -1;	/* -1 unknown, 0 off, 1 on */
+static FILE *wgpu_log_fp;
+
+static bool
+wgpu_log_enabled (void)
+{
+  if (wgpu_log_state < 0)
+    {
+      wgpu_log_state = getenv ("WGPU_DEBUG") ? 1 : 0;
+      if (wgpu_log_state)
+	wgpu_log_fp = fopen ("/tmp/wgpu-debug.log", "a");
+    }
+  return wgpu_log_state == 1 && wgpu_log_fp != NULL;
+}
+
+static void wgpu_log (const char *fmt, ...) ATTRIBUTE_FORMAT_PRINTF (1, 2);
+static void
+wgpu_log (const char *fmt, ...)
+{
+  if (!wgpu_log_enabled ())
+    return;
+  struct timespec t = current_timespec ();
+  fprintf (wgpu_log_fp, "[%ld.%03ld C] ", (long) t.tv_sec,
+	   (long) (t.tv_nsec / 1000000));
+  va_list ap;
+  va_start (ap, fmt);
+  vfprintf (wgpu_log_fp, fmt, ap);
+  va_end (ap);
+  fputc ('\n', wgpu_log_fp);
+  fflush (wgpu_log_fp);
+}
 
 /* Alist of (NAME . PIXEL) X11 color names, loaded from rgb.txt, used to
    resolve named face colors (e.g. "red", "grey75").  staticpro'd so it
@@ -968,6 +1007,7 @@ static void
 wgpu_set_name_internal (struct frame *f, Lisp_Object name)
 {
   Lisp_Object encoded = ENCODE_UTF_8 (name);
+  wgpu_log ("set_title \"%s\"", SSDATA (encoded));
   block_input ();
   wgpu_window_set_title (SSDATA (encoded));
   unblock_input ();
@@ -1311,9 +1351,23 @@ wgpu_read_socket (struct terminal *terminal, struct input_event *hold_quit)
 		|| my < r->y || my >= r->y + r->height)
 	      {
 		f->mouse_moved = true;
-		note_mouse_highlight (f, mx, my);
-		remember_mouse_glyph (f, mx, my, r);
-		dpyinfo->last_mouse_glyph_frame = f;
+		/* Only touch the glyph matrices when they're consistent: not
+		   mid-redisplay, initialized, and not garbaged.  Calling
+		   note_mouse_highlight otherwise can dereference half-built
+		   matrices and crash.  */
+		if (!redisplaying_p && f->glyphs_initialized_p
+		    && !FRAME_GARBAGED_P (f) && FRAME_X_OUTPUT (f))
+		  {
+		    wgpu_log ("motion %d,%d -> note_mouse_highlight", mx, my);
+		    note_mouse_highlight (f, mx, my);
+		    remember_mouse_glyph (f, mx, my, r);
+		    dpyinfo->last_mouse_glyph_frame = f;
+		    wgpu_log ("motion %d,%d done", mx, my);
+		  }
+		else
+		  wgpu_log ("motion %d,%d SKIPPED (redisp=%d init=%d garb=%d)",
+			    mx, my, redisplaying_p, f->glyphs_initialized_p,
+			    FRAME_GARBAGED_P (f));
 	      }
 	  }
 	  break;
@@ -1323,6 +1377,9 @@ wgpu_read_socket (struct terminal *terminal, struct input_event *hold_quit)
 	  {
 	    struct wgpu_display_info *dpyinfo = FRAME_DISPLAY_INFO (f);
 	    bool press = (evs[i].kind == WgpuEventKind_PointerPress);
+	    wgpu_log ("button %s code=%u at %d,%d mods=%d",
+		      press ? "press" : "release", evs[i].button,
+		      evs[i].x, evs[i].y, mods);
 	    struct input_event ie;
 	    EVENT_INIT (ie);
 	    ie.kind = MOUSE_CLICK_EVENT;
@@ -1341,6 +1398,7 @@ wgpu_read_socket (struct terminal *terminal, struct input_event *hold_quit)
 	      dpyinfo->grabbed &= ~(1 << evs[i].button);
 	    kbd_buffer_store_event_hold (&ie, hold_quit);
 	    count++;
+	    wgpu_log ("button stored");
 	  }
 	  break;
 

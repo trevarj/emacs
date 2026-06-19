@@ -88,6 +88,56 @@ struct GlyphEntry {
     h: f32,
 }
 
+/// Debug logging: enabled by the WGPU_DEBUG env var, appended to
+/// /tmp/wgpu-debug.log (shared with the C side), flushed per line.
+fn wgpu_dbg_on() -> bool {
+    thread_local! { static ON: std::cell::Cell<i8> = const { std::cell::Cell::new(-1) }; }
+    ON.with(|c| {
+        let v = c.get();
+        if v < 0 {
+            let on = std::env::var_os("WGPU_DEBUG").is_some();
+            c.set(on as i8);
+            on
+        } else {
+            v == 1
+        }
+    })
+}
+
+fn dbg_write(args: std::fmt::Arguments) {
+    if !wgpu_dbg_on() {
+        return;
+    }
+    use std::io::Write;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    // Keep the file handle open (reopening per line would itself cause a
+    // slowdown that masquerades as the bug we're hunting).
+    thread_local! {
+        static LOG: RefCell<Option<std::fs::File>> = const { RefCell::new(None) };
+    }
+    LOG.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        if slot.is_none() {
+            *slot = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("/tmp/wgpu-debug.log")
+                .ok();
+        }
+        if let Some(f) = slot.as_mut() {
+            let ts = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| format!("{}.{:03}", d.as_secs(), d.subsec_millis()))
+                .unwrap_or_else(|_| "0.000".into());
+            let _ = writeln!(f, "[{} rust] {}", ts, args);
+        }
+    });
+}
+
+macro_rules! dlog {
+    ($($a:tt)*) => { dbg_write(format_args!($($a)*)) };
+}
+
 /// MIME types we offer/accept for the text clipboard, in preference order.
 const CLIPBOARD_MIME: &[&str] = &[
     "text/plain;charset=utf-8",
@@ -335,6 +385,7 @@ impl WgpuWindow {
     }
 
     fn dispatch(&mut self) -> Result<(), String> {
+        let t0 = std::time::Instant::now();
         let _ = self.conn.flush();
         // Read any pending socket data without blocking, then dispatch.
         if let Some(guard) = self.conn.prepare_read() {
@@ -345,6 +396,10 @@ impl WgpuWindow {
             .map_err(|e| format!("dispatch: {e}"))?;
         // Drain the key-repeat timerfd (it may be why Emacs woke us).
         self.state.pump_repeat();
+        let ms = t0.elapsed().as_millis();
+        if ms >= 8 {
+            dlog!("dispatch SLOW {} ms (events queued={})", ms, self.state.events.len());
+        }
         Ok(())
     }
 
@@ -379,10 +434,13 @@ impl WgpuWindow {
                 .find(|m| types.iter().any(|t| t == *m))
                 .map(|m| m.to_string())
         })?;
+        dlog!("get_clipboard receiving...");
         let pipe = offer.receive(mime).ok()?;
         let _ = self.conn.flush();
         let _ = self.event_queue.roundtrip(&mut self.state);
-        Some(read_pipe_timeout(&pipe, 500))
+        let data = read_pipe_timeout(&pipe, 500);
+        dlog!("get_clipboard got {} bytes", data.len());
+        Some(data)
     }
 }
 
@@ -586,18 +644,39 @@ impl WinState {
         if !self.configured {
             return;
         }
+        let dbg = wgpu_dbg_on();
+        let t_begin = std::time::Instant::now();
+        if dbg {
+            dlog!(
+                "present begin cmds={} glyphs={} size={}x{}",
+                self.cmds.len(),
+                self.glyphs.len(),
+                self.size.0,
+                self.size.1
+            );
+        }
         self.ensure_persistent();
         let persistent = self.persistent.as_ref().unwrap();
         let pview = persistent.create_view(&wgpu::TextureViewDescriptor::default());
 
+        let t_acq = std::time::Instant::now();
         let frame = match self.surface.get_current_texture() {
             Ok(f) => f,
             Err(e) => {
+                dlog!("present get_current_texture ERR {e:?}; reconfiguring");
                 eprintln!("wgpu: surface lost ({e:?}); reconfiguring");
                 self.configure_surface();
                 return;
             }
         };
+        if dbg {
+            let acq = t_acq.elapsed();
+            // A long acquire is the classic "frozen" signature (the swapchain
+            // is throttling/blocking on the compositor).
+            if acq.as_millis() >= 8 {
+                dlog!("present get_current_texture SLOW {} ms", acq.as_millis());
+            }
+        }
 
         let mut encoder = self
             .gpu
@@ -634,6 +713,14 @@ impl WinState {
         self.gpu.queue.submit(Some(encoder.finish()));
         frame.present();
         self.cmds.clear();
+        // Reclaim GPU resources from dropped textures/encoders (scroll temps,
+        // finished command buffers, released swapchain frames).  Without this
+        // non-blocking poll the window path never runs wgpu's cleanup, so GPU
+        // memory grows until the driver wedges -- a freeze after a while.
+        self.gpu.device.poll(wgpu::Maintain::Poll);
+        if dbg {
+            dlog!("present end total {} ms", t_begin.elapsed().as_millis());
+        }
     }
 }
 
