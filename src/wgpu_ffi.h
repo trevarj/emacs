@@ -190,6 +190,11 @@ int wgpu_window_fd(void);
 int wgpu_window_dispatch(void);
 
 /**
+ * Integer output scale factor (1, 2, ...) for HiDPI. 1 if no window.
+ */
+int wgpu_window_scale(void);
+
+/**
  * Current window size in pixels, written to *w/*h.
  *
  * # Safety

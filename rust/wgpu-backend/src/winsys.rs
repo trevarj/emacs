@@ -91,6 +91,8 @@ struct WinState {
     persistent: Option<wgpu::Texture>,
     persistent_size: (u32, u32),
     size: (u32, u32),
+    /// Integer output scale factor (1, 2, ...).
+    scale: i32,
     /// New size the compositor asked for, pending delivery to Emacs.
     pending_resize: Option<(u32, u32)>,
     configured: bool,
@@ -183,6 +185,7 @@ impl WgpuWindow {
             persistent: None,
             persistent_size: (0, 0),
             size: (800, 600),
+            scale: 1,
             pending_resize: None,
             configured: false,
             close_requested: false,
@@ -192,6 +195,18 @@ impl WgpuWindow {
 
         // Roundtrip so the compositor sends the initial configure (sizes us).
         event_queue.roundtrip(&mut state).map_err(|e| format!("roundtrip: {e}"))?;
+        event_queue.roundtrip(&mut state).ok();
+
+        // Fall back to the output's scale if no scale_factor_changed arrived.
+        if state.scale <= 1 {
+            for output in state.output_state.outputs() {
+                if let Some(info) = state.output_state.info(&output) {
+                    if info.scale_factor > state.scale {
+                        state.scale = info.scale_factor;
+                    }
+                }
+            }
+        }
 
         Ok(WgpuWindow { conn, qh, event_queue, state })
     }
@@ -260,7 +275,7 @@ impl WinState {
         let frame = match self.surface.get_current_texture() {
             Ok(f) => f,
             Err(e) => {
-                eprintln!("WGPUDBG get_current_texture err: {e:?}; reconfiguring");
+                eprintln!("wgpu: surface lost ({e:?}); reconfiguring");
                 self.configure_surface();
                 return;
             }
@@ -307,7 +322,11 @@ impl WinState {
 // ----- sctk handlers -------------------------------------------------------
 
 impl CompositorHandler for WinState {
-    fn scale_factor_changed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: i32) {}
+    fn scale_factor_changed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, new: i32) {
+        if new >= 1 {
+            self.scale = new;
+        }
+    }
     fn transform_changed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: wl_output::Transform) {}
     fn frame(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: u32) {}
     fn surface_enter(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: &wl_output::WlOutput) {}
@@ -466,6 +485,12 @@ pub extern "C" fn wgpu_window_dispatch() -> c_int {
         },
         -1,
     )
+}
+
+/// Integer output scale factor (1, 2, ...) for HiDPI. 1 if no window.
+#[no_mangle]
+pub extern "C" fn wgpu_window_scale() -> c_int {
+    with_window(|win| win.state.scale, 1)
 }
 
 /// Current window size in pixels, written to *w/*h.
