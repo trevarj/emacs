@@ -204,13 +204,19 @@ impl App {
             .gpu
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame") });
+        let load = wgpu::LoadOp::Clear(wgpu::Color {
+            r: self.clear[0],
+            g: self.clear[1],
+            b: self.clear[2],
+            a: self.clear[3],
+        });
         self.renderer.encode(
             &self.gpu,
             &mut encoder,
             &view,
             self.size.0,
             self.size.1,
-            self.clear,
+            load,
             &self.cmds,
         );
         // Keep presenting.

@@ -154,6 +154,67 @@ int wgpu_frame_end_rgba(uint8_t *out, uintptr_t out_len);
  */
 int wgpu_frame_end_png(const char *path);
 
+/**
+ * Open the (single) Emacs window. `title` is a NUL-terminated C string (may be
+ * null for a default). Returns 0 on success, -1 on failure.
+ *
+ * # Safety
+ * `title`, if non-null, must be a valid NUL-terminated C string.
+ */
+int wgpu_window_open(const char *title);
+
+/**
+ * Wayland connection fd for Emacs to select on. -1 if no window.
+ */
+int wgpu_window_fd(void);
+
+/**
+ * Process pending Wayland events. Returns 1 if the compositor asked the
+ * window to close, else 0 (negative on error).
+ */
+int wgpu_window_dispatch(void);
+
+/**
+ * Current window size in pixels, written to *w/*h.
+ *
+ * # Safety
+ * `w` and `h` must be valid pointers.
+ */
+void wgpu_window_size(uint32_t *w, uint32_t *h);
+
+/**
+ * Upload a coverage glyph (w*h bytes) into the window's atlas; returns id >=0.
+ *
+ * # Safety
+ * `data` must point to at least `len >= w*h` readable bytes.
+ */
+int64_t wgpu_window_atlas_upload(uint32_t w, uint32_t h, const uint8_t *data, uintptr_t len);
+
+/**
+ * Start a new batch of draw commands.
+ */
+void wgpu_window_begin(void);
+
+/**
+ * Record a solid filled rectangle (pixels, linear RGBA 0..=1).
+ */
+void wgpu_window_rect(float x, float y, float w, float h, float r, float g, float b, float a);
+
+/**
+ * Record a glyph (atlas id from `wgpu_window_atlas_upload`) at x,y, tinted.
+ */
+void wgpu_window_glyph(int64_t id, float x, float y, float r, float g, float b, float a);
+
+/**
+ * Composite the recorded commands and present to the window.
+ */
+void wgpu_window_present(void);
+
+/**
+ * Destroy the window and release GPU/Wayland resources.
+ */
+void wgpu_window_close(void);
+
 #ifdef __cplusplus
 }  // extern "C"
 #endif  // __cplusplus
