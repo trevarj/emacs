@@ -284,6 +284,59 @@ wgpu_draw_composite_glyph_string_foreground (struct glyph_string *s)
     }
 }
 
+/* Draw the underline for glyph string S in COLOR, honoring the face's
+   underline style (single/double/wave/dots/dashes).  Wave and dotted/dashed
+   styles are approximated with small rects.  */
+static void
+wgpu_draw_underline (struct glyph_string *s, unsigned long color)
+{
+  int thickness = s->underline_thickness > 0 ? s->underline_thickness : 1;
+  int pos = s->ybase + (s->underline_position > 0 ? s->underline_position : 1);
+  int x0 = s->x, w = s->width;
+  if (w <= 0)
+    return;
+  float r, g, b;
+  wgpu_unpack_pixel (color, &r, &g, &b);
+  block_input ();
+  switch (s->face->underline)
+    {
+    case FACE_UNDERLINE_DOUBLE_LINE:
+      wgpu_window_rect ((float) x0, (float) pos, (float) w, 1.0f, r, g, b, 1.0f);
+      wgpu_window_rect ((float) x0, (float) (pos + 2), (float) w, 1.0f, r, g, b, 1.0f);
+      break;
+    case FACE_UNDERLINE_WAVE:
+      {
+	/* Triangle-wave zigzag, amplitude 2px, period 4px.  */
+	const int amp = 2;
+	for (int dx = 0; dx < w; dx++)
+	  {
+	    int phase = dx % (2 * amp);
+	    int dy = phase <= amp ? phase : (2 * amp - phase);
+	    wgpu_window_rect ((float) (x0 + dx), (float) (pos + dy), 1.0f, 1.0f,
+			      r, g, b, 1.0f);
+	  }
+      }
+      break;
+    case FACE_UNDERLINE_DOTS:
+      for (int dx = 0; dx < w; dx += 2)
+	wgpu_window_rect ((float) (x0 + dx), (float) pos, 1.0f, (float) thickness,
+			  r, g, b, 1.0f);
+      break;
+    case FACE_UNDERLINE_DASHES:
+      for (int dx = 0; dx < w; dx += 6)
+	wgpu_window_rect ((float) (x0 + dx), (float) pos,
+			  (float) (w - dx < 3 ? w - dx : 3), (float) thickness,
+			  r, g, b, 1.0f);
+      break;
+    case FACE_UNDERLINE_SINGLE:
+    default:
+      wgpu_window_rect ((float) x0, (float) pos, (float) w, (float) thickness,
+			r, g, b, 1.0f);
+      break;
+    }
+  unblock_input ();
+}
+
 /* Draw glyphless characters (undisplayable codepoints / control chars) as a
    thin box optionally containing the hex code or an acronym, like the other
    backends.  Ported from pgtk_draw_glyphless_glyph_string_foreground.  */
@@ -409,18 +462,9 @@ wgpu_draw_glyph_string (struct glyph_string *s)
 	/* Underline.  */
 	if (s->face->underline && !s->for_overlaps)
 	  {
-	    int thickness = (s->underline_thickness > 0
-			     ? s->underline_thickness : 1);
-	    int pos = s->ybase + (s->underline_position > 0
-				  ? s->underline_position : 1);
 	    unsigned long ul = (s->face->underline_defaulted_p
 				? fg : s->face->underline_color);
-	    float r, g, b;
-	    wgpu_unpack_pixel (ul, &r, &g, &b);
-	    block_input ();
-	    wgpu_window_rect ((float) s->x, (float) pos, (float) s->width,
-			      (float) thickness, r, g, b, 1.0f);
-	    unblock_input ();
+	    wgpu_draw_underline (s, ul);
 	  }
       }
       break;
