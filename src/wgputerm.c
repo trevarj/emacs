@@ -191,7 +191,15 @@ wgpu_default_font_parameter (struct frame *f, Lisp_Object parms)
 
   if (!FONTP (font) && !STRINGP (font))
     {
-      const char *names[] = { "monospace-10", "Monospace-10", "fixed", NULL };
+      /* Use an explicit pixel size scaled by the HiDPI factor, so the
+	 default font is readable and unambiguous (avoids the point-size /
+	 face-height path that can collapse to 1px).  */
+      int scale = (int) dpyinfo->scale;
+      if (scale < 1)
+	scale = 1;
+      char sized[64];
+      snprintf (sized, sizeof sized, "Monospace:pixelsize=%d", 14 * scale);
+      const char *names[] = { sized, "monospace-10", "fixed", NULL };
       for (int i = 0; names[i]; i++)
 	{
 	  font = font_open_by_name (f, build_unibyte_string (names[i]));
@@ -554,12 +562,17 @@ wgpu_term_init (Lisp_Object display_name)
     current_kboard = terminal->kboard;
   terminal->kboard->reference_count++;
 
+  /* Normalize font sizes for HiDPI: a scale-2 display gets 192 DPI so a
+     10pt font renders ~26px instead of ~13px.  */
+  int scale = wgpu_window_scale ();
+  if (scale < 1)
+    scale = 1;
   dpyinfo->name_list_element = Fcons (display_name, Qnil);
   dpyinfo->smallest_font_height = 1;
   dpyinfo->smallest_char_width = 1;
   dpyinfo->resx = 96.0;
   dpyinfo->resy = 96.0;
-  dpyinfo->scale = 1.0;
+  dpyinfo->scale = scale;
   reset_mouse_highlight (&dpyinfo->mouse_highlight);
 
   terminal->name = xlispstrdup (display_name);

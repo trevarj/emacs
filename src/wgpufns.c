@@ -154,6 +154,13 @@ check_x_display_info (Lisp_Object object)
   return x_display_list;
 }
 
+DEFUN ("wgpu-scale-factor", Fwgpu_scale_factor, Swgpu_scale_factor, 0, 0, 0,
+       doc: /* Return the integer HiDPI scale factor of the wgpu display.  */)
+  (void)
+{
+  return make_fixnum (x_display_list ? (EMACS_INT) x_display_list->scale : 1);
+}
+
 DEFUN ("x-create-frame", Fx_create_frame, Sx_create_frame, 1, 1, 0,
        doc: /* SKIP: real doc in xfns.c.  */)
   (Lisp_Object parms)
@@ -351,6 +358,7 @@ syms_of_wgpufns (void)
 {
   defsubr (&Sx_create_frame);
   defsubr (&Sx_open_connection);
+  defsubr (&Swgpu_scale_factor);
   defsubr (&Swgpu_dump_frame);
   defsubr (&Swgpu__frame_rgba);
   defsubr (&Swgpu__draw_demo);

@@ -54,6 +54,14 @@
   (cl-assert (not wgpu-initialized))
   (create-default-fontset)
   (x-open-connection (or display "wayland") x-command-line-resources t)
+  ;; Normalize font size for HiDPI: pick a pixel size scaled by the output
+  ;; scale factor, and pin it (with an explicit pixelsize so the face system
+  ;; doesn't collapse the size).  Only if the user hasn't set a font.
+  (let ((scale (if (fboundp 'wgpu-scale-factor) (wgpu-scale-factor) 1)))
+    (unless (or (assq 'font default-frame-alist)
+                (assq 'font initial-frame-alist))
+      (push (cons 'font (format "Monospace:pixelsize=%d" (* 14 (max 1 scale))))
+            default-frame-alist)))
   (setq wgpu-initialized t))
 
 ;; Any display name maps to the wgpu backend.
