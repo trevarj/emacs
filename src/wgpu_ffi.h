@@ -284,6 +284,11 @@ void wgpu_window_glyph(int64_t id, float x, float y, float r, float g, float b, 
 void wgpu_window_present(void);
 
 /**
+ * Set the pointer cursor shape (codes match the C `wgpu_cursor_shape` enum).
+ */
+void wgpu_window_set_cursor(int code);
+
+/**
  * Scroll the region [x, from_y, w, h] of the persistent frame to [x, to_y].
  * Called from scroll_run before the newly-exposed lines are drawn.
  */

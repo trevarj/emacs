@@ -251,6 +251,19 @@ extern void register_wgpufont_driver (struct frame *f);
 
 /* RIF default-font hook + pixel helper, used by frame creation.  */
 extern void wgpu_default_font_parameter (struct frame *f, Lisp_Object parms);
+/* Pointer cursor shapes, encoded into Emacs_Cursor (a void *) and passed to
+   the Rust cursor-shape FFI.  Values must match cursor_code_to_shape in
+   rust/wgpu-backend/src/winsys.rs.  Nonzero so the fields differ from NULL.  */
+enum wgpu_cursor_shape
+{
+  WGPU_CURSOR_DEFAULT = 1,
+  WGPU_CURSOR_TEXT = 2,
+  WGPU_CURSOR_HAND = 3,
+  WGPU_CURSOR_WAIT = 4,
+  WGPU_CURSOR_HRESIZE = 5,
+  WGPU_CURSOR_VRESIZE = 6,
+};
+
 extern void wgpu_unpack_pixel (unsigned long pixel, float *r, float *g, float *b);
 extern void wgpu_glyph_string_colors (struct glyph_string *s, unsigned long *fg,
 				      unsigned long *bg);

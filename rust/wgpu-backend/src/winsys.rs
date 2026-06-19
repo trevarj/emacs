@@ -41,9 +41,15 @@ use smithay_client_toolkit::{
     output::{OutputHandler, OutputState},
     registry::{ProvidesRegistryState, RegistryState},
     registry_handlers,
+    reexports::protocols::wp::cursor_shape::v1::client::wp_cursor_shape_device_v1::{
+        Shape, WpCursorShapeDeviceV1,
+    },
     seat::{
         keyboard::{KeyEvent, KeyboardHandler, Keysym, Modifiers, RepeatInfo},
-        pointer::{PointerEvent, PointerEventKind, PointerHandler, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT},
+        pointer::{
+            cursor_shape::CursorShapeManager, PointerEvent, PointerEventKind, PointerHandler,
+            BTN_LEFT, BTN_MIDDLE, BTN_RIGHT,
+        },
         Capability, SeatHandler, SeatState,
     },
     shell::{
@@ -123,6 +129,13 @@ struct WinState {
     pointer: Option<WlPointer>,
     /// Last pointer position (surface pixels), for axis events that omit it.
     pointer_pos: (i32, i32),
+    /// cursor-shape-v1: lets the compositor draw a themed cursor shape.
+    cursor_shape_mgr: Option<CursorShapeManager>,
+    cursor_shape_device: Option<WpCursorShapeDeviceV1>,
+    /// Latest pointer-enter serial (required to set the cursor shape).
+    pointer_enter_serial: u32,
+    /// Currently-set cursor shape code (avoids redundant requests).
+    current_cursor: u32,
     /// Current modifier mask (WGPU_MOD_*).
     mods: u32,
     /// Key repeat (Wayland delegates auto-repeat to the client).  We use a
@@ -239,6 +252,8 @@ impl WgpuWindow {
         let alpha_mode = caps.alpha_modes[0];
         // Clipboard manager (optional: absent on compositors without it).
         let data_device_manager = DataDeviceManagerState::bind(&globals, &qh).ok();
+        // cursor-shape-v1 manager (optional).
+        let cursor_shape_mgr = CursorShapeManager::bind(&globals, &qh).ok();
         // Prefer Mailbox: it never blocks get_current_texture (which, with
         // Fifo, can stall Emacs's main thread indefinitely when the window is
         // occluded/unfocused -- a hard freeze).  Fall back to Fifo.
@@ -256,6 +271,10 @@ impl WgpuWindow {
             keyboard: None,
             pointer: None,
             pointer_pos: (0, 0),
+            cursor_shape_mgr,
+            cursor_shape_device: None,
+            pointer_enter_serial: 0,
+            current_cursor: 0,
             mods: 0,
             // CLOCK_MONOTONIC, non-blocking so draining never stalls Emacs.
             timer_fd: unsafe {
@@ -677,7 +696,13 @@ impl SeatHandler for WinState {
         }
         if capability == Capability::Pointer && self.pointer.is_none() {
             match self.seat_state.get_pointer(qh, &seat) {
-                Ok(ptr) => self.pointer = Some(ptr),
+                Ok(ptr) => {
+                    // A cursor-shape device for this pointer, if supported.
+                    if let Some(mgr) = self.cursor_shape_mgr.as_ref() {
+                        self.cursor_shape_device = Some(mgr.get_shape_device(&ptr, qh));
+                    }
+                    self.pointer = Some(ptr);
+                }
                 Err(e) => eprintln!("wgpu: get_pointer failed: {e}"),
             }
         }
@@ -770,6 +795,21 @@ impl KeyboardHandler for WinState {
     }
 }
 
+/// Map our cursor-shape codes (shared with the C side) to cursor-shape-v1
+/// shapes.  0/1 = default arrow.
+fn cursor_code_to_shape(code: u32) -> Shape {
+    match code {
+        2 => Shape::Text,      // over buffer text
+        3 => Shape::Pointer,   // over a clickable (hand)
+        4 => Shape::Wait,      // hourglass
+        5 => Shape::EwResize,  // horizontal drag (vertical divider)
+        6 => Shape::NsResize,  // vertical drag (horizontal divider)
+        _ => Shape::Default,
+    }
+}
+
+// (cursor-shape-v1 dispatch is provided by delegate_pointer!.)
+
 /// Map a Linux/Wayland button code to an Emacs button number.
 /// Emacs uses 0=left (mouse-1), 1=middle (mouse-2), 2=right (mouse-3).
 fn button_to_emacs(btn: u32) -> u32 {
@@ -803,7 +843,14 @@ impl PointerHandler for WinState {
             let x = e.position.0 as i32;
             let y = e.position.1 as i32;
             match &e.kind {
-                PointerEventKind::Enter { .. } => {
+                PointerEventKind::Enter { serial } => {
+                    self.pointer_enter_serial = *serial;
+                    // Re-assert our cursor shape on (re-)entry, as required.
+                    if let Some(dev) = self.cursor_shape_device.as_ref() {
+                        if self.current_cursor != 0 {
+                            dev.set_shape(*serial, cursor_code_to_shape(self.current_cursor));
+                        }
+                    }
                     self.pointer_pos = (x, y);
                     self.events.push_back(WgpuEvent::motion(x, y, self.mods, 0));
                 }
@@ -1059,6 +1106,24 @@ pub extern "C" fn wgpu_window_glyph(id: i64, x: f32, y: f32, r: f32, g: f32, b: 
 #[no_mangle]
 pub extern "C" fn wgpu_window_present() {
     with_window(|win| win.state.present(), ());
+}
+
+/// Set the pointer cursor shape (codes match the C `wgpu_cursor_shape` enum).
+#[no_mangle]
+pub extern "C" fn wgpu_window_set_cursor(code: c_int) {
+    with_window(
+        |win| {
+            let code = code as u32;
+            win.state.current_cursor = code;
+            if let Some(dev) = win.state.cursor_shape_device.as_ref() {
+                if win.state.pointer_enter_serial != 0 {
+                    dev.set_shape(win.state.pointer_enter_serial, cursor_code_to_shape(code));
+                    let _ = win.conn.flush();
+                }
+            }
+        },
+        (),
+    );
 }
 
 /// Scroll the region [x, from_y, w, h] of the persistent frame to [x, to_y].
