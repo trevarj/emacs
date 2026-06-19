@@ -299,6 +299,30 @@ DEFUN ("x-create-frame", Fx_create_frame, Sx_create_frame, 1, 1, 0,
      after.  */
   gui_figure_window_size (f, parms, true, true);
 
+  /* Size the frame to the actual Wayland surface up front, so its pixel
+     dimensions match the GPU surface/persistent texture from the first paint.
+     Otherwise the default 80x36 frame is drawn first and then resized, which
+     leaves stale pixels (e.g. buffer text where the mode line lands) in the
+     persistent texture.  */
+  {
+    uint32_t sw = 0, sh = 0;
+    wgpu_window_size (&sw, &sh);
+    if (sw >= 16 && sh >= 16)
+      {
+	int tw = FRAME_PIXEL_TO_TEXT_WIDTH (f, (int) sw);
+	int th = FRAME_PIXEL_TO_TEXT_HEIGHT (f, (int) sh);
+	/* Round the text area down to whole rows/columns so the mode line
+	   lands on a glyph-row boundary; otherwise a fractional last row
+	   overlaps the mode line and leaves stale pixels there.  */
+	int lh = FRAME_LINE_HEIGHT (f), cw = FRAME_COLUMN_WIDTH (f);
+	if (lh > 0)
+	  th -= th % lh;
+	if (cw > 0)
+	  tw -= tw % cw;
+	change_frame_size (f, tw, th, false, true, false);
+      }
+  }
+
   gui_default_parameter (f, parms, Qcursor_type, Qbox,
 			 "cursorType", "CursorType", RES_TYPE_SYMBOL);
   gui_default_parameter (f, parms, Qalpha, Qnil, "alpha", "Alpha",
@@ -355,6 +379,106 @@ M1 stub.  */)
   return Qnil;
 }
 
+DEFUN ("xw-color-values", Fxw_color_values, Sxw_color_values, 1, 2, 0,
+       doc: /* SKIP: real doc in xfns.c.  */)
+  (Lisp_Object color, Lisp_Object frame)
+{
+  Emacs_Color col;
+  struct frame *f = decode_window_system_frame (frame);
+
+  CHECK_STRING (color);
+  if (!wgpu_defined_color (f, SSDATA (color), &col, false, false))
+    return Qnil;
+
+  return list3i (col.red, col.green, col.blue);
+}
+
+DEFUN ("x-display-planes", Fx_display_planes, Sx_display_planes, 0, 1, 0,
+       doc: /* Return the number of bit planes of the wgpu display.
+The wgpu backend renders to a 24-bit (true color) RGBA target.  */)
+  (Lisp_Object terminal)
+{
+  return make_fixnum (24);
+}
+
+DEFUN ("x-display-color-cells", Fx_display_color_cells, Sx_display_color_cells,
+       0, 1, 0,
+       doc: /* Return the number of color cells of the wgpu display.  */)
+  (Lisp_Object terminal)
+{
+  return make_fixnum (1 << 24);
+}
+
+DEFUN ("x-display-visual-class", Fx_display_visual_class,
+       Sx_display_visual_class, 0, 1, 0,
+       doc: /* Return the visual class of the wgpu display (always true color).  */)
+  (Lisp_Object terminal)
+{
+  return intern ("true-color");
+}
+
+DEFUN ("x-display-screens", Fx_display_screens, Sx_display_screens, 0, 1, 0,
+       doc: /* Return the number of screens on the wgpu display.  */)
+  (Lisp_Object terminal)
+{
+  return make_fixnum (1);
+}
+
+DEFUN ("x-display-pixel-width", Fx_display_pixel_width, Sx_display_pixel_width,
+       0, 1, 0,
+       doc: /* Return the width in pixels of the wgpu display.  */)
+  (Lisp_Object terminal)
+{
+  uint32_t w = 0, h = 0;
+  wgpu_window_size (&w, &h);
+  return make_fixnum (w ? (EMACS_INT) w : 1920);
+}
+
+DEFUN ("x-display-pixel-height", Fx_display_pixel_height,
+       Sx_display_pixel_height, 0, 1, 0,
+       doc: /* Return the height in pixels of the wgpu display.  */)
+  (Lisp_Object terminal)
+{
+  uint32_t w = 0, h = 0;
+  wgpu_window_size (&w, &h);
+  return make_fixnum (h ? (EMACS_INT) h : 1080);
+}
+
+DEFUN ("x-display-mm-width", Fx_display_mm_width, Sx_display_mm_width, 0, 1, 0,
+       doc: /* Return the width in millimeters of the wgpu display.  */)
+  (Lisp_Object terminal)
+{
+  uint32_t w = 0, h = 0;
+  wgpu_window_size (&w, &h);
+  return make_fixnum ((EMACS_INT) ((w ? w : 1920) * 25.4 / 96.0));
+}
+
+DEFUN ("x-display-mm-height", Fx_display_mm_height, Sx_display_mm_height,
+       0, 1, 0,
+       doc: /* Return the height in millimeters of the wgpu display.  */)
+  (Lisp_Object terminal)
+{
+  uint32_t w = 0, h = 0;
+  wgpu_window_size (&w, &h);
+  return make_fixnum ((EMACS_INT) ((h ? h : 1080) * 25.4 / 96.0));
+}
+
+DEFUN ("x-display-backing-store", Fx_display_backing_store,
+       Sx_display_backing_store, 0, 1, 0,
+       doc: /* Return the backing store capability of the wgpu display.  */)
+  (Lisp_Object terminal)
+{
+  return intern ("not-useful");
+}
+
+DEFUN ("x-display-save-under", Fx_display_save_under, Sx_display_save_under,
+       0, 1, 0,
+       doc: /* Return t if the wgpu display supports save-under.  */)
+  (Lisp_Object terminal)
+{
+  return Qnil;
+}
+
 DEFUN ("x-hide-tip", Fx_hide_tip, Sx_hide_tip, 0, 0, 0,
        doc: /* Hide the current tooltip window, if there is any.
 Value is t if tooltip was open, nil otherwise.
@@ -377,5 +501,16 @@ syms_of_wgpufns (void)
   defsubr (&Swgpu__window_dump);
   defsubr (&Sxw_display_color_p);
   defsubr (&Sx_display_grayscale_p);
+  defsubr (&Sxw_color_values);
+  defsubr (&Sx_display_planes);
+  defsubr (&Sx_display_color_cells);
+  defsubr (&Sx_display_visual_class);
+  defsubr (&Sx_display_screens);
+  defsubr (&Sx_display_pixel_width);
+  defsubr (&Sx_display_pixel_height);
+  defsubr (&Sx_display_mm_width);
+  defsubr (&Sx_display_mm_height);
+  defsubr (&Sx_display_backing_store);
+  defsubr (&Sx_display_save_under);
   defsubr (&Sx_hide_tip);
 }

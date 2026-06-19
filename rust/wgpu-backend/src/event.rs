@@ -13,6 +13,14 @@ pub enum WgpuEventKind {
     KeyPress = 0,
     FocusIn = 1,
     FocusOut = 2,
+    /// Pointer moved; x/y carry the surface-relative position.
+    PointerMotion = 3,
+    /// Pointer button pressed; button/x/y are set.
+    PointerPress = 4,
+    /// Pointer button released; button/x/y are set.
+    PointerRelease = 5,
+    /// Scroll wheel/axis; axis_x/axis_y carry the (hi-res) deltas.
+    PointerAxis = 6,
 }
 
 /// Modifier bits (our own encoding; translated to Emacs modifiers on the C
@@ -33,11 +41,61 @@ pub struct WgpuEvent {
     pub unichar: u32,
     /// Modifier mask (WGPU_MOD_*).
     pub modifiers: u32,
+    /// Pointer position in surface pixels (PointerMotion/Press/Release).
+    pub x: i32,
+    pub y: i32,
+    /// Emacs button number (0=left, 1=right, 2=middle, ...) for Press/Release.
+    pub button: u32,
+    /// Event timestamp in milliseconds (pointer events).
+    pub time: u32,
+    /// Hi-res scroll deltas (PointerAxis); +y scrolls down, +x scrolls right.
+    pub axis_x: i32,
+    pub axis_y: i32,
 }
 
 impl WgpuEvent {
+    fn blank(kind: WgpuEventKind) -> Self {
+        Self {
+            kind,
+            keysym: 0,
+            unichar: 0,
+            modifiers: 0,
+            x: 0,
+            y: 0,
+            button: 0,
+            time: 0,
+            axis_x: 0,
+            axis_y: 0,
+        }
+    }
+
     pub fn key(keysym: u32, unichar: u32, modifiers: u32) -> Self {
-        Self { kind: WgpuEventKind::KeyPress, keysym, unichar, modifiers }
+        Self { keysym, unichar, modifiers, ..Self::blank(WgpuEventKind::KeyPress) }
+    }
+
+    pub fn motion(x: i32, y: i32, modifiers: u32, time: u32) -> Self {
+        Self { x, y, modifiers, time, ..Self::blank(WgpuEventKind::PointerMotion) }
+    }
+
+    pub fn button(press: bool, button: u32, x: i32, y: i32, modifiers: u32, time: u32) -> Self {
+        let kind = if press {
+            WgpuEventKind::PointerPress
+        } else {
+            WgpuEventKind::PointerRelease
+        };
+        Self { button, x, y, modifiers, time, ..Self::blank(kind) }
+    }
+
+    pub fn axis(axis_x: i32, axis_y: i32, x: i32, y: i32, modifiers: u32, time: u32) -> Self {
+        Self {
+            axis_x,
+            axis_y,
+            x,
+            y,
+            modifiers,
+            time,
+            ..Self::blank(WgpuEventKind::PointerAxis)
+        }
     }
 }
 

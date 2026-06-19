@@ -37,6 +37,7 @@ use smithay_client_toolkit::{
     registry_handlers,
     seat::{
         keyboard::{KeyEvent, KeyboardHandler, Keysym, Modifiers},
+        pointer::{PointerEvent, PointerEventKind, PointerHandler, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT},
         Capability, SeatHandler, SeatState,
     },
     shell::{
@@ -46,11 +47,13 @@ use smithay_client_toolkit::{
         },
         WaylandSurface,
     },
-    delegate_seat, delegate_keyboard,
+    delegate_seat, delegate_keyboard, delegate_pointer,
 };
 use wayland_client::{
     globals::registry_queue_init,
-    protocol::{wl_keyboard::WlKeyboard, wl_output, wl_seat::WlSeat, wl_surface},
+    protocol::{
+        wl_keyboard::WlKeyboard, wl_output, wl_pointer::WlPointer, wl_seat::WlSeat, wl_surface,
+    },
     Connection, EventQueue, Proxy, QueueHandle,
 };
 
@@ -71,12 +74,25 @@ struct GlyphEntry {
     h: f32,
 }
 
+/// True for X/xkb modifier and lock keysyms, which must not be delivered as
+/// keystrokes (their state is tracked via update_modifiers).
+fn is_modifier_keysym(ks: u32) -> bool {
+    matches!(ks,
+        0xffe1..=0xffee   // Shift_L .. Hyper_R
+        | 0xff7e          // Mode_switch
+        | 0xff7f          // Num_Lock
+        | 0xfe01..=0xfe0f) // ISO_Lock .. ISO_Level5_Lock (incl. Level3_Shift)
+}
+
 /// sctk delegate target + render state.
 struct WinState {
     registry_state: RegistryState,
     output_state: OutputState,
     seat_state: SeatState,
     keyboard: Option<WlKeyboard>,
+    pointer: Option<WlPointer>,
+    /// Last pointer position (surface pixels), for axis events that omit it.
+    pointer_pos: (i32, i32),
     /// Current modifier mask (WGPU_MOD_*).
     mods: u32,
     /// Pending input events for Emacs's read_socket.
@@ -181,6 +197,8 @@ impl WgpuWindow {
             output_state: OutputState::new(&globals, &qh),
             seat_state: SeatState::new(&globals, &qh),
             keyboard: None,
+            pointer: None,
+            pointer_pos: (0, 0),
             mods: 0,
             events: VecDeque::new(),
             window,
@@ -261,12 +279,84 @@ impl WinState {
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
                 format: self.format,
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+                // COPY_DST so scroll can copy a shifted region back in.
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::COPY_SRC
+                    | wgpu::TextureUsages::COPY_DST,
                 view_formats: &[],
             });
             self.persistent = Some(tex);
             self.persistent_size = self.size;
         }
+    }
+
+    /// Scroll a rectangular region of the persistent texture vertically:
+    /// copy [x, from_y, w, h] to [x, to_y, w, h].  Uses a temp texture because
+    /// wgpu forbids overlapping intra-texture copies.  Executed immediately so
+    /// that the newly-exposed lines (recorded afterwards) composite on top at
+    /// the next present.
+    fn scroll(&mut self, x: u32, from_y: u32, w: u32, mut h: u32, to_y: u32) {
+        if w == 0 || h == 0 {
+            return;
+        }
+        self.ensure_persistent();
+        let (tw, th) = self.persistent_size;
+        if x >= tw || from_y >= th || to_y >= th {
+            return;
+        }
+        let w = w.min(tw - x);
+        // Clamp height so neither the source nor destination exceeds the texture.
+        h = h.min(th - from_y).min(th - to_y);
+        if w == 0 || h == 0 {
+            return;
+        }
+        let persistent = self.persistent.as_ref().unwrap();
+        let temp = self.gpu.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("scroll temp"),
+            size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: self.format,
+            usage: wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let mut encoder = self
+            .gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("scroll") });
+        let extent = wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 };
+        encoder.copy_texture_to_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: persistent,
+                mip_level: 0,
+                origin: wgpu::Origin3d { x, y: from_y, z: 0 },
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyTextureInfo {
+                texture: &temp,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            extent,
+        );
+        encoder.copy_texture_to_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &temp,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyTextureInfo {
+                texture: persistent,
+                mip_level: 0,
+                origin: wgpu::Origin3d { x, y: to_y, z: 0 },
+                aspect: wgpu::TextureAspect::All,
+            },
+            extent,
+        );
+        self.gpu.queue.submit(Some(encoder.finish()));
     }
 
     /// Composite recorded commands onto the persistent texture (preserving
@@ -375,11 +465,22 @@ impl SeatHandler for WinState {
                 Err(e) => eprintln!("wgpu: get_keyboard failed: {e}"),
             }
         }
+        if capability == Capability::Pointer && self.pointer.is_none() {
+            match self.seat_state.get_pointer(qh, &seat) {
+                Ok(ptr) => self.pointer = Some(ptr),
+                Err(e) => eprintln!("wgpu: get_pointer failed: {e}"),
+            }
+        }
     }
     fn remove_capability(&mut self, _: &Connection, _: &QueueHandle<Self>, _: WlSeat, capability: Capability) {
         if capability == Capability::Keyboard {
             if let Some(kbd) = self.keyboard.take() {
                 kbd.release ();
+            }
+        }
+        if capability == Capability::Pointer {
+            if let Some(ptr) = self.pointer.take() {
+                ptr.release ();
             }
         }
     }
@@ -394,14 +495,20 @@ impl KeyboardHandler for WinState {
 
     fn press_key(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlKeyboard,
                  _: u32, event: KeyEvent) {
+        let ks = event.keysym.raw();
+        // Modifier/lock keys are tracked via update_modifiers; they must not
+        // be delivered as keystrokes (otherwise e.g. Super_L = 0xffeb arrives
+        // as a bogus key and breaks prefix sequences).
+        if is_modifier_keysym(ks) {
+            return;
+        }
         let unichar = event
             .utf8
             .as_ref()
             .and_then(|s| s.chars().next())
             .map(|c| c as u32)
             .unwrap_or(0);
-        self.events
-            .push_back(WgpuEvent::key(event.keysym.raw(), unichar, self.mods));
+        self.events.push_back(WgpuEvent::key(ks, unichar, self.mods));
     }
 
     fn release_key(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlKeyboard,
@@ -418,6 +525,72 @@ impl KeyboardHandler for WinState {
     }
 }
 
+/// Map a Linux/Wayland button code to an Emacs button number.
+/// Emacs uses 0=left (mouse-1), 1=middle (mouse-2), 2=right (mouse-3).
+fn button_to_emacs(btn: u32) -> u32 {
+    match btn {
+        BTN_LEFT => 0,
+        BTN_MIDDLE => 1,
+        BTN_RIGHT => 2,
+        // Side/extra and others: 0x113 -> 3, 0x114 -> 4, ...
+        other => other.wrapping_sub(BTN_LEFT),
+    }
+}
+
+/// Reduce an axis to a signed step count (notches), preferring the discrete
+/// value and falling back to the sign of the pixel delta for touchpads.
+fn axis_steps(a: &smithay_client_toolkit::seat::pointer::AxisScroll) -> i32 {
+    if a.discrete != 0 {
+        a.discrete
+    } else if a.absolute > 0.0 {
+        1
+    } else if a.absolute < 0.0 {
+        -1
+    } else {
+        0
+    }
+}
+
+impl PointerHandler for WinState {
+    fn pointer_frame(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlPointer,
+                     events: &[PointerEvent]) {
+        for e in events {
+            let x = e.position.0 as i32;
+            let y = e.position.1 as i32;
+            match &e.kind {
+                PointerEventKind::Enter { .. } => {
+                    self.pointer_pos = (x, y);
+                    self.events.push_back(WgpuEvent::motion(x, y, self.mods, 0));
+                }
+                PointerEventKind::Motion { time } => {
+                    self.pointer_pos = (x, y);
+                    self.events.push_back(WgpuEvent::motion(x, y, self.mods, *time));
+                }
+                PointerEventKind::Leave { .. } => {}
+                PointerEventKind::Press { time, button, .. } => {
+                    self.pointer_pos = (x, y);
+                    self.events.push_back(WgpuEvent::button(
+                        true, button_to_emacs(*button), x, y, self.mods, *time));
+                }
+                PointerEventKind::Release { time, button, .. } => {
+                    self.pointer_pos = (x, y);
+                    self.events.push_back(WgpuEvent::button(
+                        false, button_to_emacs(*button), x, y, self.mods, *time));
+                }
+                PointerEventKind::Axis { time, horizontal, vertical, .. } => {
+                    let hx = axis_steps(horizontal);
+                    let vy = axis_steps(vertical);
+                    if hx != 0 || vy != 0 {
+                        let (px, py) = self.pointer_pos;
+                        self.events.push_back(
+                            WgpuEvent::axis(hx, vy, px, py, self.mods, *time));
+                    }
+                }
+            }
+        }
+    }
+}
+
 impl ProvidesRegistryState for WinState {
     fn registry(&mut self) -> &mut RegistryState {
         &mut self.registry_state
@@ -429,6 +602,7 @@ delegate_compositor!(WinState);
 delegate_output!(WinState);
 delegate_seat!(WinState);
 delegate_keyboard!(WinState);
+delegate_pointer!(WinState);
 delegate_xdg_shell!(WinState);
 delegate_xdg_window!(WinState);
 delegate_registry!(WinState);
@@ -560,11 +734,13 @@ pub unsafe extern "C" fn wgpu_window_poll_events(buf: *mut WgpuEvent, max: c_int
     )
 }
 
-/// Start a new batch of draw commands.
+/// Begin a redisplay batch.  NOTE: this must NOT clear the command list --
+/// Emacs calls update_begin per window/region (many times) with a single
+/// frame_up_to_date at the end; clearing here would drop all but the last
+/// update and cause heavy artifacting.  Commands accumulate and are cleared by
+/// `present` after they are composited onto the persistent texture.
 #[no_mangle]
-pub extern "C" fn wgpu_window_begin() {
-    with_window(|win| win.state.cmds.clear(), ());
-}
+pub extern "C" fn wgpu_window_begin() {}
 
 /// Record a solid filled rectangle (pixels, linear RGBA 0..=1).
 #[no_mangle]
@@ -592,6 +768,19 @@ pub extern "C" fn wgpu_window_glyph(id: i64, x: f32, y: f32, r: f32, g: f32, b: 
 #[no_mangle]
 pub extern "C" fn wgpu_window_present() {
     with_window(|win| win.state.present(), ());
+}
+
+/// Scroll the region [x, from_y, w, h] of the persistent frame to [x, to_y].
+/// Called from scroll_run before the newly-exposed lines are drawn.
+#[no_mangle]
+pub extern "C" fn wgpu_window_scroll(x: c_int, from_y: c_int, w: c_int, h: c_int, to_y: c_int) {
+    if x < 0 || from_y < 0 || to_y < 0 || w <= 0 || h <= 0 {
+        return;
+    }
+    with_window(
+        |win| win.state.scroll(x as u32, from_y as u32, w as u32, h as u32, to_y as u32),
+        (),
+    );
 }
 
 /// If the compositor asked for a new size since the last call, write it to

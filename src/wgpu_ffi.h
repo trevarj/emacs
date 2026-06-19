@@ -34,6 +34,22 @@ typedef enum {
   WgpuEventKind_KeyPress = 0,
   WgpuEventKind_FocusIn = 1,
   WgpuEventKind_FocusOut = 2,
+  /**
+   * Pointer moved; x/y carry the surface-relative position.
+   */
+  WgpuEventKind_PointerMotion = 3,
+  /**
+   * Pointer button pressed; button/x/y are set.
+   */
+  WgpuEventKind_PointerPress = 4,
+  /**
+   * Pointer button released; button/x/y are set.
+   */
+  WgpuEventKind_PointerRelease = 5,
+  /**
+   * Scroll wheel/axis; axis_x/axis_y carry the (hi-res) deltas.
+   */
+  WgpuEventKind_PointerAxis = 6,
 } WgpuEventKind;
 
 /**
@@ -53,6 +69,24 @@ typedef struct {
    * Modifier mask (WGPU_MOD_*).
    */
   uint32_t modifiers;
+  /**
+   * Pointer position in surface pixels (PointerMotion/Press/Release).
+   */
+  int32_t x;
+  int32_t y;
+  /**
+   * Emacs button number (0=left, 1=right, 2=middle, ...) for Press/Release.
+   */
+  uint32_t button;
+  /**
+   * Event timestamp in milliseconds (pointer events).
+   */
+  uint32_t time;
+  /**
+   * Hi-res scroll deltas (PointerAxis); +y scrolls down, +x scrolls right.
+   */
+  int32_t axis_x;
+  int32_t axis_y;
 } WgpuEvent;
 
 #ifdef __cplusplus
@@ -220,7 +254,11 @@ int64_t wgpu_window_atlas_upload(uint32_t w, uint32_t h, const uint8_t *data, ui
 int wgpu_window_poll_events(WgpuEvent *buf, int max);
 
 /**
- * Start a new batch of draw commands.
+ * Begin a redisplay batch.  NOTE: this must NOT clear the command list --
+ * Emacs calls update_begin per window/region (many times) with a single
+ * frame_up_to_date at the end; clearing here would drop all but the last
+ * update and cause heavy artifacting.  Commands accumulate and are cleared by
+ * `present` after they are composited onto the persistent texture.
  */
 void wgpu_window_begin(void);
 
@@ -238,6 +276,12 @@ void wgpu_window_glyph(int64_t id, float x, float y, float r, float g, float b, 
  * Composite the recorded commands and present to the window.
  */
 void wgpu_window_present(void);
+
+/**
+ * Scroll the region [x, from_y, w, h] of the persistent frame to [x, to_y].
+ * Called from scroll_run before the newly-exposed lines are drawn.
+ */
+void wgpu_window_scroll(int x, int from_y, int w, int h, int to_y);
 
 /**
  * If the compositor asked for a new size since the last call, write it to
