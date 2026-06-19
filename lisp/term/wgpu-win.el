@@ -59,5 +59,6 @@
 ;; Any display name maps to the wgpu backend.
 (add-to-list 'display-format-alist '(".*" . wgpu))
 
+(provide 'wgpu-win)
 (provide 'term/wgpu-win)
 ;;; wgpu-win.el ends here

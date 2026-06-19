@@ -19,6 +19,7 @@
 //! from one thread, so no locking or Send/Sync is needed.
 
 use std::cell::RefCell;
+use std::mem::ManuallyDrop;
 use std::os::raw::{c_char, c_int};
 use std::os::unix::io::AsRawFd;
 use std::ptr::NonNull;
@@ -50,8 +51,11 @@ use wayland_client::{
 use crate::gpu2d::{DrawCmd, Renderer};
 use crate::render::Gpu;
 
+// ManuallyDrop: at process exit (and on close) we deliberately leak the
+// wgpu/Wayland resources rather than run their destructors, which crash inside
+// libwayland during teardown. The OS reclaims everything on exit.
 thread_local! {
-    static WINDOW: RefCell<Option<WgpuWindow>> = const { RefCell::new(None) };
+    static WINDOW: RefCell<Option<ManuallyDrop<WgpuWindow>>> = const { RefCell::new(None) };
 }
 
 struct GlyphEntry {
@@ -327,7 +331,7 @@ delegate_registry!(WinState);
 
 fn with_window<R>(f: impl FnOnce(&mut WgpuWindow) -> R, default: R) -> R {
     WINDOW.with(|w| match w.borrow_mut().as_mut() {
-        Some(win) => f(win),
+        Some(win) => f(&mut **win),
         None => default,
     })
 }
@@ -346,7 +350,7 @@ pub unsafe extern "C" fn wgpu_window_open(title: *const c_char) -> c_int {
     };
     match WgpuWindow::open(&title) {
         Ok(win) => {
-            WINDOW.with(|w| *w.borrow_mut() = Some(win));
+            WINDOW.with(|w| *w.borrow_mut() = Some(ManuallyDrop::new(win)));
             0
         }
         Err(e) => {

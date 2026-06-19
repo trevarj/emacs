@@ -963,6 +963,11 @@ default_pixels_per_inch_y (void)
 #else
 #define FRAME_ANDROID_P(f) ((f)->output_method == output_android)
 #endif
+#ifndef HAVE_WGPU
+#define FRAME_WGPU_P(f) false
+#else
+#define FRAME_WGPU_P(f) ((f)->output_method == output_wgpu)
+#endif
 
 /* FRAME_WINDOW_P tests whether the frame is a graphical window system
    frame.  */
@@ -983,6 +988,9 @@ default_pixels_per_inch_y (void)
 #endif
 #ifdef HAVE_ANDROID
 #define FRAME_WINDOW_P(f) FRAME_ANDROID_P (f)
+#endif
+#ifdef HAVE_WGPU
+#define FRAME_WINDOW_P(f) FRAME_WGPU_P (f)
 #endif
 #ifndef FRAME_WINDOW_P
 #define FRAME_WINDOW_P(f) ((void) (f), false)
