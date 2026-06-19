@@ -3,9 +3,11 @@
 Golden-image and bring-up tests for the experimental wgpu (Wayland + GPU)
 backend.  See `../../../wgpu-backend-plan.md`.
 
-## Standalone Rust window (M1c)
+## Standalone Rust window (M1c/M2)
 
-Open a Wayland window presenting a clear color (needs `WAYLAND_DISPLAY`):
+Open a Wayland window that renders demo content (a row of atlas glyphs + a
+cursor fill, over a clear background) via the same `Renderer` the offscreen
+golden path uses (needs `WAYLAND_DISPLAY`):
 
 ```sh
 cd rust/wgpu-backend
