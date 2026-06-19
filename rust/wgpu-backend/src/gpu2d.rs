@@ -166,10 +166,12 @@ impl Renderer {
             source: wgpu::ShaderSource::Wgsl(SHADER.into()),
         });
 
+        // Nearest: glyphs are blitted 1:1 (atlas region size == quad pixel
+        // size at integer positions), so point sampling keeps them crisp.
         let sampler = gpu.device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("atlas sampler"),
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
+            mag_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Nearest,
             ..Default::default()
         });
         let uniform = gpu.device.create_buffer(&wgpu::BufferDescriptor {
@@ -372,7 +374,7 @@ mod tests {
     #[ignore]
     fn draws_rect_and_glyph() {
         let gpu = Gpu::new_headless().expect("gpu");
-        let mut r = Renderer::new(&gpu, wgpu::TextureFormat::Rgba8UnormSrgb);
+        let mut r = Renderer::new(&gpu, crate::render::TARGET_FORMAT);
 
         // A 4x4 fully-opaque "glyph".
         let uv = r.add_glyph(&gpu, 4, 4, &[255u8; 16]).expect("atlas");
