@@ -15,6 +15,28 @@ guix shell -m ../../manifest.scm -- cargo run --example clear_color        # unt
 guix shell -m ../../manifest.scm -- cargo run --example clear_color -- 90   # 90 frames
 ```
 
+## Windowed tests without disturbing your session
+
+Do NOT run windowed tests (or inject keys) against your live `WAYLAND_DISPLAY`
+-- the window competes for focus while you're working.  Run a private headless
+compositor on a separate socket and point Emacs at it:
+
+```sh
+guix shell weston -- weston --backend=headless-backend.so \
+  --socket=wgpu-test --width=2560 --height=1440 --idle-time=0 &
+WAYLAND_DISPLAY=wgpu-test guix shell -m manifest.scm -- \
+  env -u EMACSLOADPATH ./src/emacs -Q
+```
+
+Drive editing with `--eval` (not key injection) and read back state, e.g.:
+
+```sh
+... ./src/emacs -Q --eval '(run-with-timer 1.5 nil (lambda ()
+  (switch-to-buffer "*scratch*") (erase-buffer)
+  (dotimes (i 50) (insert (format "line %d\n" i)) (redisplay))
+  (kill-emacs 0)))'
+```
+
 ## Offscreen golden images (M1d)
 
 The offscreen render path is deterministic and needs only a Vulkan/GL device
