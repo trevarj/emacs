@@ -8,6 +8,8 @@ See wgpu-backend-plan.md.  */
 
 #include <config.h>
 
+#include <string.h>
+
 #include "lisp.h"
 #include "frame.h"
 #include "dispextern.h"
@@ -72,6 +74,52 @@ M1: the rendered content is a solid clear color; M2 makes it glyph-aware.  */)
   return Qt;
 }
 
+/* Build a small deterministic demo frame using the frame-command FFI: a row
+   of synthetic "glyphs" plus a cursor block.  Exercises the exact path the RIF
+   draw hooks will use (atlas upload + fills + glyph quads), end to end from
+   Lisp, headless.  M2 placeholder until redisplay drives these calls.  */
+static void
+wgpu_build_demo (uint32_t w, uint32_t h)
+{
+  wgpu_frame_begin (w, h, 0.07, 0.15, 0.18, 1.0);
+
+  /* A 6x10 solid coverage "glyph".  */
+  unsigned char glyph[6 * 10];
+  memset (glyph, 255, sizeof glyph);
+  int64_t g = wgpu_atlas_upload (6, 10, glyph, sizeof glyph);
+
+  /* A row of five glyphs in near-white.  */
+  for (int i = 0; i < 5; i++)
+    wgpu_frame_glyph (g, 8.0f + i * 12, 10.0f, 0.9f, 0.9f, 0.9f, 1.0f);
+
+  /* A red cursor block after them.  */
+  wgpu_frame_rect (74.0f, 8.0f, 8.0f, 14.0f, 0.8f, 0.1f, 0.1f, 1.0f);
+}
+
+DEFUN ("wgpu--draw-demo", Fwgpu__draw_demo, Swgpu__draw_demo, 1, 1, 0,
+       doc: /* Render the M2 demo frame to FILE as a PNG (test helper).  */)
+  (Lisp_Object file)
+{
+  CHECK_STRING (file);
+  wgpu_build_demo (128, 48);
+  if (wgpu_frame_end_png (SSDATA (ENCODE_FILE (file))) != 0)
+    error ("wgpu--draw-demo: render failed (no GPU?)");
+  return Qt;
+}
+
+DEFUN ("wgpu--demo-rgba", Fwgpu__demo_rgba, Swgpu__demo_rgba, 0, 0, 0,
+       doc: /* Return the M2 demo frame as RGBA8 bytes (128x48; test helper).  */)
+  (void)
+{
+  uint32_t w = 128, h = 48;
+  wgpu_build_demo (w, h);
+  ptrdiff_t n = (ptrdiff_t) w * h * 4;
+  Lisp_Object s = make_uninit_string (n);
+  if (wgpu_frame_end_rgba (SDATA (s), n) != 0)
+    error ("wgpu--demo-rgba: render failed (no GPU?)");
+  return s;
+}
+
 DEFUN ("wgpu--frame-rgba", Fwgpu__frame_rgba, Swgpu__frame_rgba, 0, 2, 0,
        doc: /* Return WIDTHxHEIGHT offscreen-rendered pixels as RGBA8 bytes.
 A unibyte string of WIDTH*HEIGHT*4 bytes, row-major, top-down.  WIDTH and
@@ -132,6 +180,8 @@ syms_of_wgpufns (void)
 {
   defsubr (&Swgpu_dump_frame);
   defsubr (&Swgpu__frame_rgba);
+  defsubr (&Swgpu__draw_demo);
+  defsubr (&Swgpu__demo_rgba);
   defsubr (&Sxw_display_color_p);
   defsubr (&Sx_display_grayscale_p);
   defsubr (&Sx_hide_tip);
