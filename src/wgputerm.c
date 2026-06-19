@@ -466,6 +466,35 @@ wgpu_draw_glyph_string (struct glyph_string *s)
 				? fg : s->face->underline_color);
 	    wgpu_draw_underline (s, ul);
 	  }
+
+	/* Overline.  */
+	if (s->face->overline_p && !s->for_overlaps)
+	  {
+	    unsigned long oc = (s->face->overline_color_defaulted_p
+				? fg : s->face->overline_color);
+	    float r, g, b;
+	    wgpu_unpack_pixel (oc, &r, &g, &b);
+	    block_input ();
+	    wgpu_window_rect ((float) s->x, (float) s->y, (float) s->width,
+			      1.0f, r, g, b, 1.0f);
+	    unblock_input ();
+	  }
+
+	/* Strike-through (centered on the first glyph's box).  */
+	if (s->face->strike_through_p && !s->for_overlaps)
+	  {
+	    int glyph_y = s->ybase - s->first_glyph->ascent;
+	    int glyph_h = s->first_glyph->ascent + s->first_glyph->descent;
+	    int dy = (glyph_h - 1) / 2;
+	    unsigned long sc = (s->face->strike_through_color_defaulted_p
+				? fg : s->face->strike_through_color);
+	    float r, g, b;
+	    wgpu_unpack_pixel (sc, &r, &g, &b);
+	    block_input ();
+	    wgpu_window_rect ((float) s->x, (float) (glyph_y + dy),
+			      (float) s->width, 1.0f, r, g, b, 1.0f);
+	    unblock_input ();
+	  }
       }
       break;
 
