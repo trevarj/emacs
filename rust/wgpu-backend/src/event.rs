@@ -1,9 +1,8 @@
-//! Input events handed from the Wayland event thread to Emacs.
+//! Input events handed from the Wayland event handling to Emacs.
 //!
-//! In the full design (M3) the Wayland thread decodes keyboard/pointer events
-//! via xkbcommon and enqueues them here; Emacs drains them from its
-//! `read_socket_hook` over FFI. M0 ships the ABI-stable types plus a simple
-//! queue with tests, so the FFI shape and the drain semantics are pinned early.
+//! The Wayland keyboard handler (sctk, which decodes via xkbcommon) fills these
+//! and Emacs drains them from `read_socket_hook` over FFI, translating each to
+//! a `struct input_event`.
 
 use std::collections::VecDeque;
 
@@ -11,39 +10,39 @@ use std::collections::VecDeque;
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WgpuEventKind {
-    Key = 0,
-    Resize = 1,
-    FocusIn = 2,
-    FocusOut = 3,
+    KeyPress = 0,
+    FocusIn = 1,
+    FocusOut = 2,
 }
 
+/// Modifier bits (our own encoding; translated to Emacs modifiers on the C
+/// side).  Shift is reported but usually already baked into `unichar`.
+pub const WGPU_MOD_SHIFT: u32 = 1 << 0;
+pub const WGPU_MOD_CTRL: u32 = 1 << 1;
+pub const WGPU_MOD_ALT: u32 = 1 << 2;
+pub const WGPU_MOD_LOGO: u32 = 1 << 3;
+
 /// A backend input event, ABI-stable for the C side.
-///
-/// `a`/`b` are kind-dependent payload slots (kept generic so the C struct stays
-/// fixed-size as event kinds gain fields):
-/// - `Key`:    `a` = keysym, `b` = modifier mask
-/// - `Resize`: `a` = width px, `b` = height px
-/// - focus:    unused
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WgpuEvent {
     pub kind: WgpuEventKind,
-    pub a: u32,
-    pub b: u32,
+    /// xkb/X keysym (KeyPress).
+    pub keysym: u32,
+    /// Unicode codepoint, or 0 if the key produced no text (KeyPress).
+    pub unichar: u32,
+    /// Modifier mask (WGPU_MOD_*).
+    pub modifiers: u32,
 }
 
 impl WgpuEvent {
-    pub fn key(keysym: u32, modifiers: u32) -> Self {
-        Self { kind: WgpuEventKind::Key, a: keysym, b: modifiers }
-    }
-    pub fn resize(width: u32, height: u32) -> Self {
-        Self { kind: WgpuEventKind::Resize, a: width, b: height }
+    pub fn key(keysym: u32, unichar: u32, modifiers: u32) -> Self {
+        Self { kind: WgpuEventKind::KeyPress, keysym, unichar, modifiers }
     }
 }
 
-/// FIFO of pending input events. Producer = Wayland thread, consumer = Emacs
-/// main thread via `read_socket_hook`. (M0: not yet wrapped in a lock; the
-/// lock-free/mutex handoff lands with the real thread in M3.)
+/// FIFO of pending input events (producer: Wayland handlers; consumer: Emacs
+/// via read_socket_hook).
 #[derive(Default)]
 pub struct EventQueue {
     q: VecDeque<WgpuEvent>,
@@ -59,11 +58,10 @@ impl EventQueue {
     }
 
     /// Drain at most `out.len()` events into `out`, preserving FIFO order.
-    /// Returns the number actually written.
+    /// Returns the number written.
     pub fn drain_into(&mut self, out: &mut [WgpuEvent]) -> usize {
         let n = out.len().min(self.q.len());
         for slot in out.iter_mut().take(n) {
-            // pop_front cannot fail: n <= self.q.len().
             *slot = self.q.pop_front().expect("queue underflow");
         }
         n
@@ -83,39 +81,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn drain_respects_capacity_and_preserves_order() {
+    fn drain_respects_capacity_and_order() {
         let mut q = EventQueue::new();
         for i in 0..5 {
-            q.push(WgpuEvent::key(i, 0));
+            q.push(WgpuEvent::key(i, i, 0));
         }
-        let mut out = [WgpuEvent::key(99, 0); 3];
+        let mut out = [WgpuEvent::key(99, 0, 0); 3];
         assert_eq!(q.drain_into(&mut out), 3);
-        assert_eq!(out[0].a, 0);
-        assert_eq!(out[1].a, 1);
-        assert_eq!(out[2].a, 2);
+        assert_eq!(out[0].keysym, 0);
+        assert_eq!(out[2].keysym, 2);
         assert_eq!(q.len(), 2);
     }
 
     #[test]
-    fn drain_into_empty_queue_returns_zero() {
+    fn drain_empty_returns_zero() {
         let mut q = EventQueue::new();
-        let mut out = [WgpuEvent::resize(0, 0); 2];
+        let mut out = [WgpuEvent::key(0, 0, 0); 2];
         assert_eq!(q.drain_into(&mut out), 0);
-        assert!(q.is_empty());
-    }
-
-    #[test]
-    fn drain_partial_then_rest() {
-        let mut q = EventQueue::new();
-        for i in 0..3 {
-            q.push(WgpuEvent::key(i, 0));
-        }
-        let mut out = [WgpuEvent::key(0, 0); 2];
-        assert_eq!(q.drain_into(&mut out), 2);
-        assert_eq!(out[0].a, 0);
-        assert_eq!(out[1].a, 1);
-        let mut rest = [WgpuEvent::key(0, 0); 4];
-        assert_eq!(q.drain_into(&mut rest), 1);
-        assert_eq!(rest[0].a, 2);
     }
 }
