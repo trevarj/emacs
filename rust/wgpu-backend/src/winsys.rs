@@ -164,8 +164,15 @@ impl WgpuWindow {
         .map_err(|e| format!("request_device: {e}"))?;
         let gpu = Gpu { instance, adapter, device, queue };
 
+        // Prefer a non-sRGB (UNORM) surface so our already-sRGB-encoded colors
+        // pass through and glyph AA blends in gamma space (crisp text).
         let caps = surface.get_capabilities(&gpu.adapter);
-        let format = caps.formats.iter().copied().find(|f| f.is_srgb()).unwrap_or(caps.formats[0]);
+        let format = caps
+            .formats
+            .iter()
+            .copied()
+            .find(|f| !f.is_srgb())
+            .unwrap_or(caps.formats[0]);
         let alpha_mode = caps.alpha_modes[0];
         let renderer = Renderer::new(&gpu, format);
 

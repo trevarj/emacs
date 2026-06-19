@@ -54,7 +54,7 @@ fn ensure(slot: &mut Option<Frame>) -> Option<&mut Frame> {
                 return None;
             }
         };
-        let renderer = Renderer::new(&gpu, wgpu::TextureFormat::Rgba8UnormSrgb);
+        let renderer = Renderer::new(&gpu, crate::render::TARGET_FORMAT);
         *slot = Some(Frame {
             gpu,
             renderer,

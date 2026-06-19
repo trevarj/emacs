@@ -65,6 +65,13 @@ impl Gpu {
     }
 }
 
+/// The offscreen target format.  Non-sRGB (UNORM) so colors and glyph AA are
+/// composited in gamma (sRGB-value) space: values pass through unchanged and
+/// coverage blends perceptually, which keeps text crisp and correctly weighted
+/// (an sRGB target would re-encode our already-sRGB byte colors and blend AA
+/// in linear space, washing text out).
+pub const TARGET_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
+
 /// Create an offscreen color target suitable for rendering then reading back.
 pub fn create_target(gpu: &Gpu, width: u32, height: u32) -> wgpu::Texture {
     gpu.device.create_texture(&wgpu::TextureDescriptor {
@@ -73,7 +80,7 @@ pub fn create_target(gpu: &Gpu, width: u32, height: u32) -> wgpu::Texture {
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        format: TARGET_FORMAT,
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
         view_formats: &[],
     })
