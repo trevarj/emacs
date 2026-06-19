@@ -369,8 +369,26 @@ wgpu_scroll_run (struct window *w, struct run *run)
 }
 static void wgpu_after_update_window_line (struct window *w, struct glyph_row *r) {}
 static void wgpu_flush_display (struct frame *f) {}
-static void wgpu_draw_fringe_bitmap (struct window *w, struct glyph_row *row,
-				     struct draw_fringe_bitmap_params *p) {}
+
+/* Clear the fringe background so stale pixels (e.g. a region highlight that
+   reached the fringe) don't linger.  The actual fringe bitmaps (continuation
+   arrows, etc.) are not yet rendered.  */
+static void
+wgpu_draw_fringe_bitmap (struct window *w, struct glyph_row *row,
+			 struct draw_fringe_bitmap_params *p)
+{
+  struct frame *f = XFRAME (WINDOW_FRAME (w));
+  if (p->bx < 0 || p->nx <= 0 || p->ny <= 0)
+    return;
+  unsigned long bg = (p->face ? p->face->background
+		      : FRAME_BACKGROUND_PIXEL (f));
+  float r, g, b;
+  wgpu_unpack_pixel (bg, &r, &g, &b);
+  block_input ();
+  wgpu_window_rect ((float) p->bx, (float) p->by, (float) p->nx,
+		    (float) p->ny, r, g, b, 1.0f);
+  unblock_input ();
+}
 static void wgpu_define_fringe_bitmap (int which, unsigned short *bits,
 				       int h, int wd) {}
 static void wgpu_destroy_fringe_bitmap (int which) {}
@@ -560,9 +578,15 @@ wgpu_clear_frame (struct frame *f)
 {
   float r, g, b;
   wgpu_unpack_pixel (FRAME_BACKGROUND_PIXEL (f), &r, &g, &b);
+  /* Clear the whole surface, not just the frame: when the frame rounds down
+     to whole rows/columns it is slightly smaller than the Wayland surface,
+     and the leftover strip would otherwise show stale pixels.  */
+  uint32_t sw = 0, sh = 0;
+  wgpu_window_size (&sw, &sh);
+  float w = (float) max ((int) sw, FRAME_PIXEL_WIDTH (f));
+  float h = (float) max ((int) sh, FRAME_PIXEL_HEIGHT (f));
   block_input ();
-  wgpu_window_rect (0.0f, 0.0f, (float) FRAME_PIXEL_WIDTH (f),
-		    (float) FRAME_PIXEL_HEIGHT (f), r, g, b, 1.0f);
+  wgpu_window_rect (0.0f, 0.0f, w, h, r, g, b, 1.0f);
   unblock_input ();
 }
 
