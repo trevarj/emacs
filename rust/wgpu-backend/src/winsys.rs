@@ -570,11 +570,16 @@ impl SeatHandler for WinState {
 
 impl KeyboardHandler for WinState {
     fn enter(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlKeyboard,
-             _: &wl_surface::WlSurface, _: u32, _: &[u32], _: &[Keysym]) {}
+             _: &wl_surface::WlSurface, _: u32, _: &[u32], _: &[Keysym]) {
+        // Keyboard focus gained -> frame focus in (cursor goes solid).
+        self.events.push_back(WgpuEvent::focus(true));
+    }
     fn leave(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlKeyboard,
              _: &wl_surface::WlSurface, _: u32) {
-        // Lost focus: stop repeating so a held key doesn't keep firing.
+        // Lost focus: stop repeating so a held key doesn't keep firing, and
+        // tell Emacs so the cursor goes hollow.
         self.disarm_repeat();
+        self.events.push_back(WgpuEvent::focus(false));
     }
 
     fn press_key(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlKeyboard,

@@ -392,9 +392,94 @@ wgpu_draw_fringe_bitmap (struct window *w, struct glyph_row *row,
 static void wgpu_define_fringe_bitmap (int which, unsigned short *bits,
 				       int h, int wd) {}
 static void wgpu_destroy_fringe_bitmap (int which) {}
-static void wgpu_clear_under_internal_border (struct frame *f) {}
-static void wgpu_draw_vertical_window_border (struct window *w, int x, int y0, int y1) {}
-static void wgpu_draw_window_divider (struct window *w, int x0, int x1, int y0, int y1) {}
+
+/* Fill a frame-relative rectangle with a packed pixel color.  */
+static void
+wgpu_fill_rect_pixel (int x, int y, int w, int h, unsigned long pixel)
+{
+  if (w <= 0 || h <= 0)
+    return;
+  float r, g, b;
+  wgpu_unpack_pixel (pixel, &r, &g, &b);
+  wgpu_window_rect ((float) x, (float) y, (float) w, (float) h, r, g, b, 1.0f);
+}
+
+/* Fill the internal border strips so no stale pixels show when the window
+   layout changes.  */
+static void
+wgpu_clear_under_internal_border (struct frame *f)
+{
+  int border = FRAME_INTERNAL_BORDER_WIDTH (f);
+  if (border <= 0)
+    return;
+  int width = FRAME_PIXEL_WIDTH (f);
+  int height = FRAME_PIXEL_HEIGHT (f);
+  int margin = FRAME_TOP_MARGIN_HEIGHT (f);
+  int bottom_margin = FRAME_BOTTOM_MARGIN_HEIGHT (f);
+  int face_id = (FRAME_PARENT_FRAME (f)
+		 ? CHILD_FRAME_BORDER_FACE_ID : INTERNAL_BORDER_FACE_ID);
+  if (!NILP (Vface_remapping_alist))
+    face_id = lookup_basic_face (NULL, f, face_id);
+  struct face *face = FACE_FROM_ID_OR_NULL (f, face_id);
+  unsigned long pixel = face ? face->background : FRAME_BACKGROUND_PIXEL (f);
+
+  block_input ();
+  wgpu_fill_rect_pixel (0, margin, width, border, pixel);
+  wgpu_fill_rect_pixel (0, 0, border, height, pixel);
+  wgpu_fill_rect_pixel (width - border, 0, border, height, pixel);
+  wgpu_fill_rect_pixel (0, height - bottom_margin - border, width, border, pixel);
+  unblock_input ();
+}
+
+/* 1px line separating side-by-side windows (no divider configured).  */
+static void
+wgpu_draw_vertical_window_border (struct window *w, int x, int y0, int y1)
+{
+  struct frame *f = XFRAME (WINDOW_FRAME (w));
+  struct face *face = FACE_FROM_ID_OR_NULL (f, VERTICAL_BORDER_FACE_ID);
+  unsigned long pixel = face ? face->foreground : FRAME_FOREGROUND_PIXEL (f);
+  block_input ();
+  wgpu_fill_rect_pixel (x, y0, 1, y1 - y0, pixel);
+  unblock_input ();
+}
+
+/* Window divider (the draggable separator), drawn with first/middle/last
+   pixel faces so it gets a subtle 3D edge like the other backends.  */
+static void
+wgpu_draw_window_divider (struct window *w, int x0, int x1, int y0, int y1)
+{
+  struct frame *f = XFRAME (WINDOW_FRAME (w));
+  struct face *face = FACE_FROM_ID_OR_NULL (f, WINDOW_DIVIDER_FACE_ID);
+  struct face *face_first
+    = FACE_FROM_ID_OR_NULL (f, WINDOW_DIVIDER_FIRST_PIXEL_FACE_ID);
+  struct face *face_last
+    = FACE_FROM_ID_OR_NULL (f, WINDOW_DIVIDER_LAST_PIXEL_FACE_ID);
+  unsigned long color = face ? face->foreground : FRAME_FOREGROUND_PIXEL (f);
+  unsigned long color_first
+    = face_first ? face_first->foreground : FRAME_FOREGROUND_PIXEL (f);
+  unsigned long color_last
+    = face_last ? face_last->foreground : FRAME_FOREGROUND_PIXEL (f);
+
+  block_input ();
+  if (y1 - y0 > x1 - x0 && x1 - x0 > 2)
+    {
+      /* Vertical divider.  */
+      wgpu_fill_rect_pixel (x0, y0, 1, y1 - y0, color_first);
+      wgpu_fill_rect_pixel (x0 + 1, y0, x1 - x0 - 2, y1 - y0, color);
+      wgpu_fill_rect_pixel (x1 - 1, y0, 1, y1 - y0, color_last);
+    }
+  else if (x1 - x0 > y1 - y0 && y1 - y0 > 3)
+    {
+      /* Horizontal divider.  */
+      wgpu_fill_rect_pixel (x0, y0, x1 - x0, 1, color_first);
+      wgpu_fill_rect_pixel (x0, y0 + 1, x1 - x0, y1 - y0 - 2, color);
+      wgpu_fill_rect_pixel (x0, y1 - 1, x1 - x0, 1, color_last);
+    }
+  else
+    wgpu_fill_rect_pixel (x0, y0, x1 - x0, y1 - y0, color);
+  unblock_input ();
+}
+
 static void wgpu_define_frame_cursor (struct frame *f, Emacs_Cursor cursor) {}
 static void wgpu_show_hourglass (struct frame *f) {}
 static void wgpu_hide_hourglass (struct frame *f) {}
@@ -623,6 +708,54 @@ wgpu_any_frame (struct terminal *terminal)
   return NULL;
 }
 
+/* Update which frame is highlighted (focused).  The cursor is drawn solid
+   only on the highlight frame; others get a hollow cursor (xdisp.c checks
+   f != dpyinfo->highlight_frame).  */
+static void
+wgpu_frame_rehighlight (struct wgpu_display_info *dpyinfo)
+{
+  struct frame *old_highlight = dpyinfo->highlight_frame;
+
+  if (dpyinfo->x_focus_frame)
+    {
+      dpyinfo->highlight_frame
+	= (FRAMEP (FRAME_FOCUS_FRAME (dpyinfo->x_focus_frame))
+	   ? XFRAME (FRAME_FOCUS_FRAME (dpyinfo->x_focus_frame))
+	   : dpyinfo->x_focus_frame);
+      if (!FRAME_LIVE_P (dpyinfo->highlight_frame))
+	{
+	  fset_focus_frame (dpyinfo->x_focus_frame, Qnil);
+	  dpyinfo->highlight_frame = dpyinfo->x_focus_frame;
+	}
+    }
+  else
+    dpyinfo->highlight_frame = NULL;
+
+  if (old_highlight != dpyinfo->highlight_frame)
+    {
+      /* Redraw the cursor on both frames so it flips solid/hollow.  */
+      if (old_highlight)
+	gui_update_cursor (old_highlight, true);
+      if (dpyinfo->highlight_frame)
+	gui_update_cursor (dpyinfo->highlight_frame, true);
+    }
+}
+
+/* Generic hook wrapper.  */
+static void
+wgpu_frame_rehighlight_hook (struct frame *f)
+{
+  wgpu_frame_rehighlight (FRAME_DISPLAY_INFO (f));
+}
+
+static void
+wgpu_new_focus_frame (struct wgpu_display_info *dpyinfo, struct frame *frame)
+{
+  if (frame != dpyinfo->x_focus_frame)
+    dpyinfo->x_focus_frame = frame;
+  wgpu_frame_rehighlight (dpyinfo);
+}
+
 static int
 wgpu_read_socket (struct terminal *terminal, struct input_event *hold_quit)
 {
@@ -667,6 +800,40 @@ wgpu_read_socket (struct terminal *terminal, struct input_event *hold_quit)
 
       switch (evs[i].kind)
 	{
+	case WgpuEventKind_FocusIn:
+	  {
+	    struct wgpu_display_info *dpyinfo = FRAME_DISPLAY_INFO (f);
+	    if (dpyinfo->x_focus_event_frame != f)
+	      {
+		wgpu_new_focus_frame (dpyinfo, f);
+		dpyinfo->x_focus_event_frame = f;
+		struct input_event ie;
+		EVENT_INIT (ie);
+		ie.kind = FOCUS_IN_EVENT;
+		XSETFRAME (ie.frame_or_window, f);
+		kbd_buffer_store_event_hold (&ie, hold_quit);
+		count++;
+	      }
+	  }
+	  break;
+
+	case WgpuEventKind_FocusOut:
+	  {
+	    struct wgpu_display_info *dpyinfo = FRAME_DISPLAY_INFO (f);
+	    if (dpyinfo->x_focus_event_frame == f)
+	      {
+		dpyinfo->x_focus_event_frame = NULL;
+		wgpu_new_focus_frame (dpyinfo, NULL);
+		struct input_event ie;
+		EVENT_INIT (ie);
+		ie.kind = FOCUS_OUT_EVENT;
+		XSETFRAME (ie.frame_or_window, f);
+		kbd_buffer_store_event_hold (&ie, hold_quit);
+		count++;
+	      }
+	  }
+	  break;
+
 	case WgpuEventKind_PointerMotion:
 	  {
 	    /* Drive hover highlighting (mouse-face, help-echo, buttons).  */
@@ -871,6 +1038,7 @@ wgpu_create_terminal (struct wgpu_display_info *dpyinfo)
   terminal->update_begin_hook = wgpu_update_begin;
   terminal->read_socket_hook = wgpu_read_socket;
   terminal->mouse_position_hook = wgpu_mouse_position;
+  terminal->frame_rehighlight_hook = wgpu_frame_rehighlight_hook;
   terminal->frame_up_to_date_hook = wgpu_frame_up_to_date;
   terminal->delete_terminal_hook = wgpu_delete_terminal;
   terminal->get_string_resource_hook = wgpu_get_string_resource;
