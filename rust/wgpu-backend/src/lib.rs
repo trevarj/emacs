@@ -18,6 +18,7 @@ pub mod ffi;
 pub mod gpu2d;
 pub mod render;
 pub mod window;
+pub mod winsys;
 
 pub use event::{WgpuEvent, WgpuEventKind};
 

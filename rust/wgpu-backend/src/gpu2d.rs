@@ -291,8 +291,10 @@ impl Renderer {
         v
     }
 
-    /// Render `cmds` over a `clear`-colored background into `view` of the given
-    /// pixel size, recording into `encoder`.
+    /// Render `cmds` into `view` of the given pixel size, recording into
+    /// `encoder`. `load` controls the attachment load op: `Clear(color)` to
+    /// start fresh (offscreen frames), or `Load` to draw over an existing
+    /// persistent target (the live window's incremental updates).
     pub fn encode(
         &self,
         gpu: &Gpu,
@@ -300,7 +302,7 @@ impl Renderer {
         view: &wgpu::TextureView,
         width: u32,
         height: u32,
-        clear: [f64; 4],
+        load: wgpu::LoadOp<wgpu::Color>,
         cmds: &[DrawCmd],
     ) {
         gpu.queue
@@ -321,15 +323,7 @@ impl Renderer {
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view,
                 resolve_target: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color {
-                        r: clear[0],
-                        g: clear[1],
-                        b: clear[2],
-                        a: clear[3],
-                    }),
-                    store: wgpu::StoreOp::Store,
-                },
+                ops: wgpu::Operations { load, store: wgpu::StoreOp::Store },
             })],
             depth_stencil_attachment: None,
             timestamp_writes: None,
@@ -357,7 +351,13 @@ impl Renderer {
         let mut encoder = gpu
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("gpu2d") });
-        self.encode(gpu, &mut encoder, &view, width, height, clear, cmds);
+        let load = wgpu::LoadOp::Clear(wgpu::Color {
+            r: clear[0],
+            g: clear[1],
+            b: clear[2],
+            a: clear[3],
+        });
+        self.encode(gpu, &mut encoder, &view, width, height, load, cmds);
         gpu.queue.submit(Some(encoder.finish()));
         texture_to_rgba(gpu, &target, width, height)
     }
