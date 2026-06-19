@@ -11,7 +11,18 @@ See wgpu-backend-plan.md.  */
 #include "lisp.h"
 #include "frame.h"
 #include "dispextern.h"
+#include "coding.h"
 #include "wgputerm.h"
+
+/* M1 placeholder "frame" contents: a solid Emacs-teal clear.  M2 replaces this
+   with real glyph/command rendering, at which point the goldens gain content.
+   Linear RGBA, matching examples/clear_color.rs.  */
+#define WGPU_M1_CLEAR_R 0.07
+#define WGPU_M1_CLEAR_G 0.15
+#define WGPU_M1_CLEAR_B 0.18
+#define WGPU_M1_CLEAR_A 1.00
+
+#define WGPU_DEFAULT_DUMP_DIM 64
 
 /* Validation primitive (see plan, "Validation harness").
 
@@ -23,18 +34,60 @@ See wgpu-backend-plan.md.  */
 
    then the test compares the PNG against a committed golden with tolerance.
    M0: stub; the offscreen path lands with M1.  */
-DEFUN ("wgpu-dump-frame", Fwgpu_dump_frame, Swgpu_dump_frame, 1, 2, 0,
-       doc: /* Render FRAME offscreen and write it to FILE as a PNG.
-FILE is a file name.  Optional FRAME defaults to the selected frame.
-Used by the wgpu backend's golden-image test harness.  */)
-  (Lisp_Object file, Lisp_Object frame)
+static void
+wgpu_dim (Lisp_Object width, Lisp_Object height, uint32_t *w, uint32_t *h)
 {
+  if (NILP (width))
+    *w = WGPU_DEFAULT_DUMP_DIM;
+  else
+    {
+      CHECK_FIXNAT (width);
+      *w = XFIXNAT (width);
+    }
+  if (NILP (height))
+    *h = WGPU_DEFAULT_DUMP_DIM;
+  else
+    {
+      CHECK_FIXNAT (height);
+      *h = XFIXNAT (height);
+    }
+}
+
+DEFUN ("wgpu-dump-frame", Fwgpu_dump_frame, Swgpu_dump_frame, 1, 3, 0,
+       doc: /* Render an offscreen frame and write it to FILE as a PNG.
+Optional WIDTH and HEIGHT default to 64.  Used by the wgpu backend's
+golden-image test harness.
+
+M1: the rendered content is a solid clear color; M2 makes it glyph-aware.  */)
+  (Lisp_Object file, Lisp_Object width, Lisp_Object height)
+{
+  uint32_t w, h;
   CHECK_STRING (file);
-  (void) frame;
-  /* M1: forces redisplay, calls into the Rust offscreen render + readback,
-     writes the PNG.  */
-  error ("wgpu-dump-frame: offscreen render not implemented until M1");
-  return Qnil;
+  wgpu_dim (width, height, &w, &h);
+  if (wgpu_render_clear_to_png (SSDATA (ENCODE_FILE (file)), w, h,
+				WGPU_M1_CLEAR_R, WGPU_M1_CLEAR_G,
+				WGPU_M1_CLEAR_B, WGPU_M1_CLEAR_A)
+      != WGPU_OK)
+    error ("wgpu-dump-frame: offscreen render failed (no GPU?)");
+  return Qt;
+}
+
+DEFUN ("wgpu--frame-rgba", Fwgpu__frame_rgba, Swgpu__frame_rgba, 0, 2, 0,
+       doc: /* Return WIDTHxHEIGHT offscreen-rendered pixels as RGBA8 bytes.
+A unibyte string of WIDTH*HEIGHT*4 bytes, row-major, top-down.  WIDTH and
+HEIGHT default to 64.  For the golden-image test harness.  */)
+  (Lisp_Object width, Lisp_Object height)
+{
+  uint32_t w, h;
+  wgpu_dim (width, height, &w, &h);
+  ptrdiff_t n = (ptrdiff_t) w * h * 4;
+  Lisp_Object s = make_uninit_string (n);
+  if (wgpu_render_clear_rgba (w, h, WGPU_M1_CLEAR_R, WGPU_M1_CLEAR_G,
+			      WGPU_M1_CLEAR_B, WGPU_M1_CLEAR_A,
+			      SDATA (s), n)
+      != WGPU_OK)
+    error ("wgpu--frame-rgba: offscreen render failed (no GPU?)");
+  return s;
 }
 
 /* Return the wgpu display info for OBJECT (a frame, terminal, display name,
@@ -78,6 +131,7 @@ void
 syms_of_wgpufns (void)
 {
   defsubr (&Swgpu_dump_frame);
+  defsubr (&Swgpu__frame_rgba);
   defsubr (&Sxw_display_color_p);
   defsubr (&Sx_display_grayscale_p);
   defsubr (&Sx_hide_tip);
