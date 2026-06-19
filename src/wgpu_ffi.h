@@ -250,6 +250,15 @@ void wgpu_window_present(void);
 int wgpu_window_take_resize(uint32_t *w, uint32_t *h);
 
 /**
+ * Read the window's current frame (persistent texture) back and write it as a
+ * PNG to `path`.  For clarity inspection / real-text golden tests.
+ *
+ * # Safety
+ * `path` must be a valid NUL-terminated C string.
+ */
+int wgpu_window_dump_png(const char *path);
+
+/**
  * Destroy the window and release GPU/Wayland resources.
  */
 void wgpu_window_close(void);
