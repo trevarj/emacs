@@ -385,21 +385,35 @@ impl WgpuWindow {
     }
 
     fn dispatch(&mut self) -> Result<(), String> {
+        use std::os::unix::io::AsRawFd;
         let t0 = std::time::Instant::now();
+        dlog!("dispatch begin");
         let _ = self.conn.flush();
-        // Read any pending socket data without blocking, then dispatch.
-        if let Some(guard) = self.conn.prepare_read() {
-            let _ = guard.read();
-        }
+        // Dispatch already-queued events first (never blocks).
         self.event_queue
             .dispatch_pending(&mut self.state)
             .map_err(|e| format!("dispatch: {e}"))?;
+        // Read new socket data, but ONLY if it is actually available -- Emacs
+        // may call read_socket speculatively (not just when the fd is ready),
+        // and guard.read() can block with no data, hanging the whole editor
+        // (e.g. the release event during a mouse drag never arrives).
+        if let Some(guard) = self.conn.prepare_read() {
+            let fd = self.conn.backend().poll_fd().as_raw_fd();
+            let mut pfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
+            let ready = unsafe { libc::poll(&mut pfd, 1, 0) } > 0
+                && (pfd.revents & libc::POLLIN) != 0;
+            if ready {
+                let _ = guard.read();
+                self.event_queue
+                    .dispatch_pending(&mut self.state)
+                    .map_err(|e| format!("dispatch: {e}"))?;
+            }
+            // else: drop the guard without reading (cancels the read intent).
+        }
         // Drain the key-repeat timerfd (it may be why Emacs woke us).
         self.state.pump_repeat();
         let ms = t0.elapsed().as_millis();
-        if ms >= 8 {
-            dlog!("dispatch SLOW {} ms (events queued={})", ms, self.state.events.len());
-        }
+        dlog!("dispatch end ({} ms, events queued={})", ms, self.state.events.len());
         Ok(())
     }
 
