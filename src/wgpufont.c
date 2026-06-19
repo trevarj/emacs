@@ -152,15 +152,20 @@ wgpufont_draw (struct glyph_string *s, int from, int to, int x, int y,
 	       bool with_background)
 {
   struct font_info *info = (struct font_info *) s->font;
+  /* Use the highlight-aware foreground so e.g. DRAW_CURSOR glyphs render in
+     the (inverted) cursor foreground, matching the background drawn by the
+     glyph-string code.  */
+  unsigned long fg_pixel, bg_pixel;
   float fr, fg, fb;
-  wgpu_unpack_color (s->face->foreground, &fr, &fg, &fb);
+  wgpu_glyph_string_colors (s, &fg_pixel, &bg_pixel);
+  wgpu_unpack_color (fg_pixel, &fr, &fg, &fb);
 
   block_input ();
 
   if (with_background)
     {
       float br, bg, bb;
-      wgpu_unpack_color (s->face->background, &br, &bg, &bb);
+      wgpu_unpack_color (bg_pixel, &br, &bg, &bb);
       wgpu_window_rect ((float) s->x, (float) s->y,
 			(float) s->background_width, (float) s->height,
 			br, bg, bb, 1.0f);
