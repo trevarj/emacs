@@ -1272,6 +1272,7 @@ dependencies = [
 name = "wgpu-backend"
 version = "0.1.0"
 dependencies = [
+ "bytemuck",
  "log",
  "png",
  "pollster",

@@ -25,6 +25,7 @@ wayland-client = "0.31"
 # wl_surface C pointers to wgpu's Vulkan surface creation (as winit does).
 wayland-backend = { version = "0.3", features = ["client_system"] }
 png = "0.17"               # encode offscreen frames for golden-image tests
+bytemuck = { version = "1", features = ["derive"] }  # vertex POD casts
 log = "0.4"
 
 [profile.release]
