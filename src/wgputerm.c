@@ -1273,6 +1273,7 @@ wgpu_read_socket (struct terminal *terminal, struct input_event *hold_quit)
 
   struct frame *f = wgpu_any_frame (terminal);
   int count = 0;
+  bool need_present = false;	/* set when hover highlight may have changed */
 
   if (f && resized && ww >= 16 && wh >= 16)
     {
@@ -1362,6 +1363,10 @@ wgpu_read_socket (struct terminal *terminal, struct input_event *hold_quit)
 		    note_mouse_highlight (f, mx, my);
 		    remember_mouse_glyph (f, mx, my, r);
 		    dpyinfo->last_mouse_glyph_frame = f;
+		    /* note_mouse_highlight draws the mouse-face highlight into
+		       the command list; present it so hover is visible without
+		       waiting for the next redisplay.  */
+		    need_present = true;
 		    wgpu_log ("motion %d,%d done", mx, my);
 		  }
 		else
@@ -1465,6 +1470,16 @@ wgpu_read_socket (struct terminal *terminal, struct input_event *hold_quit)
 	  }
 	  break;
 	}
+    }
+
+  /* Flush the hover highlight to the screen (mouse-face on buttons, links,
+     mode-line elements).  Skip during redisplay to avoid presenting a
+     half-built frame.  */
+  if (need_present && !redisplaying_p)
+    {
+      block_input ();
+      wgpu_window_present ();
+      unblock_input ();
     }
 
   return count;
