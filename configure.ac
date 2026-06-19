@@ -572,6 +572,7 @@ AC_ARG_WITH([ns],[AS_HELP_STRING([--with-ns],
 On by default on macOS.])],[],[with_ns=maybe])
 OPTION_DEFAULT_OFF([w32], [use native MS Windows GUI in a Cygwin build])
 OPTION_DEFAULT_OFF([pgtk], [use GTK to support window systems other than X])
+OPTION_DEFAULT_OFF([wgpu], [use the experimental Rust Wayland + wgpu backend])
 
 OPTION_DEFAULT_ON([gpm],[don't use -lgpm for mouse support on a GNU/Linux console])
 OPTION_DEFAULT_IFAVAILABLE([dbus],[compile with D-Bus support])
@@ -2676,9 +2677,14 @@ if test "${with_pgtk}" = "yes"; then
   window_system=pgtk
 fi
 
+if test "${with_wgpu}" = "yes"; then
+  window_system=wgpu
+fi
+
 if test "${ANDROID}" != "yes"; then
   AC_PATH_X
-  if test "$no_x" != yes && test "${with_pgtk}" != "yes"; then
+  if test "$no_x" != yes && test "${with_pgtk}" != "yes" \
+     && test "${with_wgpu}" != "yes"; then
     window_system=x11
   fi
 fi
@@ -3136,6 +3142,7 @@ HAVE_X_WINDOWS=no
 HAVE_X11=no
 USE_X_TOOLKIT=none
 HAVE_PGTK=no
+HAVE_WGPU=no
 
 case "${window_system}" in
   x11 )
@@ -3175,6 +3182,13 @@ dnl use the toolkit if we have gtk, or X11R5 or newer.
     HAVE_PGTK=yes
     AC_DEFINE([HAVE_PGTK], [1], [Define to 1 if you have pure Gtk+-3.])
   ;;
+  wgpu )
+    term_header=wgputerm.h
+    USE_X_TOOLKIT=none
+    HAVE_WGPU=yes
+    AC_DEFINE([HAVE_WGPU], [1],
+      [Define to 1 if using the Rust Wayland + wgpu backend.])
+  ;;
   haiku )
     term_header=haikuterm.h
   ;;
@@ -3184,6 +3198,7 @@ dnl use the toolkit if we have gtk, or X11R5 or newer.
 esac
 
 AC_SUBST([HAVE_PGTK])
+AC_SUBST([HAVE_WGPU])
 
 if test "$window_system" = none && test "X$with_x" != "Xno"; then
    AC_CHECK_PROG([HAVE_XSERVER], [X], [true], [false])
@@ -3880,6 +3895,28 @@ if test "$window_system" = "pgtk"; then
 fi
 AC_SUBST([PGTK_OBJ])
 AC_SUBST([PGTK_LIBS])
+
+dnl The Rust Wayland + wgpu backend.  The heavy work lives in the staticlib
+dnl built from rust/wgpu-backend; here we just locate cargo, name the C shim
+dnl objects, and assemble the link line (staticlib + native deps).
+WGPU_OBJ=
+WGPU_LIBS=
+WGPU_STATICLIB=
+if test "$window_system" = "wgpu"; then
+  AC_CHECK_PROGS([CARGO], [cargo])
+  if test -z "$CARGO"; then
+    AC_MSG_ERROR([--with-wgpu requires cargo (try: guix shell rust rust:cargo)])
+  fi
+  WGPU_OBJ="wgputerm.o wgpufns.o wgpufont.o"
+  WGPU_STATICLIB="\$(top_srcdir)/rust/wgpu-backend/target/release/libwgpu_backend.a"
+  dnl wgpu (Vulkan/GBM) + raw Wayland + xkbcommon, plus libs the staticlib
+  dnl needs at final link.
+  WGPU_LIBS="$WGPU_STATICLIB -lwayland-client -lxkbcommon -lvulkan -lm -ldl -lpthread"
+fi
+AC_SUBST([CARGO])
+AC_SUBST([WGPU_OBJ])
+AC_SUBST([WGPU_LIBS])
+AC_SUBST([WGPU_STATICLIB])
 
 AC_CHECK_FUNCS([malloc_trim])
 
