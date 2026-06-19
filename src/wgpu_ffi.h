@@ -110,6 +110,50 @@ int wgpu_render_clear_to_png(const char *path,
                              double b,
                              double a);
 
+/**
+ * Begin a frame of `width`x`height` with the given clear color (linear RGBA).
+ * Returns 0 on success, -1 if no GPU.
+ */
+int wgpu_frame_begin(uint32_t width, uint32_t height, double r, double g, double b, double a);
+
+/**
+ * Upload a `w`x`h` coverage bitmap (1 byte/pixel, row-major) into the glyph
+ * atlas. Returns a glyph id (>= 0) for later `wgpu_frame_glyph` calls, or -1.
+ *
+ * # Safety
+ * `data` must point to at least `len` readable bytes, `len >= w*h`.
+ */
+int64_t wgpu_atlas_upload(uint32_t w, uint32_t h, const uint8_t *data, uintptr_t len);
+
+/**
+ * Record a solid filled rectangle (pixels, linear RGBA).
+ */
+void wgpu_frame_rect(float x, float y, float w, float h, float r, float g, float b, float a);
+
+/**
+ * Record a glyph (by id from `wgpu_atlas_upload`) at pen position x,y, tinted.
+ * The glyph is drawn at its uploaded pixel size.
+ */
+void wgpu_frame_glyph(int64_t id, float x, float y, float r, float g, float b, float a);
+
+/**
+ * Render the recorded frame offscreen and copy RGBA8 into `out`
+ * (`>= width*height*4` bytes). Returns 0 / -1. Does not clear the commands,
+ * so it may be called more than once per frame.
+ *
+ * # Safety
+ * `out` must point to writable storage of at least `out_len` bytes.
+ */
+int wgpu_frame_end_rgba(uint8_t *out, uintptr_t out_len);
+
+/**
+ * Render the recorded frame offscreen and write it as a PNG to `path`.
+ *
+ * # Safety
+ * `path` must be a valid NUL-terminated C string.
+ */
+int wgpu_frame_end_png(const char *path);
+
 #ifdef __cplusplus
 }  // extern "C"
 #endif  // __cplusplus
