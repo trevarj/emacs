@@ -14,6 +14,7 @@
 //! from this crate by cbindgen into `src/wgpu_ffi.h`.
 
 pub mod event;
+pub mod gpu2d;
 pub mod render;
 pub mod window;
 
