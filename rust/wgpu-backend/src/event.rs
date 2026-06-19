@@ -73,6 +73,14 @@ impl WgpuEvent {
         Self { keysym, unichar, modifiers, ..Self::blank(WgpuEventKind::KeyPress) }
     }
 
+    pub fn focus(gained: bool) -> Self {
+        Self::blank(if gained {
+            WgpuEventKind::FocusIn
+        } else {
+            WgpuEventKind::FocusOut
+        })
+    }
+
     pub fn motion(x: i32, y: i32, modifiers: u32, time: u32) -> Self {
         Self { x, y, modifiers, time, ..Self::blank(WgpuEventKind::PointerMotion) }
     }
