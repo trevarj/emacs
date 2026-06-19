@@ -7,13 +7,25 @@ license = "GPL-3.0-or-later"
 publish = false
 
 [lib]
-# Produces libwgpu_backend.a, linked into the emacs binary.
+# staticlib -> libwgpu_backend.a linked into the emacs binary.
+# rlib      -> lets examples/tests/benches drive the crate as a Rust library
+#              (e.g. examples/clear_color.rs for standalone window bring-up).
 name = "wgpu_backend"
-crate-type = ["staticlib"]
+crate-type = ["staticlib", "rlib"]
 
-# M0 has no external dependencies on purpose: the crate builds fully offline so
-# the scaffold is reproducible under Guix before any vendoring is needed.
-# wgpu, smithay-client-toolkit, xkbcommon, etc. arrive in M1+ via `cargo vendor`.
+[dependencies]
+# GPU rendering.
+wgpu = "24"
+pollster = "0.4"            # block_on for wgpu's async device/adapter requests
+raw-window-handle = "0.6"   # hand Wayland handles to wgpu's surface creation
+# Raw Wayland client (window, xdg-shell, input).
+smithay-client-toolkit = "0.19"
+wayland-client = "0.31"
+# Force the system libwayland backend so we can hand the real wl_display /
+# wl_surface C pointers to wgpu's Vulkan surface creation (as winit does).
+wayland-backend = { version = "0.3", features = ["client_system"] }
+png = "0.17"               # encode offscreen frames for golden-image tests
+log = "0.4"
 
 [profile.release]
 opt-level = 3

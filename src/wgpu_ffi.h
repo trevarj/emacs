@@ -77,6 +77,39 @@ int wgpu_backend_wakeup_fd(void);
  */
 int wgpu_backend_poll_events(WgpuEvent *buf, int max);
 
+/**
+ * Render an offscreen frame of `width`x`height` cleared to the given color
+ * (linear RGBA, 0..=1) and write tightly-packed RGBA8 into `out` (which must
+ * have room for `out_len` >= width*height*4 bytes). Returns `WGPU_OK` or a
+ * negative error code. Used by the golden-image test harness.
+ *
+ * # Safety
+ * `out` must point to writable storage of at least `out_len` bytes.
+ */
+int wgpu_render_clear_rgba(uint32_t width,
+                           uint32_t height,
+                           double r,
+                           double g,
+                           double b,
+                           double a,
+                           uint8_t *out,
+                           uintptr_t out_len);
+
+/**
+ * Render an offscreen clear frame and write it as a PNG to `path`.
+ * Returns `WGPU_OK` or a negative error code.
+ *
+ * # Safety
+ * `path` must be a valid NUL-terminated C string.
+ */
+int wgpu_render_clear_to_png(const char *path,
+                             uint32_t width,
+                             uint32_t height,
+                             double r,
+                             double g,
+                             double b,
+                             double a);
+
 #ifdef __cplusplus
 }  // extern "C"
 #endif  // __cplusplus

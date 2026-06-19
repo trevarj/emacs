@@ -14,6 +14,8 @@
 //! from this crate by cbindgen into `src/wgpu_ffi.h`.
 
 pub mod event;
+pub mod render;
+pub mod window;
 
 pub use event::{WgpuEvent, WgpuEventKind};
 
@@ -66,6 +68,80 @@ pub unsafe extern "C" fn wgpu_backend_poll_events(buf: *mut WgpuEvent, max: c_in
     // M0: no event source wired yet; nothing to drain.
     let _out = std::slice::from_raw_parts_mut(buf, max as usize);
     0
+}
+
+/// Render an offscreen frame of `width`x`height` cleared to the given color
+/// (linear RGBA, 0..=1) and write tightly-packed RGBA8 into `out` (which must
+/// have room for `out_len` >= width*height*4 bytes). Returns `WGPU_OK` or a
+/// negative error code. Used by the golden-image test harness.
+///
+/// # Safety
+/// `out` must point to writable storage of at least `out_len` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn wgpu_render_clear_rgba(
+    width: u32,
+    height: u32,
+    r: f64,
+    g: f64,
+    b: f64,
+    a: f64,
+    out: *mut u8,
+    out_len: usize,
+) -> c_int {
+    let need = (width as usize) * (height as usize) * 4;
+    if out.is_null() || out_len < need {
+        return WGPU_ERR_INIT;
+    }
+    let Some(gpu) = render::shared_headless_gpu() else {
+        return WGPU_ERR_INIT;
+    };
+    match render::render_offscreen_clear(gpu, width, height, [r, g, b, a]) {
+        Ok(px) => {
+            std::ptr::copy_nonoverlapping(px.as_ptr(), out, need);
+            WGPU_OK
+        }
+        Err(e) => {
+            eprintln!("wgpu_render_clear_rgba: {e}");
+            WGPU_ERR_INIT
+        }
+    }
+}
+
+/// Render an offscreen clear frame and write it as a PNG to `path`.
+/// Returns `WGPU_OK` or a negative error code.
+///
+/// # Safety
+/// `path` must be a valid NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn wgpu_render_clear_to_png(
+    path: *const c_char,
+    width: u32,
+    height: u32,
+    r: f64,
+    g: f64,
+    b: f64,
+    a: f64,
+) -> c_int {
+    if path.is_null() {
+        return WGPU_ERR_INIT;
+    }
+    let path = match std::ffi::CStr::from_ptr(path).to_str() {
+        Ok(p) => p,
+        Err(_) => return WGPU_ERR_INIT,
+    };
+    let Some(gpu) = render::shared_headless_gpu() else {
+        return WGPU_ERR_INIT;
+    };
+    let result = render::render_offscreen_clear(gpu, width, height, [r, g, b, a])
+        .and_then(|px| render::encode_png(&px, width, height))
+        .and_then(|png| std::fs::write(path, png).map_err(|e| e.to_string()));
+    match result {
+        Ok(()) => WGPU_OK,
+        Err(e) => {
+            eprintln!("wgpu_render_clear_to_png: {e}");
+            WGPU_ERR_INIT
+        }
+    }
 }
 
 #[cfg(test)]
