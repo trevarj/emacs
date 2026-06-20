@@ -4064,6 +4064,9 @@ the test harness to prove menu rendering without the interactive loop.  */)
 {
   struct frame *f = SELECTED_FRAME ();
   CHECK_STRING (file);
+  /* Test-only surface: gated behind WLSHM_DEBUG (the harness sets it).  */
+  if (!getenv ("WLSHM_DEBUG"))
+    error ("wlshm-test-menu-render is a test primitive; set WLSHM_DEBUG to use it");
   ptrdiff_t cnt = list_length (items);
   struct wlshm_mrow *rows = xnmalloc (cnt + 1, sizeof *rows);
   int n = 0;
