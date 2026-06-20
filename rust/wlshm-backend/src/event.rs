@@ -25,6 +25,12 @@ pub enum WlshmEventKind {
     Configure = 7,
     /// Compositor asked the window to close.
     Close = 8,
+    /// A drag-and-drop drop occurred; x/y carry the surface-relative drop
+    /// position, `window` the target.  The dropped payload (text or
+    /// `text/uri-list`) is retrieved via a side-channel getter on the C side
+    /// (`wlshm_window_get_drop`) because the POD event can't carry a string.
+    /// `button` is reused as a flag: 1 = the payload is a `text/uri-list`.
+    Drop = 9,
 }
 
 /// Modifier bits (our own encoding; translated to Emacs modifiers on the C
@@ -113,6 +119,17 @@ impl WlshmEvent {
             WlshmEventKind::PointerRelease
         };
         Self { button, x, y, modifiers, time, ..Self::blank(kind) }
+    }
+
+    /// A drag-and-drop drop at surface-relative (x, y).  `is_uri_list` flags
+    /// whether the payload (fetched separately) is a `text/uri-list`.
+    pub fn drop(x: i32, y: i32, is_uri_list: bool) -> Self {
+        Self {
+            x,
+            y,
+            button: is_uri_list as u32,
+            ..Self::blank(WlshmEventKind::Drop)
+        }
     }
 
     pub fn axis(axis_x: i32, axis_y: i32, x: i32, y: i32, modifiers: u32, time: u32) -> Self {

@@ -3226,6 +3226,42 @@ wlshm_read_socket (struct terminal *terminal, struct input_event *hold_quit)
 	  }
 	  break;
 
+	case WlshmEventKind_Drop:
+	  {
+	    /* A drag-and-drop drop landed on this frame.  The Rust side has
+	       already received the payload over a pipe; fetch it via the
+	       side-channel getter (the POD event can't carry a string).  Its
+	       `.button` flags whether the payload is a `text/uri-list`.  We
+	       build a DRAG_N_DROP_EVENT whose .arg is `(uri-list . STRING)` or
+	       `(text . STRING)`; the wlshm `[drag-n-drop]` handler in
+	       wlshm-win.el routes it through dnd.el.  */
+	    const uint8_t *ptr = NULL;
+	    uintptr_t len = 0;
+	    if (wlshm_window_get_drop (&ptr, &len) == 0 && ptr && len > 0)
+	      {
+		/* Payload is UTF-8 (text or uri-list); decode like the
+		   clipboard getter so multibyte text/filenames survive.  */
+		Lisp_Object bytes
+		  = make_unibyte_string ((const char *) ptr, (ptrdiff_t) len);
+		Lisp_Object text
+		  = code_convert_string_norecord (bytes, Qutf_8, false);
+		Lisp_Object tag = evs[i].button ? intern ("uri-list")
+						: intern ("text");
+		struct input_event ie;
+		EVENT_INIT (ie);
+		ie.kind = DRAG_N_DROP_EVENT;
+		ie.modifiers = 0;
+		ie.timestamp = evs[i].time;
+		ie.arg = Fcons (tag, text);
+		XSETINT (ie.x, evs[i].x);
+		XSETINT (ie.y, evs[i].y);
+		XSETFRAME (ie.frame_or_window, f);
+		kbd_buffer_store_event_hold (&ie, hold_quit);
+		count++;
+	      }
+	  }
+	  break;
+
 	case WlshmEventKind_PointerAxis:
 	  {
 	    /* Vertical takes precedence; emit one wheel event per notch.  */
