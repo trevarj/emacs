@@ -3262,6 +3262,45 @@ wlshm_read_socket (struct terminal *terminal, struct input_event *hold_quit)
 	  }
 	  break;
 
+	case WlshmEventKind_Preedit:
+	  {
+	    /* The IME (zwp_text_input_v3) updated the in-progress composition.
+	       The text comes via a side-channel getter (the POD event can't
+	       carry a string); an empty string clears the preedit.  We post a
+	       backend-agnostic PREEDIT_TEXT_EVENT whose .arg is the same
+	       list-of-parts shape pgtk/x/android use: ((STRING . ATTRS) ...).
+	       text-input-v3 gives a single unstyled segment, so we build one
+	       part marked underlined; the `[preedit-text]' handler in
+	       wlshm-win.el draws it as a zero-width overlay at point.  Committed
+	       (final) IME text arrives separately as ordinary KeyPress events.  */
+	    const uint8_t *ptr = NULL;
+	    uintptr_t len = 0;
+	    Lisp_Object arg = Qnil;
+	    if (wlshm_window_get_preedit (&ptr, &len) == 0 && ptr && len > 0)
+	      {
+		Lisp_Object bytes
+		  = make_unibyte_string ((const char *) ptr, (ptrdiff_t) len);
+		Lisp_Object text
+		  = code_convert_string_norecord (bytes, Qutf_8, false);
+		/* One part: (TEXT (ul . t)) -> underlined composition.  */
+		Lisp_Object part
+		  = list2 (text, Fcons (intern ("ul"), Qt));
+		arg = list1 (part);
+	      }
+	    /* arg == Qnil clears the preedit (composition ended/empty).  */
+	    struct input_event ie;
+	    EVENT_INIT (ie);
+	    ie.kind = PREEDIT_TEXT_EVENT;
+	    ie.arg = arg;
+	    ie.code = 0;
+	    ie.modifiers = 0;
+	    ie.timestamp = evs[i].time;
+	    XSETFRAME (ie.frame_or_window, f);
+	    kbd_buffer_store_event_hold (&ie, hold_quit);
+	    count++;
+	  }
+	  break;
+
 	case WlshmEventKind_PointerAxis:
 	  {
 	    /* Vertical takes precedence; emit one wheel event per notch.  */

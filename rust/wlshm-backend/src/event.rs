@@ -31,6 +31,13 @@ pub enum WlshmEventKind {
     /// (`wlshm_window_get_drop`) because the POD event can't carry a string.
     /// `button` is reused as a flag: 1 = the payload is a `text/uri-list`.
     Drop = 9,
+    /// The IME (zwp_text_input_v3) updated the in-progress composition
+    /// (preedit) string.  The text itself is retrieved via a side-channel
+    /// getter (`wlshm_window_get_preedit`) because the POD event can't carry a
+    /// string; an empty string clears the preedit.  Committed (final) IME text
+    /// is delivered separately as ordinary `KeyPress` events, one per
+    /// codepoint, so it flows through the normal keystroke path.
+    Preedit = 10,
 }
 
 /// Modifier bits (our own encoding; translated to Emacs modifiers on the C
@@ -130,6 +137,12 @@ impl WlshmEvent {
             button: is_uri_list as u32,
             ..Self::blank(WlshmEventKind::Drop)
         }
+    }
+
+    /// IME preedit (composition) changed.  The new text is fetched separately
+    /// via `wlshm_window_get_preedit`; an empty string clears the preedit.
+    pub fn preedit() -> Self {
+        Self::blank(WlshmEventKind::Preedit)
     }
 
     pub fn axis(axis_x: i32, axis_y: i32, x: i32, y: i32, modifiers: u32, time: u32) -> Self {

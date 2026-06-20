@@ -19,6 +19,12 @@ crate-type = ["staticlib", "rlib"]
 # Raw Wayland client (window, xdg-shell, input, wl_shm pool).
 smithay-client-toolkit = "0.19"
 wayland-client = "0.31"
+# text-input-v3 (IME) lives in the unstable protocols.  sctk 0.19 already pulls
+# wayland-protocols 0.32 in transitively but doesn't wrap text-input, so we bind
+# zwp_text_input_manager_v3 / zwp_text_input_v3 ourselves via raw Dispatch impls.
+# The "unstable" feature gates the text_input module; "client" generates the
+# client-side proxies.
+wayland-protocols = { version = "0.32", features = ["client", "unstable"] }
 # Force the system libwayland backend (matches the libwayland-client we link).
 wayland-backend = { version = "0.3", features = ["client_system"] }
 log = "0.4"

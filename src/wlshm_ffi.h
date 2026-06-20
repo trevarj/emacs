@@ -66,6 +66,15 @@ typedef enum {
    * `button` is reused as a flag: 1 = the payload is a `text/uri-list`.
    */
   WlshmEventKind_Drop = 9,
+  /**
+   * The IME (zwp_text_input_v3) updated the in-progress composition
+   * (preedit) string.  The text itself is retrieved via a side-channel
+   * getter (`wlshm_window_get_preedit`) because the POD event can't carry a
+   * string; an empty string clears the preedit.  Committed (final) IME text
+   * is delivered separately as ordinary `KeyPress` events, one per
+   * codepoint, so it flows through the normal keystroke path.
+   */
+  WlshmEventKind_Preedit = 10,
 } WlshmEventKind;
 
 /**
@@ -345,6 +354,18 @@ int wlshm_window_get_clipboard(const uint8_t **out_ptr, uintptr_t *out_len);
  * `out_ptr` and `out_len` must be valid pointers.
  */
 int wlshm_window_get_drop(const uint8_t **out_ptr, uintptr_t *out_len);
+
+/**
+ * Retrieve the current IME preedit (composition) string.  Writes a
+ * pointer/length valid until the next call into *out_ptr/*out_len and returns
+ * 0; -1 if there is no preedit object at all.  The buffer is UTF-8 and may be
+ * empty (length 0) to mean "clear the preedit".  C must call this right after
+ * it pops a `WlshmEventKind_Preedit` event.
+ *
+ * # Safety
+ * `out_ptr` and `out_len` must be valid pointers.
+ */
+int wlshm_window_get_preedit(const uint8_t **out_ptr, uintptr_t *out_len);
 
 /**
  * Release our ownership of the CLIPBOARD selection.
