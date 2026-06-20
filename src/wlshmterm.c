@@ -3176,6 +3176,20 @@ wlshm_delete_terminal (struct terminal *terminal)
   wlshm_backend_shutdown ();
 }
 
+/* terminal->get_focus_frame: the frame that currently holds keyboard focus on
+   F's display (tracked from wl_keyboard enter/leave), or nil.  Lets
+   `frame-focus-state' and friends report focus accurately.  */
+static Lisp_Object
+wlshm_get_focus_frame (struct frame *f)
+{
+  struct frame *focus = FRAME_DISPLAY_INFO (f)->x_focus_frame;
+  Lisp_Object lisp_focus;
+  if (!focus)
+    return Qnil;
+  XSETFRAME (lisp_focus, focus);
+  return lisp_focus;
+}
+
 /* Warp the pointer.  M3 stub (no pointer warping yet).  */
 void
 frame_set_mouse_pixel_position (struct frame *f, int pix_x, int pix_y)
@@ -3805,6 +3819,7 @@ wlshm_create_terminal (struct wlshm_display_info *dpyinfo)
   terminal->popup_dialog_hook = wlshm_popup_dialog;
   terminal->frame_up_to_date_hook = wlshm_frame_up_to_date;
   terminal->delete_terminal_hook = wlshm_delete_terminal;
+  terminal->get_focus_frame = wlshm_get_focus_frame;
   terminal->get_string_resource_hook = wlshm_get_string_resource;
   terminal->set_new_font_hook = wlshm_new_font;
   terminal->defined_color_hook = wlshm_defined_color;
