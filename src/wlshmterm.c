@@ -407,9 +407,19 @@ wlshm_draw_glyph_string_box (struct glyph_string *s)
 
   int left = s->x, top = s->y;
   int width = s->background_width, height = s->height;
-  bool left_p = s->first_glyph->left_box_line_p;
-  bool right_p = (s->nchars > 0
-		  && s->first_glyph[s->nchars - 1].right_box_line_p);
+  /* Draw the left/right edges at the box-run boundaries.  For a mouse-face
+     highlight the underlying glyphs carry the box flags of the face beneath
+     (e.g. the mode line's own box), so also close the box at the ends of the
+     highlighted run -- where the neighbouring glyph string isn't mouse-face.
+     Without this the hover box on mode-line elements has only top/bottom
+     edges and looks unclosed.  Mirrors x_draw_glyph_string_box.  */
+  bool left_p = (s->first_glyph->left_box_line_p
+		 || (s->hl == DRAW_MOUSE_FACE
+		     && (s->prev == NULL || s->prev->hl != s->hl)));
+  bool right_p = ((s->nchars > 0
+		   && s->first_glyph[s->nchars - 1].right_box_line_p)
+		  || (s->hl == DRAW_MOUSE_FACE
+		      && (s->next == NULL || s->next->hl != s->hl)));
 
   unsigned long top_left, bottom_right;
   if (s->face->box == FACE_SIMPLE_BOX)
