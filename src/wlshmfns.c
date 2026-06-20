@@ -260,6 +260,39 @@ DEFUN ("x-open-connection", Fx_open_connection, Sx_open_connection, 1, 3, 0,
   return Qnil;
 }
 
+DEFUN ("x-close-connection", Fx_close_connection, Sx_close_connection, 1, 1, 0,
+       doc: /* SKIP: real doc in xfns.c.  */)
+  (Lisp_Object terminal)
+{
+  struct wlshm_display_info *dpyinfo = check_x_display_info (terminal);
+
+  if (dpyinfo->reference_count > 0)
+    error ("Display still has frames on it");
+
+  wlshm_delete_terminal (dpyinfo->terminal);
+  return Qnil;
+}
+
+DEFUN ("x-display-list", Fx_display_list, Sx_display_list, 0, 0, 0,
+       doc: /* SKIP: real doc in xfns.c.  */)
+  (void)
+{
+  Lisp_Object result = Qnil;
+  for (struct wlshm_display_info *d = x_display_list; d; d = d->next)
+    result = Fcons (XCAR (d->name_list_element), result);
+  return result;
+}
+
+DEFUN ("x-server-max-request-size", Fx_server_max_request_size,
+       Sx_server_max_request_size, 0, 1, 0,
+       doc: /* SKIP: real doc in xfns.c.  */)
+  (Lisp_Object terminal)
+{
+  check_x_display_info (terminal);
+  /* No real equivalent under Wayland.  */
+  return Qnil;
+}
+
 DEFUN ("xw-display-color-p", Fxw_display_color_p, Sxw_display_color_p, 0, 1, 0,
        doc: /* Return t if the display supports color.
 M1 stub: the wlshm backend always reports a color display.  */)
@@ -1067,6 +1100,9 @@ syms_of_wlshmfns (void)
   defsubr (&Swlshm_display_monitor_attributes_list);
   defsubr (&Sx_create_frame);
   defsubr (&Sx_open_connection);
+  defsubr (&Sx_close_connection);
+  defsubr (&Sx_display_list);
+  defsubr (&Sx_server_max_request_size);
   defsubr (&Swlshm_scale_factor);
   defsubr (&Sxw_display_color_p);
   defsubr (&Sx_display_grayscale_p);

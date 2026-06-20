@@ -309,6 +309,7 @@ extern struct wlshm_display_info *x_display_list;
 extern struct wlshm_display_info *wlshm_term_init (Lisp_Object display_name);
 extern struct wlshm_display_info *check_x_display_info (Lisp_Object object);
 extern struct terminal *wlshm_create_terminal (struct wlshm_display_info *dpyinfo);
+extern void wlshm_delete_terminal (struct terminal *terminal);
 
 /* Lisp init entry points (syms_of_*).  */
 extern void syms_of_wlshmterm (void);
