@@ -2710,7 +2710,7 @@ frame's display)."
      ((eq frame-type 'w32)
       (with-no-warnings
        (> w32-num-mouse-buttons 0)))
-     ((memq frame-type '(x ns haiku pgtk wgpu))
+     ((memq frame-type '(x ns haiku pgtk wlshm))
       t)    ;; We assume X, NeXTstep, GTK, and Haiku *always* have a pointing device
      ((eq frame-type 'android)
       (android-detect-mouse))
@@ -2744,7 +2744,7 @@ that use a window system such as X, and false for text-only terminals.
 DISPLAY can be a display name, a frame, or nil (meaning the selected
 frame's display)."
   (not (null (memq (framep-on-display display) '(x w32 ns pgtk haiku
-                                                   android wgpu)))))
+                                                   android wlshm)))))
 
 (defun display-images-p (&optional display)
   "Return non-nil if DISPLAY can display images.
@@ -2783,7 +2783,7 @@ frame's display)."
       ;; a Windows DOS Box.
       (with-no-warnings
        (not (null dos-windows-version))))
-     ((memq frame-type '(x w32 ns pgtk wgpu))
+     ((memq frame-type '(x w32 ns pgtk wlshm))
       t)
      ((and tty-select-active-regions
            (terminal-parameter nil 'xterm--set-selection))
@@ -2796,7 +2796,7 @@ frame's display)."
 This means that, for example, DISPLAY can differentiate between
 the keybinding RET and [return]."
   (let ((frame-type (framep-on-display display)))
-    (or (memq frame-type '(x w32 ns pc pgtk haiku android wgpu))
+    (or (memq frame-type '(x w32 ns pc pgtk haiku android wlshm))
         ;; MS-DOS and MS-Windows terminals have built-in support for
         ;; function (symbol) keys
         (memq system-type '(ms-dos windows-nt)))))
@@ -2809,7 +2809,7 @@ DISPLAY should be either a frame or a display name (a string).
 If DISPLAY is omitted or nil, it defaults to the selected frame's display."
   (let ((frame-type (framep-on-display display)))
     (cond
-     ((memq frame-type '(x w32 ns haiku pgtk android wgpu))
+     ((memq frame-type '(x w32 ns haiku pgtk android wlshm))
       (x-display-screens display))
      (t
       1))))
@@ -2830,7 +2830,7 @@ with DISPLAY.  To get information for each physical monitor, use
 `display-monitor-attributes-list'."
   (let ((frame-type (framep-on-display display)))
     (cond
-     ((memq frame-type '(x w32 ns haiku pgtk android wgpu))
+     ((memq frame-type '(x w32 ns haiku pgtk android wlshm))
       (x-display-pixel-height display))
      (t
       (tty-display-pixel-height display)))))
@@ -2851,7 +2851,7 @@ with DISPLAY.  To get information for each physical monitor, use
 `display-monitor-attributes-list'."
   (let ((frame-type (framep-on-display display)))
     (cond
-     ((memq frame-type '(x w32 ns haiku pgtk android wgpu))
+     ((memq frame-type '(x w32 ns haiku pgtk android wlshm))
       (x-display-pixel-width display))
      (t
       (tty-display-pixel-width display)))))
@@ -2889,7 +2889,7 @@ For graphical terminals, note that on \"multi-monitor\" setups this
 refers to the height in millimeters for all physical monitors
 associated with DISPLAY.  To get information for each physical
 monitor, use `display-monitor-attributes-list'."
-  (and (memq (framep-on-display display) '(x w32 ns haiku pgtk android wgpu))
+  (and (memq (framep-on-display display) '(x w32 ns haiku pgtk android wlshm))
        (or (cddr (assoc (or display (frame-parameter nil 'display))
 			display-mm-dimensions-alist))
 	   (cddr (assoc t display-mm-dimensions-alist))
@@ -2910,7 +2910,7 @@ For graphical terminals, note that on \"multi-monitor\" setups this
 refers to the width in millimeters for all physical monitors
 associated with DISPLAY.  To get information for each physical
 monitor, use `display-monitor-attributes-list'."
-  (and (memq (framep-on-display display) '(x w32 ns haiku pgtk android wgpu))
+  (and (memq (framep-on-display display) '(x w32 ns haiku pgtk android wlshm))
        (or (cadr (assoc (or display (frame-parameter nil 'display))
 			display-mm-dimensions-alist))
 	   (cadr (assoc t display-mm-dimensions-alist))
@@ -2928,7 +2928,7 @@ DISPLAY can be a display name or a frame.
 If DISPLAY is omitted or nil, it defaults to the selected frame's display."
   (let ((frame-type (framep-on-display display)))
     (cond
-     ((memq frame-type '(x w32 ns haiku pgtk android wgpu))
+     ((memq frame-type '(x w32 ns haiku pgtk android wlshm))
       (x-display-backing-store display))
      (t
       'not-useful))))
@@ -2941,7 +2941,7 @@ DISPLAY can be a display name or a frame.
 If DISPLAY is omitted or nil, it defaults to the selected frame's display."
   (let ((frame-type (framep-on-display display)))
     (cond
-     ((memq frame-type '(x w32 ns haiku pgtk android wgpu))
+     ((memq frame-type '(x w32 ns haiku pgtk android wlshm))
       (x-display-save-under display))
      (t
       'not-useful))))
@@ -2954,7 +2954,7 @@ DISPLAY can be a display name or a frame.
 If DISPLAY is omitted or nil, it defaults to the selected frame's display."
   (let ((frame-type (framep-on-display display)))
     (cond
-     ((memq frame-type '(x w32 ns haiku pgtk android wgpu))
+     ((memq frame-type '(x w32 ns haiku pgtk android wlshm))
       (x-display-planes display))
      ((eq frame-type 'pc)
       4)
@@ -2969,7 +2969,7 @@ DISPLAY can be a display name or a frame.
 If DISPLAY is omitted or nil, it defaults to the selected frame's display."
   (let ((frame-type (framep-on-display display)))
     (cond
-     ((memq frame-type '(x w32 ns haiku pgtk android wgpu))
+     ((memq frame-type '(x w32 ns haiku pgtk android wlshm))
       (x-display-color-cells display))
      ((eq frame-type 'pc)
       16)
@@ -2986,7 +2986,7 @@ DISPLAY can be a display name or a frame.
 If DISPLAY is omitted or nil, it defaults to the selected frame's display."
   (let ((frame-type (framep-on-display display)))
     (cond
-     ((memq frame-type '(x w32 ns haiku pgtk android wgpu))
+     ((memq frame-type '(x w32 ns haiku pgtk android wlshm))
       (x-display-visual-class display))
      ((and (memq frame-type '(pc t))
 	   (tty-display-color-p display))
@@ -3061,6 +3061,8 @@ monitors."
       (ns-display-monitor-attributes-list display))
      ((eq frame-type 'pgtk)
       (pgtk-display-monitor-attributes-list display))
+     ((eq frame-type 'wlshm)
+      (wlshm-display-monitor-attributes-list display))
      ((eq frame-type 'haiku)
       (haiku-display-monitor-attributes-list display))
      ((eq frame-type 'android)

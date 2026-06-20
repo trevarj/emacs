@@ -1,0 +1,3872 @@
+/* Wayland + wlshm terminal backend for Emacs -- terminal/redisplay shim.
+
+This wires the Emacs redisplay interface (RIF) and terminal hooks to the Rust
+backend over FFI (wlshm_ffi.h): RIF draw hooks record fills/glyphs via the
+frame-command API, and frame_up_to_date presents.  Single-threaded model
+(keyboard input is M3); structurally mirrors pgtkterm.c but holds no drawing
+logic of its own.  See wlshm-backend-plan.md.  */
+
+#include <config.h>
+
+#include "lisp.h"
+#include "blockinput.h"
+#include "keyboard.h"
+#include "frame.h"
+#include "window.h"
+#include "buffer.h"
+#include "termchar.h"
+#include "termhooks.h"
+#include "dispextern.h"
+#include <stdarg.h>
+#include "font.h"
+#include "fontset.h"
+#include <cairo-ft.h>		/* FcPattern + cairo-ft, prereqs for ftfont.h */
+#include "ftfont.h"		/* struct font_info -> cr_scaled_font (for menus) */
+#include "composite.h"
+#include "menu.h"		/* MENU_KEYMAPS */
+#include "coding.h"		/* ENCODE_UTF_8 */
+#include <poll.h>
+#include "systime.h"
+#include "wlshmterm.h"
+
+/* Chain of all wlshm displays.  */
+struct wlshm_display_info *x_display_list;
+
+/* ------------------------------------------------------------------ */
+/* Debug logging (enable with the WLSHM_DEBUG env var).  Writes to        */
+/* /tmp/wlshm-debug.log with a monotonic timestamp, flushed per line so a  */
+/* crash/freeze preserves the last entry.  Shared with the Rust side.     */
+/* ------------------------------------------------------------------ */
+static int wlshm_log_state = -1;	/* -1 unknown, 0 off, 1 on */
+static FILE *wlshm_log_fp;
+
+static bool
+wlshm_log_enabled (void)
+{
+  if (wlshm_log_state < 0)
+    {
+      wlshm_log_state = getenv ("WLSHM_DEBUG") ? 1 : 0;
+      if (wlshm_log_state)
+	wlshm_log_fp = fopen ("/tmp/wlshm-debug.log", "a");
+    }
+  return wlshm_log_state == 1 && wlshm_log_fp != NULL;
+}
+
+static void wlshm_log (const char *fmt, ...) ATTRIBUTE_FORMAT_PRINTF (1, 2);
+static void
+wlshm_log (const char *fmt, ...)
+{
+  if (!wlshm_log_enabled ())
+    return;
+  struct timespec t = current_timespec ();
+  fprintf (wlshm_log_fp, "[%ld.%03ld C] ", (long) t.tv_sec,
+	   (long) (t.tv_nsec / 1000000));
+  va_list ap;
+  va_start (ap, fmt);
+  vfprintf (wlshm_log_fp, fmt, ap);
+  va_end (ap);
+  fputc ('\n', wlshm_log_fp);
+  fflush (wlshm_log_fp);
+}
+
+/* Alist of (NAME . PIXEL) X11 color names, loaded from rgb.txt, used to
+   resolve named face colors (e.g. "red", "grey75").  staticpro'd so it
+   survives GC.  PIXEL is 0xRRGGBB, matching our pixel encoding.  */
+static Lisp_Object wlshm_color_map;
+
+/* Human-readable keysym name.  M3 stub (no keyboard yet).  */
+char *
+get_keysym_name (int keysym)
+{
+  static char value[16];
+  sprintf (value, "%d", keysym);
+  return value;
+}
+
+/* Unpack a backend pixel (0xRRGGBB) into linear 0..1 RGB.  */
+void
+wlshm_unpack_pixel (unsigned long pixel, float *r, float *g, float *b)
+{
+  *r = ((pixel >> 16) & 0xff) / 255.0f;
+  *g = ((pixel >> 8) & 0xff) / 255.0f;
+  *b = (pixel & 0xff) / 255.0f;
+}
+
+/* ------------------------------------------------------------------ */
+/* CPU rendering: a persistent Cairo image-surface "canvas".            */
+/*                                                                      */
+/* Emacs draws each frame incrementally onto this canvas via the RIF.   */
+/* frame_up_to_date copies it into a wl_shm buffer (wlshm_window_present).*/
+/* CAIRO_FORMAT_RGB24 == XRGB8888 (native-endian), which is exactly the  */
+/* wl_shm format we present, so the copy is a straight memcpy in Rust.   */
+/* Multi-window model (M3): the canvas/cr live per-frame in struct wlshm_output.
+   `wlshm_cur' names the frame currently being drawn; it is set at every RIF
+   entry point (and by wlshm_begin_cr_clip).  The file-static wlshm_canvas /
+   wlshm_cr below are convenience ALIASES that wlshm_ensure_canvas refreshes to
+   point at wlshm_cur's per-frame canvas, so the many drawing helpers that use
+   them are unchanged.  */
+/* ------------------------------------------------------------------ */
+static struct frame *wlshm_cur;
+static cairo_surface_t *wlshm_canvas;
+static cairo_t *wlshm_cr;
+static int wlshm_canvas_w, wlshm_canvas_h;
+
+/* The frame whose canvas the drawing helpers should target.  */
+static struct frame *
+wlshm_canvas_frame (void)
+{
+  if (wlshm_cur && FRAME_LIVE_P (wlshm_cur) && FRAME_WLSHM_P (wlshm_cur))
+    return wlshm_cur;
+  struct frame *sf = SELECTED_FRAME ();
+  if (sf && FRAME_WLSHM_P (sf) && FRAME_X_OUTPUT (sf))
+    return sf;
+  return NULL;
+}
+
+/* Ensure wlshm_cur's per-frame canvas matches its Wayland surface size, and
+   point the wlshm_canvas/wlshm_cr aliases at it.  */
+static void
+wlshm_ensure_canvas (void)
+{
+  struct frame *f = wlshm_canvas_frame ();
+  if (!f)
+    {
+      wlshm_canvas = NULL;
+      wlshm_cr = NULL;
+      return;
+    }
+  struct wlshm_output *o = FRAME_X_OUTPUT (f);
+  uint32_t w = 0, h = 0;
+  wlshm_window_size (WLSHM_FRAME_HANDLE (f), &w, &h);
+  if (w == 0 || h == 0)
+    {
+      w = 800;
+      h = 600;
+    }
+  if (!o->canvas || o->canvas_w != (int) w || o->canvas_h != (int) h)
+    {
+      if (o->cr)
+	{
+	  cairo_destroy (o->cr);
+	  o->cr = NULL;
+	}
+      if (o->canvas)
+	{
+	  cairo_surface_destroy (o->canvas);
+	  o->canvas = NULL;
+	}
+      o->canvas = cairo_image_surface_create (CAIRO_FORMAT_RGB24,
+					      (int) w, (int) h);
+      o->cr = cairo_create (o->canvas);
+      o->canvas_w = (int) w;
+      o->canvas_h = (int) h;
+    }
+  wlshm_canvas = o->canvas;
+  wlshm_cr = o->cr;
+  wlshm_canvas_w = o->canvas_w;
+  wlshm_canvas_h = o->canvas_h;
+}
+
+/* Push frame F's canvas to the compositor via the Rust wl_shm present.  */
+static void
+wlshm_present_canvas (struct frame *f)
+{
+  wlshm_cur = f;
+  wlshm_ensure_canvas ();
+  if (!wlshm_canvas)
+    return;
+  cairo_surface_flush (wlshm_canvas);
+  wlshm_window_present (WLSHM_FRAME_HANDLE (f),
+			cairo_image_surface_get_data (wlshm_canvas),
+			(uint32_t) cairo_image_surface_get_width (wlshm_canvas),
+			(uint32_t) cairo_image_surface_get_height (wlshm_canvas),
+			(uint32_t) cairo_image_surface_get_stride (wlshm_canvas),
+			0, 0, 0, 0);
+}
+
+/* Public wrapper: present frame F's canvas (used by the tooltip code, which
+   force-draws its tip frame outside the normal redisplay).  */
+void
+wlshm_present_frame (struct frame *f)
+{
+  wlshm_present_canvas (f);
+}
+
+/* Write frame F's canvas to PATH as a PNG (golden/visual test harness).  */
+bool
+wlshm_dump_canvas_png (struct frame *f, const char *path)
+{
+  wlshm_cur = f;
+  wlshm_ensure_canvas ();
+  if (!wlshm_canvas)
+    return false;
+  cairo_surface_flush (wlshm_canvas);
+  return cairo_surface_write_to_png (wlshm_canvas, path) == CAIRO_STATUS_SUCCESS;
+}
+
+/* Solid rectangle fill on the canvas.  Keeps the historical name/signature
+   of the old GPU FFI so the many RIF call sites are unchanged; colors are
+   0..1 sRGB device values (from wlshm_unpack_pixel).  */
+static void
+wlshm_window_rect (float x, float y, float w, float h,
+		  float r, float g, float b, float a)
+{
+  wlshm_ensure_canvas ();
+  if (!wlshm_cr)
+    return;
+  cairo_save (wlshm_cr);
+  cairo_set_operator (wlshm_cr, CAIRO_OPERATOR_OVER);
+  cairo_set_source_rgba (wlshm_cr, r, g, b, a);
+  cairo_rectangle (wlshm_cr, x, y, w, h);
+  cairo_fill (wlshm_cr);
+  cairo_restore (wlshm_cr);
+}
+
+/* Cairo clip/source helpers used by ftcrfont.c for glyph drawing.  */
+cairo_t *
+wlshm_begin_cr_clip (struct frame *f)
+{
+  wlshm_cur = f;
+  wlshm_ensure_canvas ();
+  if (wlshm_cr)
+    cairo_save (wlshm_cr);
+  return wlshm_cr;
+}
+
+void
+wlshm_end_cr_clip (struct frame *f)
+{
+  if (wlshm_cr)
+    cairo_restore (wlshm_cr);
+}
+
+void
+wlshm_set_cr_source_with_color (struct frame *f, unsigned long color,
+			       bool respects_alpha_background)
+{
+  float r, g, b;
+  wlshm_unpack_pixel (color, &r, &g, &b);
+  if (!wlshm_cr)
+    return;
+  cairo_set_source_rgb (wlshm_cr, r, g, b);
+  cairo_set_operator (wlshm_cr, CAIRO_OPERATOR_OVER);
+}
+
+/* ------------------------------------------------------------------ */
+/* Colors.                                                            */
+/* ------------------------------------------------------------------ */
+
+bool
+wlshm_defined_color (struct frame *f, const char *name, Emacs_Color *color,
+		    bool alloc, bool make_index)
+{
+  unsigned short r, g, b;
+  if (parse_color_spec (name, &r, &g, &b))
+    {
+      color->red = r;
+      color->green = g;
+      color->blue = b;
+      /* Pack 8-bit-per-channel into the pixel; the draw path unpacks it.  */
+      color->pixel = ((unsigned long) (r >> 8) << 16
+		      | (unsigned long) (g >> 8) << 8
+		      | (unsigned long) (b >> 8));
+      return true;
+    }
+
+  /* Not a numeric spec: look the name up in the X11 color database.
+     Without this, every named face color (mode line, region, ...) fails to
+     resolve and load_color2 falls back to the frame's default colors, which
+     makes those faces invisible.  */
+  for (Lisp_Object tail = wlshm_color_map; CONSP (tail); tail = XCDR (tail))
+    {
+      Lisp_Object entry = XCAR (tail);
+      if (CONSP (entry) && STRINGP (XCAR (entry))
+	  && !xstrcasecmp (SSDATA (XCAR (entry)), name))
+	{
+	  unsigned long clr = (unsigned long) XFIXNUM (XCDR (entry));
+	  color->pixel = clr;
+	  color->red = ((clr >> 16) & 0xff) * 0x101;
+	  color->green = ((clr >> 8) & 0xff) * 0x101;
+	  color->blue = (clr & 0xff) * 0x101;
+	  return true;
+	}
+    }
+  return false;
+}
+
+static void
+wlshm_query_colors (struct frame *f, Emacs_Color *colors, int ncolors)
+{
+  for (int i = 0; i < ncolors; i++)
+    {
+      unsigned long p = colors[i].pixel;
+      colors[i].red = ((p >> 16) & 0xff) * 0x101;
+      colors[i].green = ((p >> 8) & 0xff) * 0x101;
+      colors[i].blue = (p & 0xff) * 0x101;
+    }
+}
+
+static void
+wlshm_query_frame_background_color (struct frame *f, Emacs_Color *bgcolor)
+{
+  bgcolor->pixel = FRAME_BACKGROUND_PIXEL (f);
+  wlshm_query_colors (f, bgcolor, 1);
+}
+
+/* ------------------------------------------------------------------ */
+/* Redisplay interface.                                               */
+/* ------------------------------------------------------------------ */
+
+/* Choose the foreground/background pixels for glyph string S according to its
+   highlight kind (s->hl).  Shared with the font driver so glyphs use the same
+   colors as the background fill.  */
+void
+wlshm_glyph_string_colors (struct glyph_string *s, unsigned long *fg,
+			  unsigned long *bg)
+{
+  if (s->hl == DRAW_CURSOR)
+    {
+      /* The cursor block is the cursor color; the glyph shows in the face
+	 background, i.e. inverted.  */
+      *bg = FRAME_CURSOR_COLOR (s->f);
+      *fg = s->face->background;
+    }
+  else
+    {
+      /* DRAW_NORMAL_TEXT / DRAW_INVERSE_VIDEO / DRAW_MOUSE_FACE / images:
+	 the face already carries the right (possibly swapped) colors.  */
+      *fg = s->face->foreground;
+      *bg = s->face->background;
+    }
+}
+
+/* Scale a packed pixel toward white (factor>1) or black (factor<1) for the
+   3D relief edges.  */
+static unsigned long
+wlshm_scale_pixel (unsigned long p, double factor)
+{
+  int r = (int) (((p >> 16) & 0xff) * factor);
+  int g = (int) (((p >> 8) & 0xff) * factor);
+  int b = (int) ((p & 0xff) * factor);
+  r = r > 255 ? 255 : r;
+  g = g > 255 ? 255 : g;
+  b = b > 255 ? 255 : b;
+  return ((unsigned long) r << 16) | ((unsigned long) g << 8) | b;
+}
+
+/* Draw the face box around glyph string S: a flat box for FACE_SIMPLE_BOX, or
+   a 3D raised/sunken relief (light top/left, dark bottom/right, swapped when
+   sunken) otherwise.  */
+static void
+wlshm_draw_glyph_string_box (struct glyph_string *s)
+{
+  if (s->face->box == FACE_NO_BOX)
+    return;
+  int hwidth = eabs (s->face->box_horizontal_line_width);
+  int vwidth = eabs (s->face->box_vertical_line_width);
+  if (hwidth == 0 && vwidth == 0)
+    return;
+
+  int left = s->x, top = s->y;
+  int width = s->background_width, height = s->height;
+  bool left_p = s->first_glyph->left_box_line_p;
+  bool right_p = (s->nchars > 0
+		  && s->first_glyph[s->nchars - 1].right_box_line_p);
+
+  unsigned long top_left, bottom_right;
+  if (s->face->box == FACE_SIMPLE_BOX)
+    top_left = bottom_right = s->face->box_color;
+  else
+    {
+      /* Derive relief colors from the face background.  */
+      unsigned long light = wlshm_scale_pixel (s->face->background, 1.4);
+      unsigned long dark = wlshm_scale_pixel (s->face->background, 0.55);
+      bool raised = (s->face->box == FACE_RAISED_BOX);
+      top_left = raised ? light : dark;
+      bottom_right = raised ? dark : light;
+    }
+
+  float tr, tg, tb, br, bg2, bb;
+  wlshm_unpack_pixel (top_left, &tr, &tg, &tb);
+  wlshm_unpack_pixel (bottom_right, &br, &bg2, &bb);
+  block_input ();
+  /* Top (light/box) and bottom (dark/box).  */
+  wlshm_window_rect ((float) left, (float) top, (float) width, (float) hwidth,
+		    tr, tg, tb, 1.0f);
+  wlshm_window_rect ((float) left, (float) (top + height - hwidth),
+		    (float) width, (float) hwidth, br, bg2, bb, 1.0f);
+  if (left_p)
+    wlshm_window_rect ((float) left, (float) top, (float) vwidth,
+		      (float) height, tr, tg, tb, 1.0f);
+  if (right_p)
+    wlshm_window_rect ((float) (left + width - vwidth), (float) top,
+		      (float) vwidth, (float) height, br, bg2, bb, 1.0f);
+  unblock_input ();
+}
+
+/* Draw the component glyphs of a composition at their composed positions
+   (combining marks, ligatures, complex scripts).  Ported from
+   pgtk_draw_composite_glyph_string_foreground.  */
+static void
+wlshm_draw_composite_glyph_string_foreground (struct glyph_string *s)
+{
+  int i, j, x;
+  struct font *font = s->font;
+
+  if (s->face && s->face->box != FACE_NO_BOX
+      && s->first_glyph->left_box_line_p)
+    x = s->x + max (s->face->box_vertical_line_width, 0);
+  else
+    x = s->x;
+
+  if (s->font_not_found_p)
+    {
+      /* Outline box for an unloadable composition.  */
+      if (s->cmp_from == 0)
+	{
+	  float r, g, b;
+	  wlshm_unpack_pixel (s->face->foreground, &r, &g, &b);
+	  int w = s->width - 1, h = s->height - 1;
+	  wlshm_window_rect ((float) x, (float) s->y, (float) w, 1.0f, r, g, b, 1.0f);
+	  wlshm_window_rect ((float) x, (float) (s->y + h), (float) w, 1.0f, r, g, b, 1.0f);
+	  wlshm_window_rect ((float) x, (float) s->y, 1.0f, (float) h, r, g, b, 1.0f);
+	  wlshm_window_rect ((float) (x + w), (float) s->y, 1.0f, (float) h, r, g, b, 1.0f);
+	}
+    }
+  else if (!s->first_glyph->u.cmp.automatic)
+    {
+      int y = s->ybase;
+      for (i = 0, j = s->cmp_from; i < s->nchars; i++, j++)
+	if (COMPOSITION_GLYPH (s->cmp, j) != '\t')
+	  {
+	    int xx = x + s->cmp->offsets[j * 2];
+	    int yy = y - s->cmp->offsets[j * 2 + 1];
+	    font->driver->draw (s, j, j + 1, xx, yy, false);
+	    if (s->face->overstrike)
+	      font->driver->draw (s, j, j + 1, xx + 1, yy, false);
+	  }
+    }
+  else
+    {
+      Lisp_Object gstring = composition_gstring_from_id (s->cmp_id);
+      Lisp_Object glyph;
+      int y = s->ybase;
+      int width = 0;
+
+      for (i = j = s->cmp_from; i < s->cmp_to; i++)
+	{
+	  glyph = LGSTRING_GLYPH (gstring, i);
+	  if (NILP (LGLYPH_ADJUSTMENT (glyph)))
+	    width += LGLYPH_WIDTH (glyph);
+	  else
+	    {
+	      int xoff, yoff, wadjust;
+	      if (j < i)
+		{
+		  font->driver->draw (s, j, i, x, y, false);
+		  if (s->face->overstrike)
+		    font->driver->draw (s, j, i, x + 1, y, false);
+		  x += width;
+		}
+	      xoff = LGLYPH_XOFF (glyph);
+	      yoff = LGLYPH_YOFF (glyph);
+	      wadjust = LGLYPH_WADJUST (glyph);
+	      font->driver->draw (s, i, i + 1, x + xoff, y + yoff, false);
+	      if (s->face->overstrike)
+		font->driver->draw (s, i, i + 1, x + xoff + 1, y + yoff, false);
+	      x += wadjust;
+	      j = i + 1;
+	      width = 0;
+	    }
+	}
+      if (j < i)
+	{
+	  font->driver->draw (s, j, i, x, y, false);
+	  if (s->face->overstrike)
+	    font->driver->draw (s, j, i, x + 1, y, false);
+	}
+    }
+}
+
+/* Draw the underline for glyph string S in COLOR, honoring the face's
+   underline style (single/double/wave/dots/dashes).  Wave and dotted/dashed
+   styles are approximated with small rects.  */
+static void
+wlshm_draw_underline (struct glyph_string *s, unsigned long color)
+{
+  int thickness = s->underline_thickness > 0 ? s->underline_thickness : 1;
+  int pos = s->ybase + (s->underline_position > 0 ? s->underline_position : 1);
+  int x0 = s->x, w = s->width;
+  if (w <= 0)
+    return;
+  float r, g, b;
+  wlshm_unpack_pixel (color, &r, &g, &b);
+  block_input ();
+  switch (s->face->underline)
+    {
+    case FACE_UNDERLINE_DOUBLE_LINE:
+      wlshm_window_rect ((float) x0, (float) pos, (float) w, 1.0f, r, g, b, 1.0f);
+      wlshm_window_rect ((float) x0, (float) (pos + 2), (float) w, 1.0f, r, g, b, 1.0f);
+      break;
+    case FACE_UNDERLINE_WAVE:
+      {
+	/* Triangle-wave zigzag, amplitude 2px, period 4px.  */
+	const int amp = 2;
+	for (int dx = 0; dx < w; dx++)
+	  {
+	    int phase = dx % (2 * amp);
+	    int dy = phase <= amp ? phase : (2 * amp - phase);
+	    wlshm_window_rect ((float) (x0 + dx), (float) (pos + dy), 1.0f, 1.0f,
+			      r, g, b, 1.0f);
+	  }
+      }
+      break;
+    case FACE_UNDERLINE_DOTS:
+      for (int dx = 0; dx < w; dx += 2)
+	wlshm_window_rect ((float) (x0 + dx), (float) pos, 1.0f, (float) thickness,
+			  r, g, b, 1.0f);
+      break;
+    case FACE_UNDERLINE_DASHES:
+      for (int dx = 0; dx < w; dx += 6)
+	wlshm_window_rect ((float) (x0 + dx), (float) pos,
+			  (float) (w - dx < 3 ? w - dx : 3), (float) thickness,
+			  r, g, b, 1.0f);
+      break;
+    case FACE_UNDERLINE_SINGLE:
+    default:
+      wlshm_window_rect ((float) x0, (float) pos, (float) w, (float) thickness,
+			r, g, b, 1.0f);
+      break;
+    }
+  unblock_input ();
+}
+
+/* Draw glyphless characters (undisplayable codepoints / control chars) as a
+   thin box optionally containing the hex code or an acronym, like the other
+   backends.  Ported from pgtk_draw_glyphless_glyph_string_foreground.  */
+static void
+wlshm_draw_glyphless_glyph_string_foreground (struct glyph_string *s)
+{
+  struct glyph *glyph = s->first_glyph;
+  unsigned char2b[8];
+  int x, i, j;
+
+  if (s->face && s->face->box != FACE_NO_BOX
+      && s->first_glyph->left_box_line_p)
+    x = s->x + max (s->face->box_vertical_line_width, 0);
+  else
+    x = s->x;
+
+  s->char2b = char2b;
+
+  float fr, fg_, fb;
+  wlshm_unpack_pixel (s->face->foreground, &fr, &fg_, &fb);
+
+  for (i = 0; i < s->nchars; i++, glyph++)
+    {
+      char buf[7];
+      char *str = NULL;
+      int len = glyph->u.glyphless.len;
+
+      if (glyph->u.glyphless.method == GLYPHLESS_DISPLAY_ACRONYM)
+	{
+	  if (len > 0
+	      && CHAR_TABLE_P (Vglyphless_char_display)
+	      && (CHAR_TABLE_EXTRA_SLOTS (XCHAR_TABLE (Vglyphless_char_display))
+		  >= 1))
+	    {
+	      Lisp_Object acronym
+		= (!glyph->u.glyphless.for_no_font
+		   ? CHAR_TABLE_REF (Vglyphless_char_display,
+				     glyph->u.glyphless.ch)
+		   : XCHAR_TABLE (Vglyphless_char_display)->extras[0]);
+	      if (CONSP (acronym))
+		acronym = XCAR (acronym);
+	      if (STRINGP (acronym))
+		str = SSDATA (acronym);
+	    }
+	}
+      else if (glyph->u.glyphless.method == GLYPHLESS_DISPLAY_HEX_CODE)
+	{
+	  unsigned int ch = glyph->u.glyphless.ch;
+	  sprintf (buf, "%0*X", ch < 0x10000 ? 4 : 6, ch);
+	  str = buf;
+	}
+
+      if (str)
+	{
+	  int upper_len = (len + 1) / 2;
+	  for (j = 0; j < len && j < 8; j++)
+	    char2b[j]
+	      = s->font->driver->encode_char (s->font, str[j]) & 0xFFFF;
+	  s->font->driver->draw (s, 0, upper_len,
+				 x + glyph->slice.glyphless.upper_xoff,
+				 s->ybase + glyph->slice.glyphless.upper_yoff,
+				 false);
+	  s->font->driver->draw (s, upper_len, len,
+				 x + glyph->slice.glyphless.lower_xoff,
+				 s->ybase + glyph->slice.glyphless.lower_yoff,
+				 false);
+	}
+
+      if (glyph->u.glyphless.method != GLYPHLESS_DISPLAY_THIN_SPACE)
+	{
+	  /* Outline box.  */
+	  int bx = x, by = s->ybase - glyph->ascent;
+	  int bw = glyph->pixel_width - 1, bh = glyph->ascent + glyph->descent - 1;
+	  wlshm_window_rect ((float) bx, (float) by, (float) bw, 1.0f, fr, fg_, fb, 1.0f);
+	  wlshm_window_rect ((float) bx, (float) (by + bh), (float) bw, 1.0f, fr, fg_, fb, 1.0f);
+	  wlshm_window_rect ((float) bx, (float) by, 1.0f, (float) bh, fr, fg_, fb, 1.0f);
+	  wlshm_window_rect ((float) (bx + bw), (float) by, 1.0f, (float) bh, fr, fg_, fb, 1.0f);
+	}
+      x += glyph->pixel_width;
+    }
+
+  s->char2b = NULL;
+}
+
+/* Clip the canvas CR to glyph string S's clip rectangles, so overhangs and
+   neighbouring glyphs don't smear into adjacent cells.  Ported from
+   pgtk_set_glyph_string_clipping.  Caller must wlshm_begin_cr_clip first
+   (cairo_restore in wlshm_end_cr_clip removes the clip).  */
+static void
+wlshm_set_glyph_string_clipping (struct glyph_string *s, cairo_t *cr)
+{
+  XRectangle r[2];
+  int n = get_glyph_string_clip_rects (s, r, 2);
+
+  if (n > 0)
+    {
+      for (int i = 0; i < n; i++)
+	cairo_rectangle (cr, r[i].x, r[i].y, r[i].width, r[i].height);
+      cairo_clip (cr);
+    }
+}
+
+/* RIF: compute the left/right overhang of glyph string S (used so bold and
+   slanted glyphs that bleed past their advance width get repainted/clipped
+   correctly).  Ported from pgtk_compute_glyph_string_overhangs.  */
+static void
+wlshm_compute_glyph_string_overhangs (struct glyph_string *s)
+{
+  if (s->cmp == NULL
+      && (s->first_glyph->type == CHAR_GLYPH
+	  || s->first_glyph->type == COMPOSITE_GLYPH))
+    {
+      struct font_metrics metrics;
+
+      if (s->first_glyph->type == CHAR_GLYPH)
+	{
+	  unsigned *code = alloca (sizeof (unsigned) * s->nchars);
+	  struct font *font = s->font;
+
+	  for (int i = 0; i < s->nchars; i++)
+	    code[i] = s->char2b[i];
+	  font->driver->text_extents (font, code, s->nchars, &metrics);
+	}
+      else
+	{
+	  Lisp_Object gstring = composition_gstring_from_id (s->cmp_id);
+
+	  composition_gstring_width (gstring, s->cmp_from, s->cmp_to, &metrics);
+	}
+      s->right_overhang = (metrics.rbearing > metrics.width
+			   ? metrics.rbearing - metrics.width : 0);
+      s->left_overhang = metrics.lbearing < 0 ? -metrics.lbearing : 0;
+    }
+  else if (s->cmp)
+    {
+      s->right_overhang = s->cmp->rbearing - s->cmp->pixel_width;
+      s->left_overhang = -s->cmp->lbearing;
+    }
+}
+
+/* Draw a 1px-thick rectangle outline (W+1 x H+1, like the X/pgtk
+   pgtk_draw_rectangle) in COLOR on the canvas.  */
+static void
+wlshm_draw_rectangle (struct frame *f, unsigned long color,
+		      int x, int y, int w, int h)
+{
+  float r, g, b;
+  wlshm_unpack_pixel (color, &r, &g, &b);
+  wlshm_window_rect ((float) x, (float) y, (float) (w + 1), 1.0f, r, g, b, 1.0f);
+  wlshm_window_rect ((float) x, (float) (y + h), (float) (w + 1), 1.0f, r, g, b, 1.0f);
+  wlshm_window_rect ((float) x, (float) y, 1.0f, (float) (h + 1), r, g, b, 1.0f);
+  wlshm_window_rect ((float) (x + w), (float) y, 1.0f, (float) (h + 1), r, g, b, 1.0f);
+}
+
+/* Draw a cairo image PATTERN onto the canvas at DEST_X,DEST_Y, sampling from
+   SRC_X,SRC_Y for WIDTH x HEIGHT.  When !OVERLAY_P the destination is first
+   filled with the glyph string's background.  Coverage masks (A1/A8) are
+   stencilled with the foreground.  Ported from pgtk_cr_draw_image.  */
+static void
+wlshm_cr_draw_image (struct frame *f, unsigned long fg, unsigned long bg,
+		     cairo_pattern_t *image, int src_x, int src_y,
+		     int width, int height, int dest_x, int dest_y,
+		     bool overlay_p)
+{
+  cairo_t *cr = wlshm_begin_cr_clip (f);
+  float r, g, b;
+
+  if (overlay_p)
+    cairo_rectangle (cr, dest_x, dest_y, width, height);
+  else
+    {
+      wlshm_unpack_pixel (bg, &r, &g, &b);
+      cairo_set_source_rgb (cr, r, g, b);
+      cairo_rectangle (cr, dest_x, dest_y, width, height);
+      cairo_fill_preserve (cr);
+    }
+
+  cairo_translate (cr, dest_x - src_x, dest_y - src_y);
+
+  cairo_surface_t *surface;
+  cairo_pattern_get_surface (image, &surface);
+  cairo_format_t format = cairo_image_surface_get_format (surface);
+  if (format != CAIRO_FORMAT_A8 && format != CAIRO_FORMAT_A1)
+    {
+      cairo_set_source (cr, image);
+      cairo_fill (cr);
+    }
+  else
+    {
+      wlshm_unpack_pixel (fg, &r, &g, &b);
+      cairo_set_source_rgb (cr, r, g, b);
+      cairo_clip (cr);
+      cairo_mask (cr, image);
+    }
+
+  wlshm_end_cr_clip (f);
+}
+
+/* Draw the foreground (the actual image) of image glyph string S.  Ported
+   from pgtk_draw_image_foreground.  */
+static void
+wlshm_draw_image_foreground (struct glyph_string *s)
+{
+  int x = s->x;
+  int y = s->ybase - image_ascent (s->img, s->face, &s->slice);
+
+  if (s->face->box != FACE_NO_BOX
+      && s->first_glyph->left_box_line_p
+      && s->slice.x == 0)
+    x += max (s->face->box_vertical_line_width, 0);
+
+  if (s->slice.x == 0)
+    x += s->img->hmargin;
+  if (s->slice.y == 0)
+    y += s->img->vmargin;
+
+  if (s->img->cr_data)
+    {
+      cairo_t *cr = wlshm_begin_cr_clip (s->f);
+      wlshm_set_glyph_string_clipping (s, cr);
+      wlshm_cr_draw_image (s->f, s->xgcv.foreground, s->xgcv.background,
+			   s->img->cr_data, s->slice.x, s->slice.y,
+			   s->slice.width, s->slice.height, x, y, true);
+      if (!s->img->mask && s->hl == DRAW_CURSOR)
+	{
+	  int relief = eabs (s->img->relief);
+	  wlshm_draw_rectangle (s->f, s->xgcv.foreground, x - relief, y - relief,
+				s->slice.width + relief * 2 - 1,
+				s->slice.height + relief * 2 - 1);
+	}
+      wlshm_end_cr_clip (s->f);
+    }
+  else
+    wlshm_draw_rectangle (s->f, s->xgcv.foreground, x, y,
+			  s->slice.width - 1, s->slice.height - 1);
+}
+
+/* Draw a raised/sunken 3D relief around image glyph string S.  Simplified
+   port of pgtk_draw_image_relief: a 1px box in light/dark relief colors.  */
+static void
+wlshm_draw_image_relief (struct glyph_string *s)
+{
+  int thick, x, y, x1, y1;
+  bool raised_p;
+
+  x = s->x;
+  y = s->ybase - image_ascent (s->img, s->face, &s->slice);
+  if (s->face->box != FACE_NO_BOX
+      && s->first_glyph->left_box_line_p
+      && s->slice.x == 0)
+    x += max (s->face->box_vertical_line_width, 0);
+  if (s->slice.x == 0)
+    x += s->img->hmargin;
+  if (s->slice.y == 0)
+    y += s->img->vmargin;
+
+  if (s->hl == DRAW_IMAGE_SUNKEN || s->hl == DRAW_IMAGE_RAISED)
+    {
+      thick = (tool_bar_button_relief < 0
+	       ? DEFAULT_TOOL_BAR_BUTTON_RELIEF
+	       : min (tool_bar_button_relief, 1000000));
+      raised_p = s->hl == DRAW_IMAGE_RAISED;
+    }
+  else
+    {
+      thick = eabs (s->img->relief);
+      raised_p = s->img->relief > 0;
+    }
+  if (thick <= 0)
+    return;
+
+  x1 = x + s->slice.width - 1;
+  y1 = y + s->slice.height - 1;
+  unsigned long light = wlshm_scale_pixel (s->face->background, 1.4);
+  unsigned long dark = wlshm_scale_pixel (s->face->background, 0.55);
+  unsigned long top_left = raised_p ? light : dark;
+  unsigned long bottom_right = raised_p ? dark : light;
+  float tr, tg, tb, br, bg2, bb;
+  wlshm_unpack_pixel (top_left, &tr, &tg, &tb);
+  wlshm_unpack_pixel (bottom_right, &br, &bg2, &bb);
+  for (int i = 0; i < thick; i++)
+    {
+      wlshm_window_rect ((float) (x - i), (float) (y - i),
+			 (float) (x1 - x + 1 + 2 * i), 1.0f, tr, tg, tb, 1.0f);
+      wlshm_window_rect ((float) (x - i), (float) (y - i),
+			 1.0f, (float) (y1 - y + 1 + 2 * i), tr, tg, tb, 1.0f);
+      wlshm_window_rect ((float) (x - i), (float) (y1 + i),
+			 (float) (x1 - x + 1 + 2 * i), 1.0f, br, bg2, bb, 1.0f);
+      wlshm_window_rect ((float) (x1 + i), (float) (y - i),
+			 1.0f, (float) (y1 - y + 1 + 2 * i), br, bg2, bb, 1.0f);
+    }
+}
+
+/* Draw image glyph string S: optional background, the image, optional relief.
+   Ported from pgtk_draw_image_glyph_string.  */
+static void
+wlshm_draw_image_glyph_string (struct glyph_string *s)
+{
+  int box_line_hwidth = max (s->face->box_vertical_line_width, 0);
+  int box_line_vwidth = max (s->face->box_horizontal_line_width, 0);
+  int height = s->height;
+
+  if (s->slice.y == 0)
+    height -= box_line_vwidth;
+  if (s->slice.y + s->slice.height >= s->img->height)
+    height -= box_line_vwidth;
+
+  if (height > s->slice.height
+      || s->img->hmargin || s->img->vmargin || s->img->mask
+      || s->img->pixmap == 0 || s->width != s->background_width)
+    {
+      int x = s->x, y = s->y, width = s->background_width;
+      if (s->first_glyph->left_box_line_p && s->slice.x == 0)
+	{
+	  x += box_line_hwidth;
+	  width -= box_line_hwidth;
+	}
+      if (s->slice.y == 0)
+	y += box_line_vwidth;
+
+      float r, g, b;
+      wlshm_unpack_pixel (s->xgcv.background, &r, &g, &b);
+      wlshm_window_rect ((float) x, (float) y, (float) width, (float) height,
+			 r, g, b, 1.0f);
+      s->background_filled_p = true;
+    }
+
+  wlshm_draw_image_foreground (s);
+
+  if (s->img->relief
+      || s->hl == DRAW_IMAGE_RAISED
+      || s->hl == DRAW_IMAGE_SUNKEN)
+    wlshm_draw_image_relief (s);
+}
+
+static void
+wlshm_draw_glyph_string (struct glyph_string *s)
+{
+  wlshm_cur = s->f;
+  unsigned long fg, bg;
+  wlshm_glyph_string_colors (s, &fg, &bg);
+
+  /* ftcrfont_draw reads the glyph colors from s->xgcv; supply them (it draws
+     with with_background=false, so only the foreground is used).  */
+  s->xgcv.foreground = fg;
+  s->xgcv.background = bg;
+
+  /* Clip all drawing for this glyph string to its clip rectangles so
+     overhangs/neighbours don't smear (the inner wlshm_window_rect and
+     ftcrfont begin/end cr-clip calls nest inside this save).  */
+  cairo_t *cr = wlshm_begin_cr_clip (s->f);
+  wlshm_set_glyph_string_clipping (s, cr);
+
+  switch (s->first_glyph->type)
+    {
+    case CHAR_GLYPH:
+    case COMPOSITE_GLYPH:
+      {
+	/* Background (inset vertically by the box line so the box shows).  */
+	if (!s->background_filled_p && !s->for_overlaps)
+	  {
+	    int box_line = max (s->face->box_horizontal_line_width, 0);
+	    float r, g, b;
+	    wlshm_unpack_pixel (bg, &r, &g, &b);
+	    block_input ();
+	    wlshm_window_rect ((float) s->x, (float) (s->y + box_line),
+			      (float) s->background_width,
+			      (float) (s->height - 2 * box_line), r, g, b, 1.0f);
+	    unblock_input ();
+	    s->background_filled_p = true;
+	  }
+
+	if (!s->for_overlaps)
+	  wlshm_draw_glyph_string_box (s);
+
+	/* Glyphs (background already drawn above).  */
+	struct font *font = s->font;
+	if (s->first_glyph->type == COMPOSITE_GLYPH)
+	  wlshm_draw_composite_glyph_string_foreground (s);
+	else if (font && font->driver && font->driver->draw)
+	  {
+	    int y = s->ybase - font->baseline_offset;
+	    font->driver->draw (s, 0, s->nchars, s->x, y, false);
+	  }
+
+	/* Underline.  */
+	if (s->face->underline && !s->for_overlaps)
+	  {
+	    unsigned long ul = (s->face->underline_defaulted_p
+				? fg : s->face->underline_color);
+	    wlshm_draw_underline (s, ul);
+	  }
+
+	/* Overline.  */
+	if (s->face->overline_p && !s->for_overlaps)
+	  {
+	    unsigned long oc = (s->face->overline_color_defaulted_p
+				? fg : s->face->overline_color);
+	    float r, g, b;
+	    wlshm_unpack_pixel (oc, &r, &g, &b);
+	    block_input ();
+	    wlshm_window_rect ((float) s->x, (float) s->y, (float) s->width,
+			      1.0f, r, g, b, 1.0f);
+	    unblock_input ();
+	  }
+
+	/* Strike-through (centered on the first glyph's box).  */
+	if (s->face->strike_through_p && !s->for_overlaps)
+	  {
+	    int glyph_y = s->ybase - s->first_glyph->ascent;
+	    int glyph_h = s->first_glyph->ascent + s->first_glyph->descent;
+	    int dy = (glyph_h - 1) / 2;
+	    unsigned long sc = (s->face->strike_through_color_defaulted_p
+				? fg : s->face->strike_through_color);
+	    float r, g, b;
+	    wlshm_unpack_pixel (sc, &r, &g, &b);
+	    block_input ();
+	    wlshm_window_rect ((float) s->x, (float) (glyph_y + dy),
+			      (float) s->width, 1.0f, r, g, b, 1.0f);
+	    unblock_input ();
+	  }
+      }
+      break;
+
+    case STRETCH_GLYPH:
+      {
+	float r, g, b;
+	wlshm_unpack_pixel (bg, &r, &g, &b);
+	block_input ();
+	wlshm_window_rect ((float) s->x, (float) s->y,
+			  (float) s->background_width, (float) s->height,
+			  r, g, b, 1.0f);
+	unblock_input ();
+      }
+      break;
+
+    case GLYPHLESS_GLYPH:
+      {
+	/* Background, then the box + hex/acronym.  */
+	if (!s->background_filled_p && !s->for_overlaps)
+	  {
+	    float r, g, b;
+	    wlshm_unpack_pixel (bg, &r, &g, &b);
+	    block_input ();
+	    wlshm_window_rect ((float) s->x, (float) s->y,
+			      (float) s->background_width, (float) s->height,
+			      r, g, b, 1.0f);
+	    unblock_input ();
+	    s->background_filled_p = true;
+	  }
+	block_input ();
+	wlshm_draw_glyphless_glyph_string_foreground (s);
+	unblock_input ();
+      }
+      break;
+
+    case IMAGE_GLYPH:
+      block_input ();
+      wlshm_draw_image_glyph_string (s);
+      unblock_input ();
+      break;
+
+    default:
+      break;
+    }
+
+  s->num_clips = 0;
+  wlshm_end_cr_clip (s->f);
+}
+
+static void
+wlshm_clear_frame_area (struct frame *f, int x, int y, int width, int height)
+{
+  wlshm_cur = f;
+  float r, g, b;
+  wlshm_unpack_pixel (FRAME_BACKGROUND_PIXEL (f), &r, &g, &b);
+  block_input ();
+  wlshm_window_rect ((float) x, (float) y, (float) width, (float) height,
+		    r, g, b, 1.0f);
+  unblock_input ();
+}
+
+static void
+wlshm_draw_window_cursor (struct window *w, struct glyph_row *glyph_row,
+			 int x, int y, enum text_cursor_kinds cursor_type,
+			 int cursor_width, bool on_p, bool active_p)
+{
+  wlshm_cur = WINDOW_XFRAME (w);
+  struct frame *f = XFRAME (WINDOW_FRAME (w));
+
+  /* When turning the cursor off, Emacs has already redrawn the underlying
+     glyph (via erase_phys_cursor -> draw_phys_cursor_glyph with
+     DRAW_NORMAL_TEXT), so there is nothing to paint here.  */
+  if (!on_p)
+    return;
+
+  w->phys_cursor_type = cursor_type;
+  w->phys_cursor_on_p = true;
+
+  switch (cursor_type)
+    {
+    case NO_CURSOR:
+      w->phys_cursor_width = 0;
+      break;
+
+    case FILLED_BOX_CURSOR:
+      /* Redraw the glyph under the cursor inverted: this paints the cursor
+	 block in the cursor color and the character in the frame background,
+	 going through wlshm_draw_glyph_string with hl == DRAW_CURSOR.  */
+      draw_phys_cursor_glyph (w, glyph_row, DRAW_CURSOR);
+      break;
+
+    case HOLLOW_BOX_CURSOR:
+    case BAR_CURSOR:
+    case HBAR_CURSOR:
+      {
+	struct glyph *cursor_glyph = get_phys_cursor_glyph (w);
+	if (!cursor_glyph)
+	  break;
+	int gx, gy, gh, wd = cursor_glyph->pixel_width;
+	get_phys_cursor_geometry (w, glyph_row, cursor_glyph, &gx, &gy, &gh);
+	float r, g, b;
+	wlshm_unpack_pixel (FRAME_CURSOR_COLOR (f), &r, &g, &b);
+	block_input ();
+	if (cursor_type == HOLLOW_BOX_CURSOR)
+	  {
+	    /* Outline only.  */
+	    wlshm_window_rect ((float) gx, (float) gy, (float) wd, 1.0f, r, g, b, 1.0f);
+	    wlshm_window_rect ((float) gx, (float) (gy + gh - 1), (float) wd, 1.0f, r, g, b, 1.0f);
+	    wlshm_window_rect ((float) gx, (float) gy, 1.0f, (float) gh, r, g, b, 1.0f);
+	    wlshm_window_rect ((float) (gx + wd - 1), (float) gy, 1.0f, (float) gh, r, g, b, 1.0f);
+	  }
+	else if (cursor_type == BAR_CURSOR)
+	  {
+	    int bw = cursor_width > 0 ? cursor_width : 2;
+	    wlshm_window_rect ((float) gx, (float) gy, (float) bw, (float) gh, r, g, b, 1.0f);
+	  }
+	else /* HBAR_CURSOR */
+	  {
+	    int bh = cursor_width > 0 ? cursor_width : 2;
+	    wlshm_window_rect ((float) gx, (float) (gy + gh - bh), (float) wd,
+			      (float) bh, r, g, b, 1.0f);
+	  }
+	unblock_input ();
+      }
+      break;
+
+    default:
+      break;
+    }
+}
+
+/* Shift an already-rendered region of the window up/down on the GPU's
+   persistent texture, so redisplay only has to repaint the newly-exposed
+   lines.  Mirrors pgtk_scroll_run (sans xwidgets).  */
+static void
+wlshm_scroll_run (struct window *w, struct run *run)
+{
+  wlshm_cur = WINDOW_XFRAME (w);
+  int x, y, width, height, from_y, to_y, bottom_y;
+
+  /* Frame-relative bounding box of W's text area (including fringes).  */
+  window_box (w, ANY_AREA, &x, &y, &width, &height);
+
+  from_y = WINDOW_TO_FRAME_PIXEL_Y (w, run->current_y);
+  to_y = WINDOW_TO_FRAME_PIXEL_Y (w, run->desired_y);
+  bottom_y = y + height;
+
+  if (to_y < from_y)
+    {
+      /* Scrolling up: don't copy in the mode line at the bottom.  */
+      if (from_y + run->height > bottom_y)
+	height = bottom_y - from_y;
+      else
+	height = run->height;
+    }
+  else
+    {
+      /* Scrolling down: don't copy over the mode line at the bottom.  */
+      if (to_y + run->height > bottom_y)
+	height = bottom_y - to_y;
+      else
+	height = run->height;
+    }
+
+  if (height <= 0 || width <= 0)
+    return;
+
+  block_input ();
+  /* Cursor off; redisplay switches it back on in update_window_end.  */
+  gui_clear_cursor (w);
+  wlshm_ensure_canvas ();
+  if (wlshm_canvas)
+    {
+      cairo_surface_flush (wlshm_canvas);
+      unsigned char *data = cairo_image_surface_get_data (wlshm_canvas);
+      int stride = cairo_image_surface_get_stride (wlshm_canvas);
+      int cw = wlshm_canvas_w, ch = wlshm_canvas_h;
+      /* Clamp the copy box to the canvas.  */
+      if (x < 0)
+	x = 0;
+      if (x + width > cw)
+	width = cw - x;
+      if (from_y < 0 || to_y < 0)
+	width = 0;
+      if (from_y + height > ch)
+	height = ch - from_y;
+      if (to_y + height > ch)
+	height = ch - to_y;
+      if (width > 0 && height > 0)
+	{
+	  size_t row_bytes = (size_t) width * 4;
+	  if (to_y < from_y)
+	    for (int i = 0; i < height; i++)
+	      memmove (data + (size_t) (to_y + i) * stride + (size_t) x * 4,
+		       data + (size_t) (from_y + i) * stride + (size_t) x * 4,
+		       row_bytes);
+	  else
+	    for (int i = height - 1; i >= 0; i--)
+	      memmove (data + (size_t) (to_y + i) * stride + (size_t) x * 4,
+		       data + (size_t) (from_y + i) * stride + (size_t) x * 4,
+		       row_bytes);
+	  cairo_surface_mark_dirty (wlshm_canvas);
+	}
+    }
+  unblock_input ();
+}
+/* Called after each window line is updated.  Mark the row's fringe bitmaps for
+   redraw (otherwise stale fringe/indicator pixels linger after an update --
+   the "margins don't redraw" symptom), and clear any leftover full-width row
+   pixels in the internal border.  Ported from pgtk_after_update_window_line.  */
+static void
+wlshm_after_update_window_line (struct window *w, struct glyph_row *desired_row)
+{
+  struct frame *f;
+  int width, height;
+
+  eassert (w);
+
+  if (!desired_row->mode_line_p && !w->pseudo_window_p)
+    desired_row->redraw_fringe_bitmaps_p = 1;
+
+  if (windows_or_buffers_changed
+      && desired_row->full_width_p
+      && (f = XFRAME (w->frame),
+	  width = FRAME_INTERNAL_BORDER_WIDTH (f),
+	  width != 0)
+      && (height = desired_row->visible_height, height > 0))
+    {
+      int y = WINDOW_TO_FRAME_PIXEL_Y (w, max (0, desired_row->y));
+      block_input ();
+      wlshm_clear_frame_area (f, 0, y, width, height);
+      wlshm_clear_frame_area (f, FRAME_PIXEL_WIDTH (f) - width, y, width, height);
+      unblock_input ();
+    }
+}
+static void wlshm_flush_display (struct frame *f) {}
+
+/* Fringe bitmaps (continuation/truncation arrows, empty-line and buffer
+   boundary indicators).  We keep the raw bits (copied at define time, since
+   define may run before the window/atlas exists) and lazily rasterize them
+   into the glyph atlas on first draw.  */
+struct wlshm_fringe_bmp
+{
+  unsigned short *bits;
+  int h, wd;
+};
+static struct wlshm_fringe_bmp *wlshm_fringe_bmps;
+static int wlshm_fringe_bmp_max;
+
+static void
+wlshm_define_fringe_bitmap (int which, unsigned short *bits, int h, int wd)
+{
+  if (which >= wlshm_fringe_bmp_max)
+    {
+      int old = wlshm_fringe_bmp_max;
+      wlshm_fringe_bmp_max = which + 20;
+      wlshm_fringe_bmps = xrealloc (wlshm_fringe_bmps,
+				   wlshm_fringe_bmp_max * sizeof *wlshm_fringe_bmps);
+      memset (&wlshm_fringe_bmps[old], 0,
+	      (wlshm_fringe_bmp_max - old) * sizeof *wlshm_fringe_bmps);
+    }
+  struct wlshm_fringe_bmp *fb = &wlshm_fringe_bmps[which];
+  xfree (fb->bits);
+  fb->bits = xnmalloc (h, sizeof (unsigned short));
+  memcpy (fb->bits, bits, h * sizeof (unsigned short));
+  fb->h = h;
+  fb->wd = wd;
+}
+
+static void
+wlshm_destroy_fringe_bitmap (int which)
+{
+  if (which < 0 || which >= wlshm_fringe_bmp_max)
+    return;
+  struct wlshm_fringe_bmp *fb = &wlshm_fringe_bmps[which];
+  xfree (fb->bits);
+  fb->bits = NULL;
+  fb->h = fb->wd = 0;
+}
+
+static void
+wlshm_draw_fringe_bitmap (struct window *w, struct glyph_row *row,
+			 struct draw_fringe_bitmap_params *p)
+{
+  struct frame *f = XFRAME (WINDOW_FRAME (w));
+  wlshm_cur = f;
+  struct face *face = p->face;
+
+  block_input ();
+  wlshm_ensure_canvas ();
+  if (!wlshm_cr)
+    {
+      unblock_input ();
+      return;
+    }
+
+  /* Clip to this row's band within the window so the fringe (background and
+     bitmap) never bleeds past the window's text area into the mode line or the
+     echo-area window below it (mirrors pgtk_clip_to_row).  */
+  cairo_save (wlshm_cr);
+  {
+    int wbx, wby, wbw;
+    window_box (w, ANY_AREA, &wbx, &wby, &wbw, 0);
+    int ry = WINDOW_TO_FRAME_PIXEL_Y (w, max (0, row->y));
+    ry = max (ry, wby);
+    cairo_rectangle (wlshm_cr, wbx, ry, wbw, row->visible_height);
+    cairo_clip (wlshm_cr);
+  }
+
+  /* Background behind the bitmap.  */
+  if (p->bx >= 0 && !p->overlay_p && p->nx > 0 && p->ny > 0)
+    {
+      unsigned long bg = face ? face->background : FRAME_BACKGROUND_PIXEL (f);
+      float r, g, b;
+      wlshm_unpack_pixel (bg, &r, &g, &b);
+      wlshm_window_rect ((float) p->bx, (float) p->by, (float) p->nx,
+			(float) p->ny, r, g, b, 1.0f);
+    }
+
+  /* The bitmap itself: build a 1-bit cairo mask from the row words and
+     paint it in the fringe color (mirrors pgtk_define/draw_fringe_bitmap).  */
+  if (p->which)
+    {
+      /* Lazily define the bitmap if it was registered while no GUI frame
+	 existed (e.g. a package loaded under a daemon).  */
+      if (p->which >= wlshm_fringe_bmp_max || !wlshm_fringe_bmps[p->which].bits)
+	gui_define_fringe_bitmap (f, p->which);
+      struct wlshm_fringe_bmp *fb
+	= (p->which < wlshm_fringe_bmp_max) ? &wlshm_fringe_bmps[p->which] : NULL;
+      wlshm_ensure_canvas ();
+      if (fb && fb->bits && fb->h > 0 && fb->wd > 0 && wlshm_cr)
+	{
+	  unsigned long fg
+	    = (p->cursor_p
+	       ? (p->overlay_p
+		  ? (face ? face->background : FRAME_BACKGROUND_PIXEL (f))
+		  : FRAME_CURSOR_COLOR (f))
+	       : (face ? face->foreground : FRAME_FOREGROUND_PIXEL (f)));
+	  float r, g, b;
+	  wlshm_unpack_pixel (fg, &r, &g, &b);
+
+	  cairo_surface_t *mask
+	    = cairo_image_surface_create (CAIRO_FORMAT_A1, fb->wd, fb->h);
+	  int stride = cairo_image_surface_get_stride (mask);
+	  unsigned char *data = cairo_image_surface_get_data (mask);
+	  for (int i = 0; i < fb->h; i++)
+	    *((unsigned short *) (data + i * stride)) = fb->bits[i];
+	  cairo_surface_mark_dirty (mask);
+
+	  cairo_save (wlshm_cr);
+	  /* Clip to the row's visible band so partial rows don't overflow.  */
+	  int clip_h = p->ny > 0 ? p->ny : fb->h;
+	  cairo_rectangle (wlshm_cr, p->x, p->y, fb->wd, clip_h);
+	  cairo_clip (wlshm_cr);
+	  cairo_set_source_rgb (wlshm_cr, r, g, b);
+	  /* Offset by -dh so visible rows [dh, dh+h) land at p->y (partial
+	     rows at window edges; dh is 0 in the common case).  */
+	  cairo_mask_surface (wlshm_cr, mask, p->x, p->y - p->dh);
+	  cairo_restore (wlshm_cr);
+	  cairo_surface_destroy (mask);
+	}
+    }
+
+  cairo_restore (wlshm_cr);
+  unblock_input ();
+}
+
+/* Fill a frame-relative rectangle with a packed pixel color.  */
+static void
+wlshm_fill_rect_pixel (int x, int y, int w, int h, unsigned long pixel)
+{
+  if (w <= 0 || h <= 0)
+    return;
+  float r, g, b;
+  wlshm_unpack_pixel (pixel, &r, &g, &b);
+  wlshm_window_rect ((float) x, (float) y, (float) w, (float) h, r, g, b, 1.0f);
+}
+
+/* Fill the internal border strips so no stale pixels show when the window
+   layout changes.  */
+static void
+wlshm_clear_under_internal_border (struct frame *f)
+{
+  wlshm_cur = f;
+  int border = FRAME_INTERNAL_BORDER_WIDTH (f);
+  if (border <= 0)
+    return;
+  int width = FRAME_PIXEL_WIDTH (f);
+  int height = FRAME_PIXEL_HEIGHT (f);
+  int margin = FRAME_TOP_MARGIN_HEIGHT (f);
+  int bottom_margin = FRAME_BOTTOM_MARGIN_HEIGHT (f);
+  int face_id = (FRAME_PARENT_FRAME (f)
+		 ? CHILD_FRAME_BORDER_FACE_ID : INTERNAL_BORDER_FACE_ID);
+  if (!NILP (Vface_remapping_alist))
+    face_id = lookup_basic_face (NULL, f, face_id);
+  struct face *face = FACE_FROM_ID_OR_NULL (f, face_id);
+  unsigned long pixel = face ? face->background : FRAME_BACKGROUND_PIXEL (f);
+
+  block_input ();
+  wlshm_fill_rect_pixel (0, margin, width, border, pixel);
+  wlshm_fill_rect_pixel (0, 0, border, height, pixel);
+  wlshm_fill_rect_pixel (width - border, 0, border, height, pixel);
+  wlshm_fill_rect_pixel (0, height - bottom_margin - border, width, border, pixel);
+  unblock_input ();
+}
+
+/* 1px line separating side-by-side windows (no divider configured).  */
+static void
+wlshm_draw_vertical_window_border (struct window *w, int x, int y0, int y1)
+{
+  struct frame *f = XFRAME (WINDOW_FRAME (w));
+  wlshm_cur = f;
+  struct face *face = FACE_FROM_ID_OR_NULL (f, VERTICAL_BORDER_FACE_ID);
+  unsigned long pixel = face ? face->foreground : FRAME_FOREGROUND_PIXEL (f);
+  block_input ();
+  wlshm_fill_rect_pixel (x, y0, 1, y1 - y0, pixel);
+  unblock_input ();
+}
+
+/* Window divider (the draggable separator), drawn with first/middle/last
+   pixel faces so it gets a subtle 3D edge like the other backends.  */
+static void
+wlshm_draw_window_divider (struct window *w, int x0, int x1, int y0, int y1)
+{
+  struct frame *f = XFRAME (WINDOW_FRAME (w));
+  wlshm_cur = f;
+  struct face *face = FACE_FROM_ID_OR_NULL (f, WINDOW_DIVIDER_FACE_ID);
+  struct face *face_first
+    = FACE_FROM_ID_OR_NULL (f, WINDOW_DIVIDER_FIRST_PIXEL_FACE_ID);
+  struct face *face_last
+    = FACE_FROM_ID_OR_NULL (f, WINDOW_DIVIDER_LAST_PIXEL_FACE_ID);
+  unsigned long color = face ? face->foreground : FRAME_FOREGROUND_PIXEL (f);
+  unsigned long color_first
+    = face_first ? face_first->foreground : FRAME_FOREGROUND_PIXEL (f);
+  unsigned long color_last
+    = face_last ? face_last->foreground : FRAME_FOREGROUND_PIXEL (f);
+
+  block_input ();
+  if (y1 - y0 > x1 - x0 && x1 - x0 > 2)
+    {
+      /* Vertical divider.  */
+      wlshm_fill_rect_pixel (x0, y0, 1, y1 - y0, color_first);
+      wlshm_fill_rect_pixel (x0 + 1, y0, x1 - x0 - 2, y1 - y0, color);
+      wlshm_fill_rect_pixel (x1 - 1, y0, 1, y1 - y0, color_last);
+    }
+  else if (x1 - x0 > y1 - y0 && y1 - y0 > 3)
+    {
+      /* Horizontal divider.  */
+      wlshm_fill_rect_pixel (x0, y0, x1 - x0, 1, color_first);
+      wlshm_fill_rect_pixel (x0, y0 + 1, x1 - x0, y1 - y0 - 2, color);
+      wlshm_fill_rect_pixel (x0, y1 - 1, x1 - x0, 1, color_last);
+    }
+  else
+    wlshm_fill_rect_pixel (x0, y0, x1 - x0, y1 - y0, color);
+  unblock_input ();
+}
+
+/* Set the pointer cursor shape for frame F (I-beam over text, arrow over the
+   mode line, hand over buttons, etc.).  CURSOR encodes a wlshm_cursor_shape.  */
+static void
+wlshm_define_frame_cursor (struct frame *f, Emacs_Cursor cursor)
+{
+  if (FRAME_OUTPUT_DATA (f)->current_cursor == cursor)
+    return;
+  FRAME_OUTPUT_DATA (f)->current_cursor = cursor;
+  block_input ();
+  wlshm_window_set_cursor (WLSHM_FRAME_HANDLE (f), (int) (intptr_t) cursor);
+  unblock_input ();
+}
+/* Busy indicator: switch the pointer to the Wait shape while Emacs is busy,
+   and back to the frame's normal cursor when done.  */
+static void
+wlshm_show_hourglass (struct frame *f)
+{
+  block_input ();
+  wlshm_window_set_cursor (f ? WLSHM_FRAME_HANDLE (f) : 0, WLSHM_CURSOR_WAIT);
+  unblock_input ();
+}
+
+static void
+wlshm_hide_hourglass (struct frame *f)
+{
+  block_input ();
+  int c = f ? (int) (intptr_t) FRAME_OUTPUT_DATA (f)->current_cursor : 0;
+  wlshm_window_set_cursor (f ? WLSHM_FRAME_HANDLE (f) : 0,
+			   c ? c : WLSHM_CURSOR_DEFAULT);
+  unblock_input ();
+}
+
+/* ------------------------------------------------------------------ */
+/* Frame lifecycle hooks (M6).                                        */
+/* ------------------------------------------------------------------ */
+
+/* delete_frame_hook: destroy F's Wayland surface and Cairo canvas.  Without
+   this the surface leaks until process exit (M3 left it deferred).  */
+static void
+wlshm_destroy_window (struct frame *f)
+{
+  struct wlshm_display_info *dpyinfo = FRAME_DISPLAY_INFO (f);
+  struct wlshm_output *o = FRAME_X_OUTPUT (f);
+
+  block_input ();
+
+  /* Drop any dangling references to this frame.  */
+  if (dpyinfo->highlight_frame == f)
+    dpyinfo->highlight_frame = NULL;
+  if (dpyinfo->x_focus_frame == f)
+    dpyinfo->x_focus_frame = NULL;
+  if (dpyinfo->x_focus_event_frame == f)
+    dpyinfo->x_focus_event_frame = NULL;
+  if (dpyinfo->last_mouse_frame == f)
+    dpyinfo->last_mouse_frame = NULL;
+  if (dpyinfo->last_mouse_motion_frame == f)
+    dpyinfo->last_mouse_motion_frame = NULL;
+  if (dpyinfo->last_mouse_glyph_frame == f)
+    dpyinfo->last_mouse_glyph_frame = NULL;
+  if (wlshm_cur == f)
+    {
+      wlshm_cur = NULL;
+      wlshm_canvas = NULL;
+      wlshm_cr = NULL;
+    }
+
+  if (o)
+    {
+      if (o->cr)
+	{
+	  cairo_destroy (o->cr);
+	  o->cr = NULL;
+	}
+      if (o->canvas)
+	{
+	  cairo_surface_destroy (o->canvas);
+	  o->canvas = NULL;
+	}
+      uint64_t h = WLSHM_FRAME_HANDLE (f);
+      if (h)
+	wlshm_window_close (h);
+      o->wlshm_frame = NULL;
+    }
+
+  unblock_input ();
+}
+
+/* frame_visible_invisible_hook: map (present) or unmap the surface.  */
+static void
+wlshm_make_frame_visible_invisible (struct frame *f, bool visible)
+{
+  if (visible)
+    {
+      SET_FRAME_VISIBLE (f, 1);
+      SET_FRAME_ICONIFIED (f, false);
+      /* Force a redisplay so the surface maps with current content.  */
+      SET_FRAME_GARBAGED (f);
+    }
+  else
+    {
+      SET_FRAME_VISIBLE (f, 0);
+      block_input ();
+      wlshm_window_unmap (WLSHM_FRAME_HANDLE (f));
+      unblock_input ();
+    }
+}
+
+/* iconify_frame_hook: minimize via xdg_toplevel.set_minimized.  Wayland sends
+   no reliable de-iconify event, so we mark the frame iconified and rely on
+   make-frame-visible to restore it.  */
+static void
+wlshm_iconify_frame (struct frame *f)
+{
+  struct wlshm_display_info *dpyinfo = FRAME_DISPLAY_INFO (f);
+
+  if (dpyinfo->highlight_frame == f)
+    dpyinfo->highlight_frame = NULL;
+  if (FRAME_ICONIFIED_P (f))
+    return;
+
+  block_input ();
+  wlshm_window_minimize (WLSHM_FRAME_HANDLE (f));
+  unblock_input ();
+
+  SET_FRAME_VISIBLE (f, 0);
+  SET_FRAME_ICONIFIED (f, true);
+}
+
+/* fullscreen_hook: apply F's want_fullscreen to the Wayland surface.  Only
+   FULLSCREEN_BOTH maps to xdg fullscreen; width/height-only are unsupported on
+   Wayland and fall back to off.  */
+static void
+wlshm_fullscreen_hook (struct frame *f)
+{
+  if (!FRAME_VISIBLE_P (f))
+    return;
+  block_input ();
+  int mode = (f->want_fullscreen == FULLSCREEN_BOTH
+	      || f->want_fullscreen == FULLSCREEN_MAXIMIZED) ? 1 : 0;
+  wlshm_window_set_fullscreen (WLSHM_FRAME_HANDLE (f), mode);
+  /* The compositor confirms the new size via a Configure event, which
+     wlshm_read_socket turns into a resize.  */
+  unblock_input ();
+}
+
+/* set_window_size_hook: request a new pixel size.  Apply locally and request
+   it from the compositor; a Configure event confirms the final size.  */
+static void
+wlshm_set_window_size (struct frame *f, bool change_gravity,
+		       int width, int height)
+{
+  block_input ();
+  FRAME_X_OUTPUT (f)->preferred_width = width;
+  FRAME_X_OUTPUT (f)->preferred_height = height;
+  wlshm_window_set_geometry (WLSHM_FRAME_HANDLE (f), 0, 0, width, height);
+
+  int tw = FRAME_PIXEL_TO_TEXT_WIDTH (f, width);
+  int th = FRAME_PIXEL_TO_TEXT_HEIGHT (f, height);
+  int lh = FRAME_LINE_HEIGHT (f), cw = FRAME_COLUMN_WIDTH (f);
+  if (lh > 0)
+    th -= th % lh;
+  if (cw > 0)
+    tw -= tw % cw;
+  change_frame_size (f, tw, th, false, true, false);
+  SET_FRAME_GARBAGED (f);
+  unblock_input ();
+}
+
+/* toggle_invisible_pointer_hook: hide the pointer while typing.  */
+static void
+wlshm_toggle_invisible_pointer (struct frame *f, bool invisible)
+{
+  block_input ();
+  wlshm_window_hide_pointer (WLSHM_FRAME_HANDLE (f), invisible);
+  f->pointer_invisible = invisible;
+  unblock_input ();
+}
+
+/* free_pixmap: release a Cairo Emacs_Pixmap (mirrors pgtk_free_pixmap).  */
+static void
+wlshm_free_pixmap (struct frame *f, Emacs_Pixmap pixmap)
+{
+  if (pixmap)
+    {
+      xfree (pixmap->data);
+      xfree (pixmap);
+    }
+}
+
+/* The following are genuine Wayland limitations: a client cannot control its
+   stacking order, position its own toplevels, or set a per-window icon.  PGTK
+   no-ops these under Wayland too.  They exist so the generic code can call them
+   unconditionally.  */
+static void
+wlshm_frame_raise_lower (struct frame *f, bool raise_flag)
+{
+  /* Wayland gives clients no control over window stacking.  No-op.  */
+}
+
+static void
+wlshm_set_frame_offset (struct frame *f, int xoff, int yoff, int change_gravity)
+{
+  /* Wayland forbids a client from positioning its own toplevel.  No-op.  */
+}
+
+static bool
+wlshm_set_bitmap_icon (struct frame *f, Lisp_Object file)
+{
+  /* Wayland has no per-window icon (only the app_id maps to a .desktop).  */
+  return false;
+}
+
+/* The bell.  Wayland has no portable audible bell, so we only ever do a VISUAL
+   flash, and ONLY when the user asked for one via `visible-bell' (mirrors
+   xterm's XTring_bell).  With the default (visible-bell nil) the bell is
+   silent -- no screen flash.  The flash is a brief translucent wash over the
+   frame rather than a hard full-screen colour inversion, which is jarring.  */
+static void
+wlshm_ring_bell (struct frame *f)
+{
+  if (!visible_bell)
+    return;
+  if (f && FRAME_WLSHM_P (f))
+    wlshm_cur = f;
+  wlshm_ensure_canvas ();
+  if (!wlshm_canvas || !wlshm_cr)
+    return;
+  f = wlshm_canvas_frame ();
+  if (!f)
+    return;
+  block_input ();
+  cairo_surface_flush (wlshm_canvas);
+  int stride = cairo_image_surface_get_stride (wlshm_canvas);
+  unsigned char *data = cairo_image_surface_get_data (wlshm_canvas);
+  size_t nbytes = (size_t) stride * wlshm_canvas_h;
+  unsigned char *snap = xmalloc (nbytes);
+  memcpy (snap, data, nbytes);
+
+  /* Soft flash: a short, semi-transparent grey wash (not a full inversion).  */
+  cairo_save (wlshm_cr);
+  cairo_set_operator (wlshm_cr, CAIRO_OPERATOR_OVER);
+  cairo_set_source_rgba (wlshm_cr, 0.5, 0.5, 0.5, 0.45);
+  cairo_paint (wlshm_cr);
+  cairo_restore (wlshm_cr);
+  wlshm_present_canvas (f);
+
+  struct timespec ts = { 0, 40 * 1000 * 1000 };  /* ~40ms flash */
+  nanosleep (&ts, NULL);
+
+  memcpy (data, snap, nbytes);
+  cairo_surface_mark_dirty (wlshm_canvas);
+  wlshm_present_canvas (f);
+  xfree (snap);
+  unblock_input ();
+}
+
+void
+wlshm_default_font_parameter (struct frame *f, Lisp_Object parms)
+{
+  struct wlshm_display_info *dpyinfo = FRAME_DISPLAY_INFO (f);
+  Lisp_Object font_param = gui_display_get_arg (dpyinfo, parms, Qfont, NULL,
+						NULL, RES_TYPE_STRING);
+  Lisp_Object font = Qnil;
+  if (BASE_EQ (font_param, Qunbound))
+    font_param = Qnil;
+
+  if (NILP (font))
+    font = (!NILP (font_param) ? font_param
+	    : gui_display_get_arg (dpyinfo, parms, Qfont, "font", "Font",
+				   RES_TYPE_STRING));
+
+  if (!FONTP (font) && !STRINGP (font))
+    {
+      /* Use an explicit pixel size scaled by the HiDPI factor, so the
+	 default font is readable and unambiguous (avoids the point-size /
+	 face-height path that can collapse to 1px).  */
+      int scale = (int) dpyinfo->scale;
+      if (scale < 1)
+	scale = 1;
+      char sized[64];
+      snprintf (sized, sizeof sized, "Monospace:pixelsize=%d", 14 * scale);
+      const char *names[] = { sized, "monospace-10", "fixed", NULL };
+      for (int i = 0; names[i]; i++)
+	{
+	  font = font_open_by_name (f, build_unibyte_string (names[i]));
+	  if (!NILP (font))
+	    break;
+	}
+      if (NILP (font))
+	error ("No suitable font was found");
+    }
+
+  gui_default_parameter (f, parms, Qfont, font, "font", "Font",
+			 RES_TYPE_STRING);
+}
+
+/* ------------------------------------------------------------------ */
+/* Frame parameter handlers.                                          */
+/* ------------------------------------------------------------------ */
+
+static void
+wlshm_set_foreground_color (struct frame *f, Lisp_Object arg, Lisp_Object oldval)
+{
+  Emacs_Color col;
+  if (STRINGP (arg) && wlshm_defined_color (f, SSDATA (arg), &col, true, false))
+    {
+      FRAME_FOREGROUND_PIXEL (f) = col.pixel;
+      update_face_from_frame_parameter (f, Qforeground_color, arg);
+      if (FRAME_VISIBLE_P (f))
+	SET_FRAME_GARBAGED (f);
+    }
+}
+
+static void
+wlshm_set_background_color (struct frame *f, Lisp_Object arg, Lisp_Object oldval)
+{
+  Emacs_Color col;
+  if (STRINGP (arg) && wlshm_defined_color (f, SSDATA (arg), &col, true, false))
+    {
+      FRAME_BACKGROUND_PIXEL (f) = col.pixel;
+      update_face_from_frame_parameter (f, Qbackground_color, arg);
+      if (FRAME_VISIBLE_P (f))
+	SET_FRAME_GARBAGED (f);
+    }
+}
+
+static void
+wlshm_set_cursor_color (struct frame *f, Lisp_Object arg, Lisp_Object oldval)
+{
+  Emacs_Color col;
+  if (STRINGP (arg) && wlshm_defined_color (f, SSDATA (arg), &col, true, false))
+    {
+      FRAME_X_OUTPUT (f)->cursor_color = col.pixel;
+      if (FRAME_VISIBLE_P (f))
+	SET_FRAME_GARBAGED (f);
+    }
+}
+
+/* ---- Frame name / title (xdg_toplevel.set_title) ---------------------- */
+
+static void
+wlshm_set_name_internal (struct frame *f, Lisp_Object name)
+{
+  Lisp_Object encoded = ENCODE_UTF_8 (name);
+  wlshm_log ("set_title \"%s\"", SSDATA (encoded));
+  block_input ();
+  wlshm_window_set_title (WLSHM_FRAME_HANDLE (f), SSDATA (encoded));
+  unblock_input ();
+}
+
+static void
+wlshm_set_name (struct frame *f, Lisp_Object name, int explicit)
+{
+  /* Lisp requests override redisplay requests.  */
+  if (explicit)
+    {
+      if (f->explicit_name && NILP (name))
+	update_mode_lines = 12;
+      f->explicit_name = !NILP (name);
+    }
+  else if (f->explicit_name)
+    return;
+
+  if (NILP (name))
+    name = build_string ("GNU Emacs");
+  else
+    CHECK_STRING (name);
+
+  if (!NILP (Fstring_equal (name, f->name)))
+    return;
+
+  fset_name (f, name);
+
+  /* Title overrides explicit name.  */
+  if (!NILP (f->title))
+    name = f->title;
+  wlshm_set_name_internal (f, name);
+}
+
+static void
+wlshm_explicitly_set_name (struct frame *f, Lisp_Object arg, Lisp_Object oldval)
+{
+  wlshm_set_name (f, arg, true);
+}
+
+static void
+wlshm_implicitly_set_name (struct frame *f, Lisp_Object arg, Lisp_Object oldval)
+{
+  wlshm_set_name (f, arg, false);
+}
+
+static void
+wlshm_set_title (struct frame *f, Lisp_Object name, Lisp_Object old_name)
+{
+  if (EQ (name, f->title))
+    return;
+  update_mode_lines = 22;
+  fset_title (f, name);
+  if (NILP (name))
+    name = f->name;
+  else
+    CHECK_STRING (name);
+  wlshm_set_name_internal (f, name);
+}
+
+/* Frame parameter: cursor-type.  Ported from pgtk_set_cursor_type.  */
+static void
+wlshm_set_cursor_type (struct frame *f, Lisp_Object arg, Lisp_Object oldval)
+{
+  set_frame_cursor_types (f, arg);
+}
+
+/* Frame parameter: internal-border-width.  Recompute the frame size and
+   repaint the border strips.  Ported from pgtk_set_internal_border_width.  */
+static void
+wlshm_set_internal_border_width (struct frame *f, Lisp_Object arg,
+				 Lisp_Object oldval)
+{
+  int border = check_int_nonnegative (arg);
+
+  if (border != FRAME_INTERNAL_BORDER_WIDTH (f))
+    {
+      f->internal_border_width = border;
+      if (FRAME_X_WINDOW (f))
+	{
+	  adjust_frame_size (f, -1, -1, 3, false, Qinternal_border_width);
+	  wlshm_clear_under_internal_border (f);
+	}
+    }
+}
+
+/* Frame parameter: scroll-bar-foreground.  Store the pixel (used by the
+   Emacs-drawn scroll bars in M2); nil = use the default.  */
+static void
+wlshm_set_scroll_bar_foreground (struct frame *f, Lisp_Object new_value,
+				 Lisp_Object old_value)
+{
+  if (NILP (new_value))
+    FRAME_X_OUTPUT (f)->scroll_bar_foreground_pixel = -1;
+  else if (STRINGP (new_value))
+    {
+      Emacs_Color color;
+      if (!wlshm_defined_color (f, SSDATA (new_value), &color, true, false))
+	error ("Unknown color");
+      FRAME_X_OUTPUT (f)->scroll_bar_foreground_pixel = color.pixel;
+    }
+  else
+    error ("Invalid scroll-bar-foreground");
+  update_face_from_frame_parameter (f, Qscroll_bar_foreground, new_value);
+}
+
+/* Frame parameter: scroll-bar-background.  As above for the trough.  */
+static void
+wlshm_set_scroll_bar_background (struct frame *f, Lisp_Object new_value,
+				 Lisp_Object old_value)
+{
+  if (NILP (new_value))
+    FRAME_X_OUTPUT (f)->scroll_bar_background_pixel = -1;
+  else if (STRINGP (new_value))
+    {
+      Emacs_Color color;
+      if (!wlshm_defined_color (f, SSDATA (new_value), &color, true, false))
+	error ("Unknown color");
+      FRAME_X_OUTPUT (f)->scroll_bar_background_pixel = color.pixel;
+    }
+  else
+    error ("Invalid scroll-bar-background");
+  update_face_from_frame_parameter (f, Qscroll_bar_background, new_value);
+}
+
+/* Frame parameter: undecorated.  Drop/add server-side window decorations.  */
+static void
+wlshm_set_undecorated (struct frame *f, Lisp_Object new_value,
+		       Lisp_Object old_value)
+{
+  if (!EQ (new_value, old_value))
+    {
+      FRAME_UNDECORATED (f) = !NILP (new_value);
+      block_input ();
+      /* Decorations ON when the frame is NOT undecorated.  */
+      wlshm_window_set_decorations (WLSHM_FRAME_HANDLE (f), NILP (new_value));
+      unblock_input ();
+      store_frame_param (f, Qundecorated, FRAME_UNDECORATED (f) ? Qt : Qnil);
+    }
+}
+
+/* Frame parameter: parent-frame.  Best-effort xdg_toplevel reparent.  */
+static void
+wlshm_set_parent_frame (struct frame *f, Lisp_Object new_value,
+			Lisp_Object old_value)
+{
+  struct frame *p = NULL;
+
+  if (!NILP (new_value))
+    {
+      CHECK_FRAME (new_value);
+      p = XFRAME (new_value);
+      if (!FRAME_WLSHM_P (p))
+	error ("parent-frame must be on the same display");
+    }
+
+  if (p != FRAME_PARENT_FRAME (f))
+    {
+      block_input ();
+      wlshm_window_set_parent (WLSHM_FRAME_HANDLE (f),
+			       p ? WLSHM_FRAME_HANDLE (p) : 0);
+      unblock_input ();
+      fset_parent_frame (f, new_value);
+      store_frame_param (f, Qparent_frame, new_value);
+    }
+}
+
+/* Frame parameter: child-frame-border-width.  Mirrors the internal-border
+   handler.  */
+static void
+wlshm_set_child_frame_border_width (struct frame *f, Lisp_Object arg,
+				    Lisp_Object oldval)
+{
+  int border = (NILP (arg)
+		? -1 : check_integer_range (arg, 0, INT_MAX));
+
+  if (border != FRAME_CHILD_FRAME_BORDER_WIDTH (f))
+    {
+      f->child_frame_border_width = border;
+      if (FRAME_X_WINDOW (f))
+	{
+	  adjust_frame_size (f, -1, -1, 3, false, Qchild_frame_border_width);
+	  wlshm_clear_under_internal_border (f);
+	}
+    }
+}
+
+/* Positional, indexed by frame parameter (mirrors pgtk_frame_parm_handlers).
+   gui_set_* are the shared generic handlers; the remaining NULLs are genuine
+   Wayland-limitation no-ops (override-redirect, skip-taskbar, z-group, sticky,
+   icon-name/type, mouse/border color) that the generic code tolerates.  */
+frame_parm_handler wlshm_frame_parm_handlers[] = {
+  gui_set_autoraise,
+  gui_set_autolower,
+  wlshm_set_background_color,
+  NULL,				/* border_color */
+  gui_set_border_width,
+  wlshm_set_cursor_color,
+  wlshm_set_cursor_type,
+  gui_set_font,
+  wlshm_set_foreground_color,
+  NULL,				/* icon_name */
+  NULL,				/* icon_type */
+  wlshm_set_child_frame_border_width,
+  wlshm_set_internal_border_width,
+  gui_set_right_divider_width,
+  gui_set_bottom_divider_width,
+  NULL,				/* menu_bar_lines */
+  NULL,				/* mouse_color */
+  wlshm_explicitly_set_name,
+  gui_set_scroll_bar_width,
+  gui_set_scroll_bar_height,
+  wlshm_set_title,
+  gui_set_unsplittable,
+  gui_set_vertical_scroll_bars,
+  gui_set_horizontal_scroll_bars,
+  gui_set_visibility,
+  NULL,				/* tab_bar_lines */
+  NULL,				/* tool_bar_lines */
+  wlshm_set_scroll_bar_foreground,
+  wlshm_set_scroll_bar_background,
+  gui_set_screen_gamma,
+  gui_set_line_spacing,
+  gui_set_left_fringe,
+  gui_set_right_fringe,
+  0,
+  gui_set_fullscreen,
+  gui_set_font_backend,
+  gui_set_alpha,
+  NULL,				/* sticky */
+  NULL,				/* tool_bar_position */
+  0,
+  wlshm_set_undecorated,
+  wlshm_set_parent_frame,
+  NULL,				/* skip_taskbar */
+  NULL,				/* no_focus_on_map */
+  NULL,				/* no_accept_focus */
+  NULL,				/* z_group */
+  NULL,				/* override_redirect */
+  gui_set_no_special_glyphs,
+  gui_set_alpha_background,
+  gui_set_borders_respect_alpha_background,
+  NULL,
+};
+
+static struct redisplay_interface wlshm_redisplay_interface = {
+  wlshm_frame_parm_handlers,
+  gui_produce_glyphs,
+  gui_write_glyphs,
+  gui_insert_glyphs,
+  gui_clear_end_of_line,
+  wlshm_scroll_run,
+  wlshm_after_update_window_line,
+  NULL, /* update_window_begin */
+  NULL, /* update_window_end */
+  wlshm_flush_display,
+  gui_clear_window_mouse_face,
+  gui_get_glyph_overhangs,
+  gui_fix_overlapping_area,
+  wlshm_draw_fringe_bitmap,
+  wlshm_define_fringe_bitmap,
+  wlshm_destroy_fringe_bitmap,
+  wlshm_compute_glyph_string_overhangs,
+  wlshm_draw_glyph_string,
+  wlshm_define_frame_cursor,
+  wlshm_clear_frame_area,
+  wlshm_clear_under_internal_border,
+  wlshm_draw_window_cursor,
+  wlshm_draw_vertical_window_border,
+  wlshm_draw_window_divider,
+  NULL, /* shift_glyphs_for_insert */
+  wlshm_show_hourglass,
+  wlshm_hide_hourglass,
+  wlshm_default_font_parameter,
+};
+
+/* ------------------------------------------------------------------ */
+/* Terminal hooks.                                                    */
+/* ------------------------------------------------------------------ */
+
+static void
+wlshm_clear_frame (struct frame *f)
+{
+  wlshm_cur = f;
+  float r, g, b;
+  wlshm_unpack_pixel (FRAME_BACKGROUND_PIXEL (f), &r, &g, &b);
+  /* Clear the whole surface, not just the frame: when the frame rounds down
+     to whole rows/columns it is slightly smaller than the Wayland surface,
+     and the leftover strip would otherwise show stale pixels.  */
+  uint32_t sw = 0, sh = 0;
+  wlshm_window_size (WLSHM_FRAME_HANDLE (f), &sw, &sh);
+  float w = (float) max ((int) sw, FRAME_PIXEL_WIDTH (f));
+  float h = (float) max ((int) sh, FRAME_PIXEL_HEIGHT (f));
+  block_input ();
+  wlshm_window_rect (0.0f, 0.0f, w, h, r, g, b, 1.0f);
+  unblock_input ();
+}
+
+static void
+wlshm_update_begin (struct frame *f)
+{
+  block_input ();
+  wlshm_cur = f;
+  wlshm_ensure_canvas ();
+  unblock_input ();
+}
+
+static void wlshm_redraw_scroll_bars (struct frame *f);
+
+static void
+wlshm_frame_up_to_date (struct frame *f)
+{
+  block_input ();
+  /* Repaint scroll bars on top of the freshly-drawn text before presenting,
+     so the text redisplay doesn't leave them overpainted.  */
+  wlshm_redraw_scroll_bars (f);
+  wlshm_present_canvas (f);
+  unblock_input ();
+}
+
+/* Drain Wayland events.  M2: only window lifecycle (configure/close); keyboard
+   input is M3.  */
+/* Find a live wlshm frame on TERMINAL (M2: there is a single one).  */
+static struct frame *
+wlshm_any_frame (struct terminal *terminal)
+{
+  Lisp_Object tail, frame;
+  FOR_EACH_FRAME (tail, frame)
+    {
+      struct frame *f = XFRAME (frame);
+      if (FRAME_WLSHM_P (f) && FRAME_LIVE_P (f)
+	  && FRAME_TERMINAL (f) == terminal)
+	return f;
+    }
+  return NULL;
+}
+
+/* The live wlshm frame on TERMINAL whose Rust window HANDLE matches, or NULL
+   (handle 0 / no match -> let the caller fall back to wlshm_any_frame).  */
+static struct frame *
+wlshm_frame_for_handle (struct terminal *terminal, uint64_t handle)
+{
+  if (handle == 0)
+    return NULL;
+  Lisp_Object tail, frame;
+  FOR_EACH_FRAME (tail, frame)
+    {
+      struct frame *f = XFRAME (frame);
+      if (FRAME_WLSHM_P (f) && FRAME_LIVE_P (f)
+	  && FRAME_TERMINAL (f) == terminal
+	  && WLSHM_FRAME_HANDLE (f) == handle)
+	return f;
+    }
+  return NULL;
+}
+
+/* Update which frame is highlighted (focused).  The cursor is drawn solid
+   only on the highlight frame; others get a hollow cursor (xdisp.c checks
+   f != dpyinfo->highlight_frame).  */
+static void
+wlshm_frame_rehighlight (struct wlshm_display_info *dpyinfo)
+{
+  struct frame *old_highlight = dpyinfo->highlight_frame;
+
+  if (dpyinfo->x_focus_frame)
+    {
+      dpyinfo->highlight_frame
+	= (FRAMEP (FRAME_FOCUS_FRAME (dpyinfo->x_focus_frame))
+	   ? XFRAME (FRAME_FOCUS_FRAME (dpyinfo->x_focus_frame))
+	   : dpyinfo->x_focus_frame);
+      if (!FRAME_LIVE_P (dpyinfo->highlight_frame))
+	{
+	  fset_focus_frame (dpyinfo->x_focus_frame, Qnil);
+	  dpyinfo->highlight_frame = dpyinfo->x_focus_frame;
+	}
+    }
+  else
+    dpyinfo->highlight_frame = NULL;
+
+  if (old_highlight != dpyinfo->highlight_frame)
+    {
+      /* Redraw the cursor on both frames so it flips solid/hollow.  */
+      if (old_highlight)
+	gui_update_cursor (old_highlight, true);
+      if (dpyinfo->highlight_frame)
+	gui_update_cursor (dpyinfo->highlight_frame, true);
+    }
+}
+
+/* Generic hook wrapper.  */
+static void
+wlshm_frame_rehighlight_hook (struct frame *f)
+{
+  wlshm_frame_rehighlight (FRAME_DISPLAY_INFO (f));
+}
+
+static void
+wlshm_new_focus_frame (struct wlshm_display_info *dpyinfo, struct frame *frame)
+{
+  if (frame != dpyinfo->x_focus_frame)
+    dpyinfo->x_focus_frame = frame;
+  wlshm_frame_rehighlight (dpyinfo);
+}
+
+/* ------------------------------------------------------------------ */
+/* Scroll bars: drawn by Emacs onto the canvas (no toolkit/subsurface),  */
+/* ported from xterm.c's #ifndef USE_TOOLKIT_SCROLL_BARS path.           */
+/* ------------------------------------------------------------------ */
+
+/* Linear blend of two 0xRRGGBB pixels: A at t=0, B at t=1.  */
+static unsigned long
+wlshm_blend_pixel (unsigned long a, unsigned long b, double t)
+{
+  float ar, ag, ab, br, bg, bb;
+  wlshm_unpack_pixel (a, &ar, &ag, &ab);
+  wlshm_unpack_pixel (b, &br, &bg, &bb);
+  int r = (int) ((ar + (br - ar) * t) * 255.0 + 0.5);
+  int g = (int) ((ag + (bg - ag) * t) * 255.0 + 0.5);
+  int bl = (int) ((ab + (bb - ab) * t) * 255.0 + 0.5);
+  r = r < 0 ? 0 : (r > 255 ? 255 : r);
+  g = g < 0 ? 0 : (g > 255 ? 255 : g);
+  bl = bl < 0 ? 0 : (bl > 255 ? 255 : bl);
+  return ((unsigned long) r << 16) | ((unsigned long) g << 8) | (unsigned long) bl;
+}
+
+/* Round a filled handle by clearing its four 1px corners back to the trough.  */
+static void
+wlshm_round_corners (int x, int y, int w, int h, unsigned long trough)
+{
+  if (w < 3 || h < 3)
+    return;
+  wlshm_fill_rect_pixel (x, y, 1, 1, trough);
+  wlshm_fill_rect_pixel (x + w - 1, y, 1, 1, trough);
+  wlshm_fill_rect_pixel (x, y + h - 1, 1, 1, trough);
+  wlshm_fill_rect_pixel (x + w - 1, y + h - 1, 1, 1, trough);
+}
+
+/* Paint BAR onto the frame canvas: a flat, modern scroll bar -- a faint trough
+   and a soft mid-tone handle inset from the edges with lightly rounded
+   corners, no hard border.  Honors explicit scroll-bar colors if set.  */
+static void
+wlshm_scroll_bar_redraw (struct scroll_bar *bar)
+{
+  struct frame *f = XFRAME (WINDOW_FRAME (XWINDOW (bar->window)));
+  struct wlshm_output *out = FRAME_X_OUTPUT (f);
+  unsigned long frame_fg = FRAME_FOREGROUND_PIXEL (f);
+  unsigned long frame_bg = FRAME_BACKGROUND_PIXEL (f);
+  unsigned long trough = (out->scroll_bar_background_pixel != (unsigned long) -1
+			  ? out->scroll_bar_background_pixel
+			  : wlshm_blend_pixel (frame_bg, frame_fg, 0.08));
+  unsigned long handle = (out->scroll_bar_foreground_pixel != (unsigned long) -1
+			  ? out->scroll_bar_foreground_pixel
+			  : wlshm_blend_pixel (frame_bg, frame_fg, 0.42));
+  int left = bar->left, top = bar->top, width = bar->width, height = bar->height;
+
+  if (width <= 0 || height <= 0)
+    return;
+
+  /* The minibuffer / echo-area window reserves scroll-bar space (every window
+     inherits the frame's scroll-bar type via make_window), and redisplay calls
+     set/redeem for it, so we must keep the bar object.  But it must not SHOW a
+     bar -- toolkit backends render nothing in the echo area.  Paint only the
+     frame background so the column stays blank.  */
+  if (MINI_WINDOW_P (XWINDOW (bar->window)))
+    {
+      block_input ();
+      wlshm_fill_rect_pixel (left, top, width, height, FRAME_BACKGROUND_PIXEL (f));
+      unblock_input ();
+      return;
+    }
+
+  block_input ();
+  /* Faint trough, no border.  */
+  wlshm_fill_rect_pixel (left, top, width, height, trough);
+
+  if (!bar->horizontal)
+    {
+      int top_range = VERTICAL_SCROLL_BAR_TOP_RANGE (f, height);
+      int s = bar->start, e = bar->end;
+      if (e > top_range)
+	e = top_range;
+      int inset = width / 4 < 2 ? 2 : width / 4;
+      int hx = left + inset, hw = width - 2 * inset;
+      int hy = top + VERTICAL_SCROLL_BAR_TOP_BORDER + s;
+      int hh = (e - s) + VERTICAL_SCROLL_BAR_MIN_HANDLE;
+      if (hw > 0 && hh > 0)
+	{
+	  wlshm_fill_rect_pixel (hx, hy, hw, hh, handle);
+	  wlshm_round_corners (hx, hy, hw, hh, trough);
+	}
+    }
+  else
+    {
+      int left_range = HORIZONTAL_SCROLL_BAR_LEFT_RANGE (f, width);
+      int s = bar->start, e = bar->end;
+      if (e > left_range)
+	e = left_range;
+      int inset = height / 4 < 2 ? 2 : height / 4;
+      int hy = top + inset, hh = height - 2 * inset;
+      int hx = left + HORIZONTAL_SCROLL_BAR_LEFT_BORDER + s;
+      int hw = (e - s) + HORIZONTAL_SCROLL_BAR_MIN_HANDLE;
+      if (hw > 0 && hh > 0)
+	{
+	  wlshm_fill_rect_pixel (hx, hy, hw, hh, handle);
+	  wlshm_round_corners (hx, hy, hw, hh, trough);
+	}
+    }
+  unblock_input ();
+}
+
+/* Repaint all of F's active scroll bars (called at frame_up_to_date so the
+   text redisplay does not leave them overpainted).  */
+static void
+wlshm_redraw_scroll_bars (struct frame *f)
+{
+  wlshm_cur = f;
+  Lisp_Object bar;
+  for (bar = FRAME_SCROLL_BARS (f); !NILP (bar);
+       bar = XSCROLL_BAR (bar)->next)
+    wlshm_scroll_bar_redraw (XSCROLL_BAR (bar));
+}
+
+/* Clamp and store BAR's handle [start,end], then repaint.  */
+static void
+wlshm_scroll_bar_set_handle (struct scroll_bar *bar, int start, int end,
+			     bool rebuild)
+{
+  struct frame *f = XFRAME (WINDOW_FRAME (XWINDOW (bar->window)));
+  bool dragging = bar->dragging != -1;
+  int top_range, length;
+
+  if (!rebuild && start == bar->start && end == bar->end)
+    return;
+
+  top_range = (bar->horizontal
+	       ? HORIZONTAL_SCROLL_BAR_LEFT_RANGE (f, bar->width)
+	       : VERTICAL_SCROLL_BAR_TOP_RANGE (f, bar->height));
+  length = end - start;
+  if (start < 0)
+    start = 0;
+  else if (start > top_range)
+    start = top_range;
+  end = start + length;
+  if (end < start)
+    end = start;
+  else if (end > top_range && !dragging)
+    end = top_range;
+
+  bar->start = start;
+  bar->end = end;
+  wlshm_scroll_bar_redraw (bar);
+}
+
+/* Allocate a scroll bar for window W and link it into the frame list.  */
+static struct scroll_bar *
+wlshm_scroll_bar_create (struct window *w, int top, int left,
+			 int width, int height, bool horizontal)
+{
+  struct frame *f = XFRAME (w->frame);
+  struct scroll_bar *bar
+    = ALLOCATE_PSEUDOVECTOR (struct scroll_bar, prev, PVEC_OTHER);
+  Lisp_Object barobj;
+
+  XSETWINDOW (bar->window, w);
+  bar->top = top;
+  bar->left = left;
+  bar->width = width;
+  bar->height = height;
+  bar->start = 0;
+  bar->end = 0;
+  bar->dragging = -1;
+  bar->horizontal = horizontal;
+
+  bar->next = FRAME_SCROLL_BARS (f);
+  bar->prev = Qnil;
+  XSETVECTOR (barobj, bar);
+  fset_scroll_bars (f, barobj);
+  if (!NILP (bar->next))
+    XSETVECTOR (XSCROLL_BAR (bar->next)->prev, bar);
+  return bar;
+}
+
+/* Dissociate BAR from its window and clear the strip it occupied.  */
+static void
+wlshm_scroll_bar_remove (struct scroll_bar *bar)
+{
+  struct frame *f = XFRAME (WINDOW_FRAME (XWINDOW (bar->window)));
+  block_input ();
+  wlshm_fill_rect_pixel (bar->left, bar->top, bar->width, bar->height,
+			 FRAME_BACKGROUND_PIXEL (f));
+  if (bar->horizontal)
+    wset_horizontal_scroll_bar (XWINDOW (bar->window), Qnil);
+  else
+    wset_vertical_scroll_bar (XWINDOW (bar->window), Qnil);
+  unblock_input ();
+}
+
+static void
+wlshm_set_vertical_scroll_bar (struct window *w, int portion, int whole,
+			       int position)
+{
+  struct frame *f = XFRAME (w->frame);
+  Lisp_Object barobj;
+  struct scroll_bar *bar;
+  int top, height, left, width, window_y, window_height;
+
+  window_box (w, ANY_AREA, 0, &window_y, 0, &window_height);
+  top = window_y;
+  height = window_height;
+  left = WINDOW_SCROLL_BAR_AREA_X (w);
+  width = WINDOW_SCROLL_BAR_AREA_WIDTH (w);
+
+  if (NILP (w->vertical_scroll_bar))
+    {
+      if (width > 0 && height > 0)
+	wlshm_fill_rect_pixel (left, top, width, height,
+			       FRAME_BACKGROUND_PIXEL (f));
+      bar = wlshm_scroll_bar_create (w, top, left, width, max (height, 1),
+				     false);
+    }
+  else
+    {
+      bar = XSCROLL_BAR (w->vertical_scroll_bar);
+      if (left != bar->left || top != bar->top
+	  || width != bar->width || height != bar->height)
+	{
+	  wlshm_fill_rect_pixel (bar->left, bar->top, bar->width, bar->height,
+				 FRAME_BACKGROUND_PIXEL (f));
+	  bar->left = left;
+	  bar->top = top;
+	  bar->width = width;
+	  bar->height = height;
+	}
+    }
+
+  if (bar->dragging == -1)
+    {
+      int top_range = VERTICAL_SCROLL_BAR_TOP_RANGE (f, height);
+      if (whole == 0)
+	wlshm_scroll_bar_set_handle (bar, 0, top_range, true);
+      else
+	{
+	  int start = ((double) position * top_range) / whole;
+	  int end = ((double) (position + portion) * top_range) / whole;
+	  wlshm_scroll_bar_set_handle (bar, start, end, true);
+	}
+    }
+  else
+    wlshm_scroll_bar_redraw (bar);
+
+  XSETVECTOR (barobj, bar);
+  wset_vertical_scroll_bar (w, barobj);
+}
+
+static void
+wlshm_set_horizontal_scroll_bar (struct window *w, int portion, int whole,
+				 int position)
+{
+  struct frame *f = XFRAME (w->frame);
+  Lisp_Object barobj;
+  struct scroll_bar *bar;
+  int top, height, left, width, window_x, window_width;
+
+  window_box (w, ANY_AREA, &window_x, 0, &window_width, 0);
+  left = window_x;
+  width = window_width;
+  top = WINDOW_SCROLL_BAR_AREA_Y (w);
+  height = WINDOW_SCROLL_BAR_AREA_HEIGHT (w);
+
+  if (NILP (w->horizontal_scroll_bar))
+    {
+      if (width > 0 && height > 0)
+	wlshm_fill_rect_pixel (left, top, width, height,
+			       FRAME_BACKGROUND_PIXEL (f));
+      bar = wlshm_scroll_bar_create (w, top, left, width, height, true);
+    }
+  else
+    {
+      bar = XSCROLL_BAR (w->horizontal_scroll_bar);
+      if (left != bar->left || top != bar->top
+	  || width != bar->width || height != bar->height)
+	{
+	  wlshm_fill_rect_pixel (bar->left, bar->top, bar->width, bar->height,
+				 FRAME_BACKGROUND_PIXEL (f));
+	  bar->left = left;
+	  bar->top = top;
+	  bar->width = width;
+	  bar->height = height;
+	}
+    }
+
+  if (bar->dragging == -1)
+    {
+      int left_range = HORIZONTAL_SCROLL_BAR_LEFT_RANGE (f, width);
+      if (whole == 0)
+	wlshm_scroll_bar_set_handle (bar, 0, left_range, true);
+      else
+	{
+	  int start = ((double) position * left_range) / whole;
+	  int end = ((double) (position + portion) * left_range) / whole;
+	  wlshm_scroll_bar_set_handle (bar, start, end, true);
+	}
+    }
+  else
+    wlshm_scroll_bar_redraw (bar);
+
+  XSETVECTOR (barobj, bar);
+  wset_horizontal_scroll_bar (w, barobj);
+}
+
+/* Condemn all of FRAME's scroll bars (port of XTcondemn_scroll_bars).  */
+static void
+wlshm_condemn_scroll_bars (struct frame *frame)
+{
+  if (!NILP (FRAME_SCROLL_BARS (frame)))
+    {
+      if (!NILP (FRAME_CONDEMNED_SCROLL_BARS (frame)))
+	{
+	  Lisp_Object last = FRAME_SCROLL_BARS (frame);
+
+	  while (!NILP (XSCROLL_BAR (last)->next))
+	    last = XSCROLL_BAR (last)->next;
+
+	  XSCROLL_BAR (last)->next = FRAME_CONDEMNED_SCROLL_BARS (frame);
+	  XSCROLL_BAR (FRAME_CONDEMNED_SCROLL_BARS (frame))->prev = last;
+	}
+
+      fset_condemned_scroll_bars (frame, FRAME_SCROLL_BARS (frame));
+      fset_scroll_bars (frame, Qnil);
+    }
+}
+
+/* Un-condemn WINDOW's scroll bar (port of XTredeem_scroll_bar).  */
+static void
+wlshm_redeem_scroll_bar (struct window *w)
+{
+  struct scroll_bar *bar;
+  Lisp_Object barobj;
+  struct frame *f;
+
+  if (NILP (w->vertical_scroll_bar) && NILP (w->horizontal_scroll_bar))
+    emacs_abort ();
+
+  if (!NILP (w->vertical_scroll_bar) && WINDOW_HAS_VERTICAL_SCROLL_BAR (w))
+    {
+      bar = XSCROLL_BAR (w->vertical_scroll_bar);
+      f = XFRAME (WINDOW_FRAME (w));
+      if (NILP (bar->prev))
+	{
+	  if (EQ (FRAME_SCROLL_BARS (f), w->vertical_scroll_bar))
+	    goto horizontal;
+	  else if (EQ (FRAME_CONDEMNED_SCROLL_BARS (f), w->vertical_scroll_bar))
+	    fset_condemned_scroll_bars (f, bar->next);
+	  else
+	    emacs_abort ();
+	}
+      else
+	XSCROLL_BAR (bar->prev)->next = bar->next;
+
+      if (!NILP (bar->next))
+	XSCROLL_BAR (bar->next)->prev = bar->prev;
+
+      bar->next = FRAME_SCROLL_BARS (f);
+      bar->prev = Qnil;
+      XSETVECTOR (barobj, bar);
+      fset_scroll_bars (f, barobj);
+      if (!NILP (bar->next))
+	XSETVECTOR (XSCROLL_BAR (bar->next)->prev, bar);
+    }
+
+ horizontal:
+  if (!NILP (w->horizontal_scroll_bar) && WINDOW_HAS_HORIZONTAL_SCROLL_BAR (w))
+    {
+      bar = XSCROLL_BAR (w->horizontal_scroll_bar);
+      f = XFRAME (WINDOW_FRAME (w));
+      if (NILP (bar->prev))
+	{
+	  if (EQ (FRAME_SCROLL_BARS (f), w->horizontal_scroll_bar))
+	    return;
+	  else if (EQ (FRAME_CONDEMNED_SCROLL_BARS (f), w->horizontal_scroll_bar))
+	    fset_condemned_scroll_bars (f, bar->next);
+	  else
+	    emacs_abort ();
+	}
+      else
+	XSCROLL_BAR (bar->prev)->next = bar->next;
+
+      if (!NILP (bar->next))
+	XSCROLL_BAR (bar->next)->prev = bar->prev;
+
+      bar->next = FRAME_SCROLL_BARS (f);
+      bar->prev = Qnil;
+      XSETVECTOR (barobj, bar);
+      fset_scroll_bars (f, barobj);
+      if (!NILP (bar->next))
+	XSETVECTOR (XSCROLL_BAR (bar->next)->prev, bar);
+    }
+}
+
+/* Remove still-condemned scroll bars (port of XTjudge_scroll_bars).  */
+static void
+wlshm_judge_scroll_bars (struct frame *f)
+{
+  Lisp_Object bar, next;
+
+  bar = FRAME_CONDEMNED_SCROLL_BARS (f);
+  fset_condemned_scroll_bars (f, Qnil);
+
+  for (; !NILP (bar); bar = next)
+    {
+      struct scroll_bar *b = XSCROLL_BAR (bar);
+      wlshm_scroll_bar_remove (b);
+      next = b->next;
+      b->next = b->prev = Qnil;
+    }
+}
+
+static void
+wlshm_set_scroll_bar_default_width (struct frame *f)
+{
+  int unit = FRAME_COLUMN_WIDTH (f);
+  int size = 16;
+  FRAME_CONFIG_SCROLL_BAR_WIDTH (f) = size;
+  FRAME_CONFIG_SCROLL_BAR_COLS (f) = (size + unit - 1) / unit;
+}
+
+static void
+wlshm_set_scroll_bar_default_height (struct frame *f)
+{
+  int height = FRAME_LINE_HEIGHT (f);
+  int size = 16;
+  FRAME_CONFIG_SCROLL_BAR_HEIGHT (f) = size;
+  FRAME_CONFIG_SCROLL_BAR_LINES (f) = (size + height - 1) / height;
+}
+
+/* Return the scroll bar of F containing frame-relative (X,Y), or NULL.  */
+static struct scroll_bar *
+wlshm_scroll_bar_at (struct frame *f, int x, int y)
+{
+  Lisp_Object bar;
+  for (bar = FRAME_SCROLL_BARS (f); !NILP (bar);
+       bar = XSCROLL_BAR (bar)->next)
+    {
+      struct scroll_bar *b = XSCROLL_BAR (bar);
+      if (x >= b->left && x < b->left + b->width
+	  && y >= b->top && y < b->top + b->height)
+	return b;
+    }
+  return NULL;
+}
+
+/* Fill IE for a click on BAR (port of x_scroll_bar_handle_click).  */
+static void
+wlshm_scroll_bar_handle_click (struct scroll_bar *bar, int button, int mods,
+			       int px, int py, bool press,
+			       struct input_event *ie)
+{
+  struct frame *f = XFRAME (WINDOW_FRAME (XWINDOW (bar->window)));
+
+  EVENT_INIT (*ie);
+  ie->kind = (bar->horizontal
+	      ? HORIZONTAL_SCROLL_BAR_CLICK_EVENT
+	      : SCROLL_BAR_CLICK_EVENT);
+  ie->code = button;
+  ie->modifiers = mods | (press ? down_modifier : up_modifier);
+  ie->frame_or_window = bar->window;
+  ie->arg = Qnil;
+
+  if (bar->horizontal)
+    {
+      int left_range = HORIZONTAL_SCROLL_BAR_LEFT_RANGE (f, bar->width);
+      int x = px - bar->left - HORIZONTAL_SCROLL_BAR_LEFT_BORDER;
+      if (x < 0)
+	x = 0;
+      if (x > left_range)
+	x = left_range;
+      if (x < bar->start)
+	ie->part = scroll_bar_before_handle;
+      else if (x < bar->end + HORIZONTAL_SCROLL_BAR_MIN_HANDLE)
+	ie->part = scroll_bar_horizontal_handle;
+      else
+	ie->part = scroll_bar_after_handle;
+      if (!press && bar->dragging != -1)
+	{
+	  int new_start = -bar->dragging;
+	  int new_end = new_start + bar->end - bar->start;
+	  wlshm_scroll_bar_set_handle (bar, new_start, new_end, false);
+	  bar->dragging = -1;
+	}
+      XSETINT (ie->x, left_range);
+      XSETINT (ie->y, x);
+    }
+  else
+    {
+      int top_range = VERTICAL_SCROLL_BAR_TOP_RANGE (f, bar->height);
+      int y = py - bar->top - VERTICAL_SCROLL_BAR_TOP_BORDER;
+      if (y < 0)
+	y = 0;
+      if (y > top_range)
+	y = top_range;
+      if (y < bar->start)
+	ie->part = scroll_bar_above_handle;
+      else if (y < bar->end + VERTICAL_SCROLL_BAR_MIN_HANDLE)
+	ie->part = scroll_bar_handle;
+      else
+	ie->part = scroll_bar_below_handle;
+      if (!press && bar->dragging != -1)
+	{
+	  int new_start = y - bar->dragging;
+	  int new_end = new_start + bar->end - bar->start;
+	  wlshm_scroll_bar_set_handle (bar, new_start, new_end, false);
+	  bar->dragging = -1;
+	}
+      XSETINT (ie->x, y);
+      XSETINT (ie->y, top_range);
+    }
+}
+
+/* Visually drag BAR's handle (port of x_scroll_bar_note_movement).  */
+static void
+wlshm_scroll_bar_note_movement (struct scroll_bar *bar, int px, int py)
+{
+  struct frame *f = XFRAME (XWINDOW (bar->window)->frame);
+  struct wlshm_display_info *dpyinfo = FRAME_DISPLAY_INFO (f);
+
+  dpyinfo->last_mouse_scroll_bar = bar;
+  f->mouse_moved = true;
+
+  if (bar->dragging != -1)
+    {
+      int pos = (bar->horizontal
+		 ? px - bar->left - HORIZONTAL_SCROLL_BAR_LEFT_BORDER
+		 : py - bar->top - VERTICAL_SCROLL_BAR_TOP_BORDER);
+      int new_start = pos - bar->dragging;
+      if (new_start != bar->start)
+	{
+	  int new_end = new_start + bar->end - bar->start;
+	  wlshm_scroll_bar_set_handle (bar, new_start, new_end, false);
+	}
+    }
+}
+
+/* Report scroll-bar position for mouse-position (drag tracking).  */
+static void
+wlshm_scroll_bar_report_motion (struct frame **fp, Lisp_Object *bar_window,
+				enum scroll_bar_part *part, Lisp_Object *x,
+				Lisp_Object *y, Time *timestamp)
+{
+  struct frame *f0 = *fp;
+  struct wlshm_display_info *dpyinfo = FRAME_DISPLAY_INFO (f0);
+  struct scroll_bar *bar = dpyinfo->last_mouse_scroll_bar;
+  struct frame *f;
+  int px = dpyinfo->last_mouse_motion_x, py = dpyinfo->last_mouse_motion_y;
+
+  if (!bar)
+    return;
+
+  f = XFRAME (WINDOW_FRAME (XWINDOW (bar->window)));
+  *fp = f;
+  *bar_window = bar->window;
+
+  if (bar->horizontal)
+    {
+      int left_range = HORIZONTAL_SCROLL_BAR_LEFT_RANGE (f, bar->width);
+      int pos = px - bar->left - HORIZONTAL_SCROLL_BAR_LEFT_BORDER;
+      if (pos < 0)
+	pos = 0;
+      if (pos > left_range)
+	pos = left_range;
+      if (pos < bar->start)
+	*part = scroll_bar_before_handle;
+      else if (pos < bar->end + HORIZONTAL_SCROLL_BAR_MIN_HANDLE)
+	*part = scroll_bar_horizontal_handle;
+      else
+	*part = scroll_bar_after_handle;
+      XSETINT (*x, pos);
+      XSETINT (*y, left_range);
+    }
+  else
+    {
+      int top_range = VERTICAL_SCROLL_BAR_TOP_RANGE (f, bar->height);
+      int pos = py - bar->top - VERTICAL_SCROLL_BAR_TOP_BORDER;
+      if (pos < 0)
+	pos = 0;
+      if (pos > top_range)
+	pos = top_range;
+      if (pos < bar->start)
+	*part = scroll_bar_above_handle;
+      else if (pos < bar->end + VERTICAL_SCROLL_BAR_MIN_HANDLE)
+	*part = scroll_bar_handle;
+      else
+	*part = scroll_bar_below_handle;
+      XSETINT (*x, pos);
+      XSETINT (*y, top_range);
+    }
+
+  *timestamp = dpyinfo->last_mouse_movement_time;
+  f0->mouse_moved = false;
+}
+
+static int
+wlshm_read_socket (struct terminal *terminal, struct input_event *hold_quit)
+{
+  enum { BATCH = 64 };
+  WlshmEvent evs[BATCH];
+
+  block_input ();
+  wlshm_window_dispatch ();
+  int nev = wlshm_window_poll_events (evs, BATCH);
+  unblock_input ();
+
+  struct frame *f = wlshm_any_frame (terminal);
+  int count = 0;
+  bool need_present = false;	/* set when hover highlight may have changed */
+
+  for (int i = 0; f && i < nev; i++)
+    {
+      /* Route this event to the frame whose window it belongs to (M3
+	 multi-window); fall back to any frame for window-less events.  */
+      struct frame *ef = wlshm_frame_for_handle (terminal, evs[i].window);
+      /* If the event names a window with no live Emacs frame -- a menu/tooltip
+	 popup (Rust-only surface) or a frame deleted since the event was
+	 queued -- drop it.  Falling through to an unrelated frame here and
+	 dereferencing it (FRAME_DISPLAY_INFO / FRAME_PIXEL_TO_TEXT_WIDTH /
+	 change_frame_size / note_mouse_highlight below) is a crash.  */
+      if (evs[i].window != 0 && !ef)
+	continue;
+      if (ef)
+	f = ef;
+      /* Never process an event against a dead or not-yet-initialized frame.  */
+      if (!FRAME_LIVE_P (f) || !FRAME_X_OUTPUT (f))
+	continue;
+
+      int mods = 0;
+      uint32_t b = evs[i].modifiers;
+      if (b & WLSHM_MOD_CTRL)
+	mods |= ctrl_modifier;
+      if (b & WLSHM_MOD_ALT)
+	mods |= meta_modifier;
+      if (b & WLSHM_MOD_LOGO)
+	mods |= super_modifier;
+
+      switch (evs[i].kind)
+	{
+	case WlshmEventKind_Configure:
+	  {
+	    uint32_t cw2 = (uint32_t) evs[i].x, ch2 = (uint32_t) evs[i].y;
+	    if (cw2 >= 16 && ch2 >= 16)
+	      {
+		int tw = FRAME_PIXEL_TO_TEXT_WIDTH (f, (int) cw2);
+		int th = FRAME_PIXEL_TO_TEXT_HEIGHT (f, (int) ch2);
+		/* Whole rows/columns only, so the mode line stays on a row
+		   boundary (avoids a fractional last row overlapping it).  */
+		int lh = FRAME_LINE_HEIGHT (f), cw = FRAME_COLUMN_WIDTH (f);
+		if (lh > 0)
+		  th -= th % lh;
+		if (cw > 0)
+		  tw -= tw % cw;
+		change_frame_size (f, tw, th, false, true, false);
+		SET_FRAME_GARBAGED (f);
+	      }
+	  }
+	  break;
+
+	case WlshmEventKind_Close:
+	  {
+	    struct input_event ie;
+	    EVENT_INIT (ie);
+	    ie.kind = DELETE_WINDOW_EVENT;
+	    XSETFRAME (ie.frame_or_window, f);
+	    kbd_buffer_store_event_hold (&ie, hold_quit);
+	    count++;
+	  }
+	  break;
+
+	case WlshmEventKind_FocusIn:
+	  {
+	    struct wlshm_display_info *dpyinfo = FRAME_DISPLAY_INFO (f);
+	    if (dpyinfo->x_focus_event_frame != f)
+	      {
+		wlshm_new_focus_frame (dpyinfo, f);
+		dpyinfo->x_focus_event_frame = f;
+		struct input_event ie;
+		EVENT_INIT (ie);
+		ie.kind = FOCUS_IN_EVENT;
+		XSETFRAME (ie.frame_or_window, f);
+		kbd_buffer_store_event_hold (&ie, hold_quit);
+		count++;
+	      }
+	  }
+	  break;
+
+	case WlshmEventKind_FocusOut:
+	  {
+	    struct wlshm_display_info *dpyinfo = FRAME_DISPLAY_INFO (f);
+	    if (dpyinfo->x_focus_event_frame == f)
+	      {
+		dpyinfo->x_focus_event_frame = NULL;
+		wlshm_new_focus_frame (dpyinfo, NULL);
+		struct input_event ie;
+		EVENT_INIT (ie);
+		ie.kind = FOCUS_OUT_EVENT;
+		XSETFRAME (ie.frame_or_window, f);
+		kbd_buffer_store_event_hold (&ie, hold_quit);
+		count++;
+	      }
+	  }
+	  break;
+
+	case WlshmEventKind_PointerMotion:
+	  {
+	    /* Drive hover highlighting (mouse-face, help-echo, buttons).  */
+	    struct wlshm_display_info *dpyinfo = FRAME_DISPLAY_INFO (f);
+	    int mx = evs[i].x, my = evs[i].y;
+	    dpyinfo->last_mouse_movement_time = evs[i].time;
+	    dpyinfo->last_mouse_motion_frame = f;
+	    dpyinfo->last_mouse_motion_x = mx;
+	    dpyinfo->last_mouse_motion_y = my;
+	    /* Scroll-bar drag tracking takes precedence over hover.  */
+	    {
+	      struct scroll_bar *sb = wlshm_scroll_bar_at (f, mx, my);
+	      struct scroll_bar *active
+		= (struct scroll_bar *) dpyinfo->last_mouse_scroll_bar;
+	      if (sb || (active && active->dragging != -1))
+		{
+		  wlshm_scroll_bar_note_movement (sb ? sb : active, mx, my);
+		  need_present = true;
+		  break;
+		}
+	      dpyinfo->last_mouse_scroll_bar = NULL;
+	    }
+	    XRectangle *r = &dpyinfo->last_mouse_glyph;
+	    if (f != dpyinfo->last_mouse_glyph_frame
+		|| mx < r->x || mx >= r->x + r->width
+		|| my < r->y || my >= r->y + r->height)
+	      {
+		f->mouse_moved = true;
+		/* Only touch the glyph matrices when they're consistent: not
+		   mid-redisplay, initialized, and not garbaged.  Calling
+		   note_mouse_highlight otherwise can dereference half-built
+		   matrices and crash.  */
+		if (!redisplaying_p && f->glyphs_initialized_p
+		    && !FRAME_GARBAGED_P (f) && FRAME_X_OUTPUT (f))
+		  {
+		    wlshm_log ("motion %d,%d -> note_mouse_highlight", mx, my);
+		    /* Track help-echo across this hover so we can post a
+		       HELP_EVENT when it changes (the echo-area / tooltip help
+		       shown over clickable elements, e.g. mode-line buttons).  */
+		    previous_help_echo_string = help_echo_string;
+		    help_echo_string = Qnil;
+		    note_mouse_highlight (f, mx, my);
+		    remember_mouse_glyph (f, mx, my, r);
+		    dpyinfo->last_mouse_glyph_frame = f;
+		    /* note_mouse_highlight draws the mouse-face highlight into
+		       the command list; present it so hover is visible without
+		       waiting for the next redisplay.  */
+		    need_present = true;
+		    if (!NILP (help_echo_string)
+			|| !NILP (previous_help_echo_string))
+		      {
+			Lisp_Object frame;
+			XSETFRAME (frame, f);
+			gen_help_event (help_echo_string, frame, help_echo_window,
+					help_echo_object, help_echo_pos);
+		      }
+		    wlshm_log ("motion %d,%d done", mx, my);
+		  }
+		else
+		  wlshm_log ("motion %d,%d SKIPPED (redisp=%d init=%d garb=%d)",
+			    mx, my, redisplaying_p, f->glyphs_initialized_p,
+			    FRAME_GARBAGED_P (f));
+	      }
+	  }
+	  break;
+
+	case WlshmEventKind_PointerPress:
+	case WlshmEventKind_PointerRelease:
+	  {
+	    struct wlshm_display_info *dpyinfo = FRAME_DISPLAY_INFO (f);
+	    bool press = (evs[i].kind == WlshmEventKind_PointerPress);
+	    wlshm_log ("button %s code=%u at %d,%d mods=%d",
+		      press ? "press" : "release", evs[i].button,
+		      evs[i].x, evs[i].y, mods);
+
+	    /* A click on a scroll bar becomes a SCROLL_BAR_CLICK_EVENT.  */
+	    struct scroll_bar *sb = wlshm_scroll_bar_at (f, evs[i].x, evs[i].y);
+	    if (!sb && !press)
+	      sb = (struct scroll_bar *) dpyinfo->last_mouse_scroll_bar;
+	    if (sb)
+	      {
+		if (press)
+		  {
+		    int rel = (sb->horizontal
+			       ? evs[i].x - sb->left - HORIZONTAL_SCROLL_BAR_LEFT_BORDER
+			       : evs[i].y - sb->top - VERTICAL_SCROLL_BAR_TOP_BORDER);
+		    int minh = (sb->horizontal
+				? HORIZONTAL_SCROLL_BAR_MIN_HANDLE
+				: VERTICAL_SCROLL_BAR_MIN_HANDLE);
+		    if (rel >= sb->start && rel < sb->end + minh)
+		      sb->dragging = rel - sb->start;
+		    dpyinfo->grabbed |= (1 << evs[i].button);
+		    dpyinfo->last_mouse_scroll_bar = sb;
+		  }
+		else
+		  dpyinfo->grabbed &= ~(1 << evs[i].button);
+		struct input_event sie;
+		wlshm_scroll_bar_handle_click (sb, evs[i].button, mods,
+					       evs[i].x, evs[i].y, press, &sie);
+		sie.timestamp = evs[i].time;
+		kbd_buffer_store_event_hold (&sie, hold_quit);
+		count++;
+		need_present = true;
+		break;
+	      }
+
+	    struct input_event ie;
+	    EVENT_INIT (ie);
+	    ie.kind = MOUSE_CLICK_EVENT;
+	    ie.code = evs[i].button;
+	    ie.timestamp = evs[i].time;
+	    ie.modifiers = mods | (press ? down_modifier : up_modifier);
+	    XSETINT (ie.x, evs[i].x);
+	    XSETINT (ie.y, evs[i].y);
+	    XSETFRAME (ie.frame_or_window, f);
+	    if (press)
+	      {
+		dpyinfo->grabbed |= (1 << evs[i].button);
+		dpyinfo->last_mouse_frame = f;
+	      }
+	    else
+	      dpyinfo->grabbed &= ~(1 << evs[i].button);
+	    kbd_buffer_store_event_hold (&ie, hold_quit);
+	    count++;
+	    wlshm_log ("button stored");
+	  }
+	  break;
+
+	case WlshmEventKind_PointerAxis:
+	  {
+	    /* Vertical takes precedence; emit one wheel event per notch.  */
+	    int steps = evs[i].axis_y != 0 ? evs[i].axis_y : evs[i].axis_x;
+	    bool horiz = (evs[i].axis_y == 0 && evs[i].axis_x != 0);
+	    int n = eabs (steps);
+	    if (n > 10)
+	      n = 10;
+	    for (int s = 0; s < n; s++)
+	      {
+		struct input_event ie;
+		EVENT_INIT (ie);
+		ie.kind = horiz ? HORIZ_WHEEL_EVENT : WHEEL_EVENT;
+		ie.timestamp = evs[i].time;
+		ie.modifiers = mods | (steps > 0 ? down_modifier : up_modifier);
+		XSETINT (ie.x, evs[i].x);
+		XSETINT (ie.y, evs[i].y);
+		XSETFRAME (ie.frame_or_window, f);
+		kbd_buffer_store_event_hold (&ie, hold_quit);
+		count++;
+	      }
+	  }
+	  break;
+
+	case WlshmEventKind_KeyPress:
+	default:
+	  {
+	    struct input_event ie;
+	    EVENT_INIT (ie);
+	    XSETFRAME (ie.frame_or_window, f);
+	    uint32_t cp = evs[i].unichar, ks = evs[i].keysym;
+	    /* Treat only genuinely printable codepoints as text; control
+	       chars (Backspace -> ^H, Tab, Return, Escape, ...) must go
+	       through the keysym path so they map to <backspace>, <tab>, etc.
+	       rather than C-h, C-i, ...  */
+	    bool printable = cp >= 32 && cp != 127;
+	    if (printable && mods == 0)
+	      {
+		/* Plain printable text (shift already applied).  */
+		ie.kind = (cp < 128) ? ASCII_KEYSTROKE_EVENT
+			  : MULTIBYTE_CHAR_KEYSTROKE_EVENT;
+		ie.code = cp;
+	      }
+	    else if (ks >= 0x20 && ks <= 0x7e)
+	      {
+		/* Printable base key with modifiers, e.g. C-x.  */
+		ie.kind = ASCII_KEYSTROKE_EVENT;
+		ie.code = ks;
+		ie.modifiers = mods;
+	      }
+	    else
+	      {
+		/* Function/navigation key: the xkb keysym matches X, which
+		   keyboard.c maps to a Lisp symbol.  */
+		ie.kind = NON_ASCII_KEYSTROKE_EVENT;
+		ie.code = ks;
+		ie.modifiers = mods;
+	      }
+	    kbd_buffer_store_event_hold (&ie, hold_quit);
+	    count++;
+	  }
+	  break;
+	}
+    }
+
+  /* Flush the hover highlight to the screen (mouse-face on buttons, links,
+     mode-line elements).  Skip unless the frame is fully ready: not
+     mid-redisplay, live, initialized, not garbaged, with output data.
+     Presenting a half-built frame (e.g. a just-created child frame) can
+     dereference an inconsistent glyph matrix and crash.  */
+  if (need_present && !redisplaying_p
+      && FRAME_LIVE_P (f) && FRAME_X_OUTPUT (f)
+      && f->glyphs_initialized_p && !FRAME_GARBAGED_P (f))
+    {
+      block_input ();
+      wlshm_present_canvas (f);
+      unblock_input ();
+    }
+
+  return count;
+}
+
+static void
+wlshm_delete_terminal (struct terminal *terminal)
+{
+  /* Windows are leaked at process exit (the connection is ManuallyDrop on the
+     Rust side to avoid libwayland teardown crashes); per-frame close happens
+     via the delete_frame hook.  */
+  wlshm_backend_shutdown ();
+}
+
+/* Warp the pointer.  M3 stub (no pointer warping yet).  */
+void
+frame_set_mouse_pixel_position (struct frame *f, int pix_x, int pix_y)
+{
+  (void) f; (void) pix_x; (void) pix_y;
+}
+
+/* Report the last known pointer position (from motion events) to the core.
+   Used by mouse-position and friends.  */
+static void
+wlshm_mouse_position (struct frame **fp, int insist, Lisp_Object *bar_window,
+		     enum scroll_bar_part *part, Lisp_Object *x, Lisp_Object *y,
+		     Time *timestamp)
+{
+  struct frame *f = *fp;
+  if (!f || !FRAME_WLSHM_P (f))
+    return;
+  struct wlshm_display_info *dpyinfo = FRAME_DISPLAY_INFO (f);
+
+  *bar_window = Qnil;
+  *part = (enum scroll_bar_part) 0;
+
+  /* While interacting with a scroll bar, report its position so Lisp-side
+     drag tracking (scroll-bar.el) can follow the handle.  */
+  if (dpyinfo->last_mouse_scroll_bar && insist == 0)
+    {
+      wlshm_scroll_bar_report_motion (fp, bar_window, part, x, y, timestamp);
+      return;
+    }
+
+  if (dpyinfo->last_mouse_motion_frame)
+    *fp = dpyinfo->last_mouse_motion_frame;
+  XSETINT (*x, dpyinfo->last_mouse_motion_x);
+  XSETINT (*y, dpyinfo->last_mouse_motion_y);
+  *timestamp = dpyinfo->last_mouse_movement_time;
+
+  /* Consume the motion: the mouse_position_hook MUST clear mouse_moved, or the
+     core keeps regenerating mouse-movement events with nothing new -- an
+     unbounded spin during a track-mouse drag/click (each event re-runs
+     buffer_posn_from_coords), i.e. an instant freeze on click/highlight.
+     Mirrors pgtk_mouse_position / XTmouse_position.  */
+  f->mouse_moved = false;
+  if (*fp)
+    (*fp)->mouse_moved = false;
+}
+
+/* No X resource database; return no value for every query.  */
+static const char *
+wlshm_get_string_resource (void *rdb, const char *name, const char *class)
+{
+  return NULL;
+}
+
+/* Install FONT_OBJECT as frame F's font and recompute the char metrics.  */
+static Lisp_Object
+wlshm_new_font (struct frame *f, Lisp_Object font_object, int fontset)
+{
+  struct font *font = XFONT_OBJECT (font_object);
+  int font_ascent, font_descent;
+
+  if (fontset < 0)
+    fontset = fontset_from_font (font_object);
+  FRAME_FONTSET (f) = fontset;
+
+  if (FRAME_FONT (f) == font)
+    return font_object;
+
+  FRAME_FONT (f) = font;
+  FRAME_BASELINE_OFFSET (f) = font->baseline_offset;
+  FRAME_COLUMN_WIDTH (f) = font->average_width;
+  get_font_ascent_descent (font, &font_ascent, &font_descent);
+  FRAME_LINE_HEIGHT (f) = font_ascent + font_descent;
+  FRAME_TAB_BAR_HEIGHT (f) = FRAME_TAB_BAR_LINES (f) * FRAME_LINE_HEIGHT (f);
+
+  {
+    int wid = FRAME_COLUMN_WIDTH (f);
+    int height = FRAME_LINE_HEIGHT (f);
+    int sb = 16;			/* scroll-bar thickness in pixels */
+    if (FRAME_CONFIG_SCROLL_BAR_WIDTH (f) <= 0)
+      {
+	FRAME_CONFIG_SCROLL_BAR_WIDTH (f) = sb;
+	FRAME_CONFIG_SCROLL_BAR_COLS (f) = (sb + wid - 1) / wid;
+      }
+    if (FRAME_CONFIG_SCROLL_BAR_HEIGHT (f) <= 0)
+      {
+	FRAME_CONFIG_SCROLL_BAR_HEIGHT (f) = sb;
+	FRAME_CONFIG_SCROLL_BAR_LINES (f) = (sb + height - 1) / height;
+      }
+  }
+
+  adjust_frame_size (f, FRAME_COLS (f) * FRAME_COLUMN_WIDTH (f),
+		     FRAME_LINES (f) * FRAME_LINE_HEIGHT (f), 3, false, Qfont);
+  return font_object;
+}
+
+/* ------------------------------------------------------------------ */
+/* M4: popup menus and dialogs.                                       */
+/*                                                                    */
+/* No toolkit: a menu/dialog is drawn directly onto a dedicated popup */
+/* Wayland window's Cairo surface (using the parent frame's scaled    */
+/* font), and a self-contained modal loop pumps Wayland events        */
+/* (non-blocking, mirroring wlshm_read_socket's discipline so it does */
+/* not freeze).  menu_show_hook is synchronous and returns the chosen */
+/* item's value, exactly as the toolkit backends do.                  */
+/*                                                                    */
+/* Limitations (documented): the menu is shown as a single flat list  */
+/* (nested submenus are flattened with their pane headings); exact    */
+/* on-screen placement at (x,y) needs xdg-popup positioning (deferred */
+/* to M6) so the compositor currently places the undecorated popup.   */
+/* ------------------------------------------------------------------ */
+
+/* X keysyms we react to in the modal loop.  */
+enum { WLSHM_KS_RET = 0xff0d, WLSHM_KS_ESC = 0xff1b, WLSHM_KS_UP = 0xff52,
+       WLSHM_KS_DOWN = 0xff54, WLSHM_KS_HOME = 0xff50, WLSHM_KS_END = 0xff57 };
+
+/* One displayed menu/dialog row.  */
+struct wlshm_mrow
+{
+  char *label_s;	/* display text (UTF-8, xmalloc'd), or NULL */
+  char *key_s;		/* equiv-key hint (UTF-8, xmalloc'd), or NULL */
+  Lisp_Object value;	/* dialog: button value (menus use `index') */
+  ptrdiff_t index;	/* menu_items slot, or -1 if not selectable */
+  bool enabled;
+  bool title;		/* a heading (pane name / dialog question) */
+  bool separator;
+};
+
+/* Copy a Lisp string to a freshly xmalloc'd UTF-8 C string (NULL if not a
+   non-empty string).  The menu modal loop renders from these C strings rather
+   than dereferencing Lisp_Objects, so a GC mid-loop can never dangle them and
+   we avoid re-encoding every redraw.  */
+static char *
+wlshm_dup_utf8 (Lisp_Object s)
+{
+  if (!STRINGP (s) || SCHARS (s) == 0)
+    return NULL;
+  return xstrdup (SSDATA (ENCODE_UTF_8 (s)));
+}
+
+/* Free ROWS and every row's xmalloc'd strings.  */
+static void
+wlshm_free_rows (struct wlshm_mrow *rows, int n)
+{
+  for (int k = 0; k < n; k++)
+    {
+      xfree (rows[k].label_s);
+      xfree (rows[k].key_s);
+    }
+  xfree (rows);
+}
+
+/* Heap bundle freed (rows + strings + the bundle, and PW closed if nonzero) on
+   any exit via record_unwind_protect_ptr.  */
+struct wlshm_menu_data
+{
+  struct wlshm_mrow *rows;
+  int n;
+  uint64_t pw;
+};
+
+static void
+wlshm_free_menu_data (void *p)
+{
+  struct wlshm_menu_data *d = p;
+  if (d->pw)
+    wlshm_window_close (d->pw);
+  wlshm_free_rows (d->rows, d->n);
+  xfree (d);
+}
+
+static cairo_scaled_font_t *
+wlshm_frame_scaled_font (struct frame *f)
+{
+  struct font *ft = FRAME_FONT (f);
+  return ft ? ((struct font_info *) ft)->cr_scaled_font : NULL;
+}
+
+static double
+wlshm_text_width (cairo_scaled_font_t *sf, struct frame *f, const char *s)
+{
+  if (!s || !*s)
+    return 0;
+  if (sf)
+    {
+      cairo_text_extents_t ext;
+      cairo_scaled_font_text_extents (sf, s, &ext);
+      return ext.x_advance;
+    }
+  return strlen (s) * FRAME_COLUMN_WIDTH (f);
+}
+
+/* Geometry constants for the popup.  */
+enum { WLSHM_M_PADX = 14, WLSHM_M_PADY = 3, WLSHM_M_BORDER = 1, WLSHM_M_GAP = 28 };
+
+/* Render ROWS into a fresh ARGB image surface; report size + row height.  */
+static cairo_surface_t *
+wlshm_render_menu (struct frame *f, struct wlshm_mrow *rows, int n, int hi,
+		   int *out_w, int *out_h, int *out_rh, int *out_seph)
+{
+  cairo_scaled_font_t *sf = wlshm_frame_scaled_font (f);
+  int ascent = FRAME_FONT (f) ? FRAME_FONT (f)->ascent : 12;
+  int fh = FRAME_FONT (f) ? FRAME_FONT (f)->height : 16;
+  int rh = fh + 2 * WLSHM_M_PADY;
+  int seph = max (5, rh / 2);
+
+  double maxw = 40;
+  for (int k = 0; k < n; k++)
+    {
+      double w = wlshm_text_width (sf, f, rows[k].label_s);
+      if (rows[k].key_s)
+	w += WLSHM_M_GAP + wlshm_text_width (sf, f, rows[k].key_s);
+      maxw = max (maxw, w);
+    }
+  int menu_w = (int) maxw + 2 * WLSHM_M_PADX + 2 * WLSHM_M_BORDER;
+  int menu_h = WLSHM_M_BORDER;
+  for (int k = 0; k < n; k++)
+    menu_h += rows[k].separator ? seph : rh;
+  menu_h += WLSHM_M_BORDER;
+
+  float bgr, bgg, bgb, fgr, fgg, fgb;
+  wlshm_unpack_pixel (FRAME_BACKGROUND_PIXEL (f), &bgr, &bgg, &bgb);
+  wlshm_unpack_pixel (FRAME_FOREGROUND_PIXEL (f), &fgr, &fgg, &fgb);
+
+  cairo_surface_t *s
+    = cairo_image_surface_create (CAIRO_FORMAT_RGB24, menu_w, menu_h);
+  cairo_t *cr = cairo_create (s);
+  /* Background + border.  */
+  cairo_set_source_rgb (cr, bgr, bgg, bgb);
+  cairo_paint (cr);
+  cairo_set_source_rgb (cr, 0.5, 0.5, 0.5);
+  cairo_set_line_width (cr, 1);
+  cairo_rectangle (cr, 0.5, 0.5, menu_w - 1, menu_h - 1);
+  cairo_stroke (cr);
+  if (sf)
+    cairo_set_scaled_font (cr, sf);
+
+  int y = WLSHM_M_BORDER;
+  for (int k = 0; k < n; k++)
+    {
+      int h = rows[k].separator ? seph : rh;
+      bool hot = (k == hi && rows[k].index >= 0 && rows[k].enabled);
+      if (hot)
+	{
+	  cairo_set_source_rgb (cr, 0.20, 0.40, 0.69);	/* selection blue */
+	  cairo_rectangle (cr, WLSHM_M_BORDER, y,
+			   menu_w - 2 * WLSHM_M_BORDER, h);
+	  cairo_fill (cr);
+	}
+      if (rows[k].separator)
+	{
+	  cairo_set_source_rgb (cr, 0.6, 0.6, 0.6);
+	  cairo_set_line_width (cr, 1);
+	  cairo_move_to (cr, WLSHM_M_PADX, y + h / 2 + 0.5);
+	  cairo_line_to (cr, menu_w - WLSHM_M_PADX, y + h / 2 + 0.5);
+	  cairo_stroke (cr);
+	}
+      else if (rows[k].label_s)
+	{
+	  if (hot)
+	    cairo_set_source_rgb (cr, 1, 1, 1);
+	  else if (rows[k].title)
+	    cairo_set_source_rgb (cr, fgr * 0.6 + 0.2, fgg * 0.6 + 0.2,
+				  fgb * 0.6 + 0.4);
+	  else if (!rows[k].enabled)
+	    cairo_set_source_rgb (cr, (fgr + bgr) / 2, (fgg + bgg) / 2,
+				  (fgb + bgb) / 2);
+	  else
+	    cairo_set_source_rgb (cr, fgr, fgg, fgb);
+	  cairo_move_to (cr, WLSHM_M_PADX, y + WLSHM_M_PADY + ascent);
+	  cairo_show_text (cr, rows[k].label_s);
+	  if (rows[k].key_s)
+	    {
+	      double kw = wlshm_text_width (sf, f, rows[k].key_s);
+	      cairo_move_to (cr, menu_w - WLSHM_M_PADX - kw,
+			     y + WLSHM_M_PADY + ascent);
+	      cairo_show_text (cr, rows[k].key_s);
+	    }
+	}
+      y += h;
+    }
+  cairo_destroy (cr);
+  cairo_surface_flush (s);
+  *out_w = menu_w; *out_h = menu_h; *out_rh = rh; *out_seph = seph;
+  return s;
+}
+
+/* Which row contains buffer-y YY, or -1.  */
+static int
+wlshm_menu_row_at (struct wlshm_mrow *rows, int n, int yy, int rh, int seph)
+{
+  int y = WLSHM_M_BORDER;
+  for (int k = 0; k < n; k++)
+    {
+      int h = rows[k].separator ? seph : rh;
+      if (yy >= y && yy < y + h)
+	return k;
+      y += h;
+    }
+  return -1;
+}
+
+/* Move highlight to the next/prev selectable row (dir +1/-1).  */
+static int
+wlshm_menu_step (struct wlshm_mrow *rows, int n, int hi, int dir)
+{
+  for (int step = 0; step < n; step++)
+    {
+      hi += dir;
+      if (hi < 0) hi = n - 1;
+      if (hi >= n) hi = 0;
+      if (rows[hi].index >= 0 && rows[hi].enabled)
+	return hi;
+    }
+  return hi;
+}
+
+static int
+wlshm_menu_first_selectable (struct wlshm_mrow *rows, int n)
+{
+  for (int k = 0; k < n; k++)
+    if (rows[k].index >= 0 && rows[k].enabled)
+      return k;
+  return -1;
+}
+
+/* Present SURF to popup window PW, then run the modal loop.  Returns the
+   highlighted row index chosen (>=0), or -1 on cancel.  ROWS/N/RH/SEPH
+   describe the layout; *HIP is the in/out highlight.  Recreates the surface
+   on highlight change via RENDER (NULL → caller redraws).  */
+static int
+wlshm_menu_modal_loop (struct frame *f, uint64_t pw,
+		       struct wlshm_mrow *rows, int n, int mw, int mh,
+		       int rh, int seph, int *hip)
+{
+  int hi = *hip, result = -1;
+  bool done = false, cancelled = false;
+  int wlfd = wlshm_window_fd ();
+  cairo_surface_t *surf = NULL;
+  bool need_draw = true;
+
+  /* Clear any key-repeat armed by the keystroke that opened the menu, so it
+     does not auto-fire while we run our own modal loop.  */
+  wlshm_window_disarm_repeat ();
+
+  while (!done)
+    {
+      if (need_draw)
+	{
+	  if (surf)
+	    cairo_surface_destroy (surf);
+	  int tw, th, trh, tsh;
+	  surf = wlshm_render_menu (f, rows, n, hi, &tw, &th, &trh, &tsh);
+	  wlshm_window_present (pw, cairo_image_surface_get_data (surf),
+			       (uint32_t) cairo_image_surface_get_width (surf),
+			       (uint32_t) cairo_image_surface_get_height (surf),
+			       cairo_image_surface_get_stride (surf),
+			       0, 0, 0, 0);
+	  need_draw = false;
+	}
+      if (wlfd >= 0)
+	{
+	  struct pollfd pfd = { .fd = wlfd, .events = POLLIN, .revents = 0 };
+	  poll (&pfd, 1, 40);
+	}
+      wlshm_window_dispatch ();
+      WlshmEvent evs[64];
+      int ne = wlshm_window_poll_events (evs, 64);
+      for (int j = 0; j < ne && !done; j++)
+	{
+	  WlshmEvent *e = &evs[j];
+	  switch (e->kind)
+	    {
+	    case WlshmEventKind_PointerMotion:
+	      if (e->window == pw)
+		{
+		  int r = wlshm_menu_row_at (rows, n, e->y, rh, seph);
+		  if (r >= 0 && rows[r].index >= 0 && rows[r].enabled && r != hi)
+		    { hi = r; need_draw = true; }
+		}
+	      break;
+	    case WlshmEventKind_PointerRelease:
+	      if (e->window == pw)
+		{
+		  int r = wlshm_menu_row_at (rows, n, e->y, rh, seph);
+		  if (r >= 0 && rows[r].index >= 0 && rows[r].enabled)
+		    { result = r; done = true; }
+		}
+	      else
+		{ cancelled = true; done = true; }	/* click outside */
+	      break;
+	    case WlshmEventKind_KeyPress:
+	      switch (e->keysym)
+		{
+		case WLSHM_KS_UP:
+		  hi = wlshm_menu_step (rows, n, hi, -1); need_draw = true; break;
+		case WLSHM_KS_DOWN:
+		  hi = wlshm_menu_step (rows, n, hi, +1); need_draw = true; break;
+		case WLSHM_KS_HOME:
+		  hi = wlshm_menu_first_selectable (rows, n); need_draw = true; break;
+		case WLSHM_KS_RET:
+		  if (hi >= 0 && rows[hi].index >= 0 && rows[hi].enabled)
+		    { result = hi; done = true; }
+		  break;
+		case WLSHM_KS_ESC:
+		  cancelled = true; done = true; break;
+		default: break;
+		}
+	      break;
+	    case WlshmEventKind_Close:
+	      if (e->window == pw) { cancelled = true; done = true; }
+	      break;
+	    default:
+	      break;
+	    }
+	}
+    }
+  if (surf)
+    cairo_surface_destroy (surf);
+  /* A key held while dismissing the menu must not keep repeating afterward.  */
+  wlshm_window_disarm_repeat ();
+  *hip = hi;
+  return cancelled ? -1 : result;
+}
+
+/* Build the menu return value for the selected menu_items slot SEL, mirroring
+   x_menu_show's MENU_KEYMAPS / submenu-prefix logic exactly.  */
+static Lisp_Object
+wlshm_menu_value (ptrdiff_t sel, int menuflags)
+{
+  Lisp_Object *target = aref_addr (menu_items, sel);
+  Lisp_Object prefix = Qnil, entry = Qnil;
+  Lisp_Object *substack = alloca (menu_items_used * sizeof *substack);
+  int depth = 0, i = 0;
+  while (i < menu_items_used)
+    {
+      Lisp_Object e = AREF (menu_items, i);
+      if (NILP (e))
+	{ substack[depth++] = prefix; prefix = entry; i++; }
+      else if (EQ (e, Qlambda))
+	{ prefix = substack[--depth]; i++; }
+      else if (EQ (e, Qt))
+	{ prefix = AREF (menu_items, i + MENU_ITEMS_PANE_PREFIX);
+	  i += MENU_ITEMS_PANE_LENGTH; }
+      else if (EQ (e, Qquote))
+	i++;
+      else
+	{
+	  entry = AREF (menu_items, i + MENU_ITEMS_ITEM_VALUE);
+	  if (aref_addr (menu_items, i) == target)
+	    {
+	      if (menuflags & MENU_KEYMAPS)
+		{
+		  entry = list1 (entry);
+		  if (!NILP (prefix))
+		    entry = Fcons (prefix, entry);
+		  for (int jj = depth - 1; jj >= 0; jj--)
+		    if (!NILP (substack[jj]))
+		      entry = Fcons (substack[jj], entry);
+		}
+	      return entry;
+	    }
+	  i += MENU_ITEMS_ITEM_LENGTH;
+	}
+    }
+  return Qnil;
+}
+
+/* Flatten the global menu_items vector into display rows.  */
+static struct wlshm_mrow *
+wlshm_menu_rows (int *nout)
+{
+  struct wlshm_mrow *rows = xnmalloc (menu_items_used + 1, sizeof *rows);
+  int n = 0, i = 0;
+  while (i < menu_items_used)
+    {
+      Lisp_Object e = AREF (menu_items, i);
+      if (NILP (e) || EQ (e, Qlambda) || EQ (e, Qquote))
+	i++;			/* submenu/markers: flatten */
+      else if (EQ (e, Qt))
+	{
+	  Lisp_Object name = AREF (menu_items, i + MENU_ITEMS_PANE_NAME);
+	  if (STRINGP (name) && SCHARS (name) > 0)
+	    {
+	      rows[n] = (struct wlshm_mrow) { .label_s = wlshm_dup_utf8 (name),
+		.key_s = NULL, .value = Qnil, .index = -1, .enabled = false,
+		.title = true };
+	      n++;
+	    }
+	  i += MENU_ITEMS_PANE_LENGTH;
+	}
+      else
+	{
+	  Lisp_Object name = AREF (menu_items, i + MENU_ITEMS_ITEM_NAME);
+	  bool sep = (!STRINGP (name) || SCHARS (name) == 0
+		      || menu_separator_name_p (SSDATA (name)));
+	  rows[n] = (struct wlshm_mrow) {
+	    .label_s = sep ? NULL : wlshm_dup_utf8 (name),
+	    .key_s = wlshm_dup_utf8 (AREF (menu_items, i + MENU_ITEMS_ITEM_EQUIV_KEY)),
+	    .value = Qnil,
+	    .index = sep ? -1 : i,
+	    .enabled = !NILP (AREF (menu_items, i + MENU_ITEMS_ITEM_ENABLE)),
+	    .title = false, .separator = sep };
+	  n++;
+	  i += MENU_ITEMS_ITEM_LENGTH;
+	}
+    }
+  *nout = n;
+  return rows;
+}
+
+/* menu_show_hook: display the prepared menu_items as a popup and return the
+   selected value (or Qnil if cancelled).  */
+static Lisp_Object
+wlshm_menu_show (struct frame *f, int x, int y, int menuflags,
+		Lisp_Object title, const char **error_name)
+{
+  if (error_name)
+    *error_name = NULL;
+  int n;
+  struct wlshm_mrow *rows = wlshm_menu_rows (&n);
+  if (n == 0)
+    { wlshm_free_rows (rows, n); return Qnil; }
+
+  int hi = wlshm_menu_first_selectable (rows, n);
+  int mw, mh, rh, seph;
+  cairo_surface_t *probe = wlshm_render_menu (f, rows, n, hi, &mw, &mh, &rh, &seph);
+  cairo_surface_destroy (probe);	/* just for geometry */
+
+  char *tc = STRINGP (title) ? SSDATA (ENCODE_UTF_8 (title)) : NULL;
+  uint64_t pw = wlshm_window_open (tc, WLSHM_FRAME_HANDLE (f), 1 /* Popup */);
+  if (pw == 0)
+    { wlshm_free_rows (rows, n); return Qnil; }
+
+  /* Free the rows + close the popup on ANY exit (incl. a non-local one).  */
+  struct wlshm_menu_data *md = xmalloc (sizeof *md);
+  *md = (struct wlshm_menu_data){ rows, n, pw };
+  specpdl_ref count = SPECPDL_INDEX ();
+  record_unwind_protect_ptr (wlshm_free_menu_data, md);
+
+  wlshm_window_set_geometry (pw, x, y, mw, mh);
+
+  block_input ();
+  int chosen = wlshm_menu_modal_loop (f, pw, rows, n, mw, mh, rh, seph, &hi);
+  unblock_input ();
+
+  /* Capture the selected menu_items slot BEFORE unbind frees `rows'.  */
+  ptrdiff_t sel = (chosen >= 0 && rows[chosen].index >= 0) ? rows[chosen].index : -1;
+  unbind_to (count, Qnil);	/* closes pw + frees rows/strings */
+  return sel >= 0 ? wlshm_menu_value (sel, menuflags) : Qnil;
+}
+
+/* popup_dialog_hook: CONTENTS is (TITLE (BUTTON . VALUE) ...).  Draw the
+   question + buttons and return the chosen button's value.  */
+static Lisp_Object
+wlshm_popup_dialog (struct frame *f, Lisp_Object header, Lisp_Object contents)
+{
+  if (!CONSP (contents))
+    return Qnil;
+  Lisp_Object question = CAR (contents);
+  Lisp_Object items = CDR (contents);
+  ptrdiff_t cnt = list_length (items);
+  struct wlshm_mrow *rows = xnmalloc (cnt + 1, sizeof *rows);
+  int n = 0;
+  if (STRINGP (question))
+    rows[n++] = (struct wlshm_mrow) { .label_s = wlshm_dup_utf8 (question),
+      .key_s = NULL, .value = Qnil, .index = -1, .enabled = false,
+      .title = true };
+  for (Lisp_Object t = items; CONSP (t); t = CDR (t))
+    {
+      Lisp_Object it = CAR (t);
+      if (CONSP (it) && STRINGP (CAR (it)))
+	rows[n++] = (struct wlshm_mrow) { .label_s = wlshm_dup_utf8 (CAR (it)),
+	  .key_s = NULL, .value = CDR (it), .index = n, .enabled = true,
+	  .title = false };
+      else if (NILP (it))
+	rows[n++] = (struct wlshm_mrow) { .label_s = NULL,
+	  .key_s = NULL, .value = Qnil, .index = -1, .separator = true };
+    }
+  if (n == 0)
+    { wlshm_free_rows (rows, n); return Qnil; }
+
+  int hi = wlshm_menu_first_selectable (rows, n);
+  int mw, mh, rh, seph;
+  cairo_surface_t *probe = wlshm_render_menu (f, rows, n, hi, &mw, &mh, &rh, &seph);
+  cairo_surface_destroy (probe);
+  uint64_t pw = wlshm_window_open (STRINGP (question) ? SSDATA (ENCODE_UTF_8 (question)) : NULL,
+				   WLSHM_FRAME_HANDLE (f), 1);
+  if (pw == 0)
+    { wlshm_free_rows (rows, n); return Qnil; }
+
+  struct wlshm_menu_data *md = xmalloc (sizeof *md);
+  *md = (struct wlshm_menu_data){ rows, n, pw };
+  specpdl_ref count = SPECPDL_INDEX ();
+  record_unwind_protect_ptr (wlshm_free_menu_data, md);
+
+  wlshm_window_set_geometry (pw, 0, 0, mw, mh);
+  block_input ();
+  int chosen = wlshm_menu_modal_loop (f, pw, rows, n, mw, mh, rh, seph, &hi);
+  unblock_input ();
+  /* Capture the chosen button value BEFORE unbind frees `rows'.  */
+  Lisp_Object result = (chosen >= 0) ? rows[chosen].value : Qnil;
+  unbind_to (count, Qnil);	/* closes pw + frees rows/strings */
+  /* A cancelled dialog signals quit, like the other backends.  */
+  if (chosen < 0)
+    quit ();
+  return result;
+}
+
+struct terminal *
+wlshm_create_terminal (struct wlshm_display_info *dpyinfo)
+{
+  struct terminal *terminal
+    = create_terminal (output_wlshm, &wlshm_redisplay_interface);
+
+  terminal->display_info.wlshm = dpyinfo;
+  dpyinfo->terminal = terminal;
+
+  terminal->clear_frame_hook = wlshm_clear_frame;
+  terminal->update_begin_hook = wlshm_update_begin;
+  terminal->ring_bell_hook = wlshm_ring_bell;
+  terminal->read_socket_hook = wlshm_read_socket;
+  terminal->mouse_position_hook = wlshm_mouse_position;
+  terminal->frame_rehighlight_hook = wlshm_frame_rehighlight_hook;
+  terminal->implicit_set_name_hook = wlshm_implicitly_set_name;
+  terminal->menu_show_hook = wlshm_menu_show;
+  terminal->popup_dialog_hook = wlshm_popup_dialog;
+  terminal->frame_up_to_date_hook = wlshm_frame_up_to_date;
+  terminal->delete_terminal_hook = wlshm_delete_terminal;
+  terminal->get_string_resource_hook = wlshm_get_string_resource;
+  terminal->set_new_font_hook = wlshm_new_font;
+  terminal->defined_color_hook = wlshm_defined_color;
+  terminal->query_colors = wlshm_query_colors;
+  terminal->query_frame_background_color = wlshm_query_frame_background_color;
+
+  /* Scroll bars (Emacs-drawn onto the canvas).  */
+  terminal->set_vertical_scroll_bar_hook = wlshm_set_vertical_scroll_bar;
+  terminal->set_horizontal_scroll_bar_hook = wlshm_set_horizontal_scroll_bar;
+  terminal->condemn_scroll_bars_hook = wlshm_condemn_scroll_bars;
+  terminal->redeem_scroll_bar_hook = wlshm_redeem_scroll_bar;
+  terminal->judge_scroll_bars_hook = wlshm_judge_scroll_bars;
+  terminal->set_scroll_bar_default_width_hook = wlshm_set_scroll_bar_default_width;
+  terminal->set_scroll_bar_default_height_hook = wlshm_set_scroll_bar_default_height;
+
+  /* Define the standard fringe bitmaps (continuation/truncation arrows,
+     empty-line and buffer-boundary indicators).  */
+  gui_init_fringe (terminal->rif);
+
+  /* Frame lifecycle (M6).  */
+  terminal->delete_frame_hook = wlshm_destroy_window;
+  terminal->frame_visible_invisible_hook = wlshm_make_frame_visible_invisible;
+  terminal->iconify_frame_hook = wlshm_iconify_frame;
+  terminal->fullscreen_hook = wlshm_fullscreen_hook;
+  terminal->set_window_size_hook = wlshm_set_window_size;
+  terminal->toggle_invisible_pointer_hook = wlshm_toggle_invisible_pointer;
+  terminal->free_pixmap = wlshm_free_pixmap;
+  /* Documented Wayland-limitation no-ops.  */
+  terminal->frame_raise_lower_hook = wlshm_frame_raise_lower;
+  terminal->set_frame_offset_hook = wlshm_set_frame_offset;
+  terminal->set_bitmap_icon_hook = wlshm_set_bitmap_icon;
+
+  return terminal;
+}
+
+struct wlshm_display_info *
+wlshm_term_init (Lisp_Object display_name)
+{
+  if (wlshm_backend_init () != WLSHM_OK)
+    error ("wlshm backend failed to initialize");
+  /* Connect to Wayland now (so the output scale is known); per-frame windows
+     are opened in Fx_create_frame.  */
+  if (wlshm_backend_connect () != 0)
+    error ("wlshm: cannot connect to Wayland (is WAYLAND_DISPLAY set?)");
+
+  block_input ();
+
+  struct wlshm_display_info *dpyinfo = xzalloc (sizeof *dpyinfo);
+  struct terminal *terminal = wlshm_create_terminal (dpyinfo);
+
+  terminal->kboard = allocate_kboard (Qwlshm);
+  /* Don't let the initial kboard remain current longer than necessary.  */
+  if (current_kboard == initial_kboard)
+    current_kboard = terminal->kboard;
+  terminal->kboard->reference_count++;
+
+  /* Normalize font sizes for HiDPI: a scale-2 display gets 192 DPI so a
+     10pt font renders ~26px instead of ~13px.  */
+  int scale = wlshm_window_scale (0);
+  if (scale < 1)
+    scale = 1;
+  dpyinfo->name_list_element = Fcons (display_name, Qnil);
+  /* Load the X11 color-name database so named face colors resolve.  */
+  if (NILP (wlshm_color_map))
+    wlshm_color_map
+      = Fx_load_color_file (Fexpand_file_name (build_string ("rgb.txt"),
+					       Vdata_directory));
+  dpyinfo->smallest_font_height = 1;
+  dpyinfo->smallest_char_width = 1;
+  dpyinfo->resx = 96.0;
+  dpyinfo->resy = 96.0;
+  dpyinfo->scale = scale;
+  reset_mouse_highlight (&dpyinfo->mouse_highlight);
+
+  terminal->name = xlispstrdup (display_name);
+
+  dpyinfo->next = x_display_list;
+  x_display_list = dpyinfo;
+
+  int fd = wlshm_window_fd ();
+  if (fd >= 0)
+    add_keyboard_wait_descriptor (fd);
+  /* Also wake on the key-repeat timerfd so held keys repeat.  */
+  int tfd = wlshm_window_timer_fd ();
+  if (tfd >= 0)
+    add_keyboard_wait_descriptor (tfd);
+
+  unblock_input ();
+  return dpyinfo;
+}
+
+DEFUN ("wlshm-test-menu-render", Fwlshm_test_menu_render,
+       Swlshm_test_menu_render, 3, 3, 0,
+       doc: /* Render a menu of ITEMS (highlight row HIGHLIGHT) to PNG FILE.
+ITEMS is a list whose elements are: a string (enabled item), a cons
+(LABEL . ENABLED) (ENABLED nil = disabled), or nil (a separator).  Used by
+the test harness to prove menu rendering without the interactive loop.  */)
+  (Lisp_Object items, Lisp_Object highlight, Lisp_Object file)
+{
+  struct frame *f = SELECTED_FRAME ();
+  CHECK_STRING (file);
+  ptrdiff_t cnt = list_length (items);
+  struct wlshm_mrow *rows = xnmalloc (cnt + 1, sizeof *rows);
+  int n = 0;
+  for (Lisp_Object t = items; CONSP (t); t = CDR (t))
+    {
+      Lisp_Object it = CAR (t);
+      if (NILP (it))
+	rows[n] = (struct wlshm_mrow) { .label_s = NULL,
+	  .key_s = NULL, .value = Qnil, .index = -1, .separator = true };
+      else if (STRINGP (it))
+	rows[n] = (struct wlshm_mrow) { .label_s = wlshm_dup_utf8 (it),
+	  .key_s = NULL, .value = Qnil, .index = n, .enabled = true };
+      else if (CONSP (it) && STRINGP (CAR (it)))
+	rows[n] = (struct wlshm_mrow) { .label_s = wlshm_dup_utf8 (CAR (it)),
+	  .key_s = NULL, .value = Qnil, .index = NILP (CDR (it)) ? -1 : n,
+	  .enabled = !NILP (CDR (it)) };
+      else
+	continue;
+      n++;
+    }
+  int hi = FIXNUMP (highlight) ? XFIXNUM (highlight) : -1;
+  int w, h, rh, sh;
+  cairo_surface_t *s = wlshm_render_menu (f, rows, n, hi, &w, &h, &rh, &sh);
+  cairo_status_t st
+    = cairo_surface_write_to_png (s, SSDATA (ENCODE_FILE (file)));
+  cairo_surface_destroy (s);
+  wlshm_free_rows (rows, n);
+  return st == CAIRO_STATUS_SUCCESS ? Qt : Qnil;
+}
+
+void
+syms_of_wlshmterm (void)
+{
+  defsubr (&Swlshm_test_menu_render);
+  staticpro (&wlshm_color_map);
+  wlshm_color_map = Qnil;
+
+  DEFVAR_BOOL ("x-use-underline-position-properties",
+	       x_use_underline_position_properties,
+     doc: /* SKIP: real doc in xterm.c.  */);
+  x_use_underline_position_properties = 1;
+
+  DEFVAR_BOOL ("x-underline-at-descent-line",
+	       x_underline_at_descent_line,
+     doc: /* SKIP: real doc in xterm.c.  */);
+  x_underline_at_descent_line = 0;
+
+  Fprovide (Qwlshm, Qnil);
+}

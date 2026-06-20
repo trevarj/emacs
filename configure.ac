@@ -572,7 +572,7 @@ AC_ARG_WITH([ns],[AS_HELP_STRING([--with-ns],
 On by default on macOS.])],[],[with_ns=maybe])
 OPTION_DEFAULT_OFF([w32], [use native MS Windows GUI in a Cygwin build])
 OPTION_DEFAULT_OFF([pgtk], [use GTK to support window systems other than X])
-OPTION_DEFAULT_OFF([wgpu], [use the experimental Rust Wayland + wgpu backend])
+OPTION_DEFAULT_OFF([wlshm], [use the experimental Rust Wayland + wlshm backend])
 
 OPTION_DEFAULT_ON([gpm],[don't use -lgpm for mouse support on a GNU/Linux console])
 OPTION_DEFAULT_IFAVAILABLE([dbus],[compile with D-Bus support])
@@ -2677,14 +2677,14 @@ if test "${with_pgtk}" = "yes"; then
   window_system=pgtk
 fi
 
-if test "${with_wgpu}" = "yes"; then
-  window_system=wgpu
+if test "${with_wlshm}" = "yes"; then
+  window_system=wlshm
 fi
 
 if test "${ANDROID}" != "yes"; then
   AC_PATH_X
   if test "$no_x" != yes && test "${with_pgtk}" != "yes" \
-     && test "${with_wgpu}" != "yes"; then
+     && test "${with_wlshm}" != "yes"; then
     window_system=x11
   fi
 fi
@@ -3142,7 +3142,7 @@ HAVE_X_WINDOWS=no
 HAVE_X11=no
 USE_X_TOOLKIT=none
 HAVE_PGTK=no
-HAVE_WGPU=no
+HAVE_WLSHM=no
 
 case "${window_system}" in
   x11 )
@@ -3182,12 +3182,12 @@ dnl use the toolkit if we have gtk, or X11R5 or newer.
     HAVE_PGTK=yes
     AC_DEFINE([HAVE_PGTK], [1], [Define to 1 if you have pure Gtk+-3.])
   ;;
-  wgpu )
-    term_header=wgputerm.h
+  wlshm )
+    term_header=wlshmterm.h
     USE_X_TOOLKIT=none
-    HAVE_WGPU=yes
-    AC_DEFINE([HAVE_WGPU], [1],
-      [Define to 1 if using the Rust Wayland + wgpu backend.])
+    HAVE_WLSHM=yes
+    AC_DEFINE([HAVE_WLSHM], [1],
+      [Define to 1 if using the Rust Wayland + wlshm backend.])
   ;;
   haiku )
     term_header=haikuterm.h
@@ -3198,7 +3198,7 @@ dnl use the toolkit if we have gtk, or X11R5 or newer.
 esac
 
 AC_SUBST([HAVE_PGTK])
-AC_SUBST([HAVE_WGPU])
+AC_SUBST([HAVE_WLSHM])
 
 if test "$window_system" = none && test "X$with_x" != "Xno"; then
    AC_CHECK_PROG([HAVE_XSERVER], [X], [true], [false])
@@ -3896,27 +3896,28 @@ fi
 AC_SUBST([PGTK_OBJ])
 AC_SUBST([PGTK_LIBS])
 
-dnl The Rust Wayland + wgpu backend.  The heavy work lives in the staticlib
-dnl built from rust/wgpu-backend; here we just locate cargo, name the C shim
+dnl The Rust Wayland + wlshm backend.  The heavy work lives in the staticlib
+dnl built from rust/wlshm-backend; here we just locate cargo, name the C shim
 dnl objects, and assemble the link line (staticlib + native deps).
-WGPU_OBJ=
-WGPU_LIBS=
-WGPU_STATICLIB=
-if test "$window_system" = "wgpu"; then
+WLSHM_OBJ=
+WLSHM_LIBS=
+WLSHM_STATICLIB=
+if test "$window_system" = "wlshm"; then
   AC_CHECK_PROGS([CARGO], [cargo])
   if test -z "$CARGO"; then
-    AC_MSG_ERROR([--with-wgpu requires cargo (try: guix shell rust rust:cargo)])
+    AC_MSG_ERROR([--with-wlshm requires cargo (try: guix shell rust rust:cargo)])
   fi
-  WGPU_OBJ="wgputerm.o wgpufns.o wgpufont.o"
-  WGPU_STATICLIB="\$(top_srcdir)/rust/wgpu-backend/target/release/libwgpu_backend.a"
-  dnl wgpu (Vulkan/GBM) + raw Wayland + xkbcommon, plus libs the staticlib
-  dnl needs at final link.
-  WGPU_LIBS="$WGPU_STATICLIB -lwayland-client -lxkbcommon -lvulkan -lm -ldl -lpthread"
+  WLSHM_OBJ="wlshmterm.o wlshmfns.o"
+  WLSHM_STATICLIB="\$(top_srcdir)/rust/wlshm-backend/target/release/libwlshm_backend.a"
+  dnl Raw Wayland + xkbcommon, plus libs the staticlib needs at final link.
+  dnl No GPU/Vulkan anymore: rendering is CPU Cairo presented through wl_shm.
+  dnl Cairo/freetype/fontconfig/harfbuzz libs flow in via their module checks.
+  WLSHM_LIBS="$WLSHM_STATICLIB -lwayland-client -lxkbcommon -lm -ldl -lpthread"
 fi
 AC_SUBST([CARGO])
-AC_SUBST([WGPU_OBJ])
-AC_SUBST([WGPU_LIBS])
-AC_SUBST([WGPU_STATICLIB])
+AC_SUBST([WLSHM_OBJ])
+AC_SUBST([WLSHM_LIBS])
+AC_SUBST([WLSHM_STATICLIB])
 
 AC_CHECK_FUNCS([malloc_trim])
 
@@ -4512,7 +4513,7 @@ if test "$with_xwidgets" != "no"; then
 fi
 AC_SUBST([XWIDGETS_OBJ])
 
-if test "$window_system" = "pgtk"; then
+if test "$window_system" = "pgtk" || test "$window_system" = "wlshm"; then
   CAIRO_REQUIRED=1.12.0
   CAIRO_MODULE="cairo >= $CAIRO_REQUIRED"
   EMACS_CHECK_MODULES([CAIRO], [$CAIRO_MODULE])
@@ -4682,7 +4683,7 @@ if test "${HAVE_X11}" = "yes"; then
     fi
   fi
 else # "${HAVE_X11}" != "yes"
-  if test $window_system = pgtk || test $window_system = wgpu; then
+  if test $window_system = pgtk || test $window_system = wlshm; then
     EMACS_CHECK_MODULES([FONTCONFIG], [fontconfig >= 2.2.0])
     EMACS_CHECK_MODULES([FREETYPE], [freetype2])
     if test "$HAVE_FONTCONFIG" != yes -o "$HAVE_FREETYPE" != yes; then
@@ -4722,7 +4723,7 @@ else
 fi
 if test "${HAVE_X11}" = "yes" && test "${HAVE_FREETYPE}" = "yes" \
         || test "$window_system" = "pgtk" \
-        || test "$window_system" = "wgpu" \
+        || test "$window_system" = "wlshm" \
         || test "${HAVE_W32}" = "yes" \
 	|| test "$REALLY_ANDROID" = "yes"; then
   if test "${with_harfbuzz}" != "no"; then
@@ -7247,8 +7248,8 @@ if test "${window_system}" = "pgtk"; then
    FONT_OBJ="ftfont.o ftcrfont.o"
 fi
 
-if test "${window_system}" = "wgpu"; then
-   FONT_OBJ="ftfont.o"
+if test "${window_system}" = "wlshm"; then
+   FONT_OBJ="ftfont.o ftcrfont.o"
 fi
 
 if test "${HAVE_BE_APP}" = "yes" ; then

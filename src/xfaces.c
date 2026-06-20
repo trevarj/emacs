@@ -255,9 +255,9 @@ along with GNU Emacs.  If not, see <https://www.gnu.org/licenses/>.  */
 #define GCGraphicsExposures 0
 #endif /* HAVE_HAIKU */
 
-#ifdef HAVE_WGPU
+#ifdef HAVE_WLSHM
 #define GCGraphicsExposures 0
-#endif /* HAVE_WGPU */
+#endif /* HAVE_WLSHM */
 
 #ifdef HAVE_ANDROID
 #define GCGraphicsExposures 0
@@ -615,8 +615,8 @@ x_free_gc (struct frame *f, Emacs_GC *gc)
 }
 #endif  /* HAVE_NS */
 
-#ifdef HAVE_WGPU
-/* wgpu emulation of GCs (same as PGTK: the backend keeps colors in the
+#ifdef HAVE_WLSHM
+/* wlshm emulation of GCs (same as PGTK: the backend keeps colors in the
    Emacs_GC and translates them at draw time).  */
 
 static Emacs_GC *
@@ -634,7 +634,7 @@ x_free_gc (struct frame *f, Emacs_GC *gc)
 {
   xfree (gc);
 }
-#endif  /* HAVE_WGPU */
+#endif  /* HAVE_WLSHM */
 
 #ifdef HAVE_ANDROID
 

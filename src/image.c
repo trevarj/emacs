@@ -150,11 +150,11 @@ typedef struct ns_bitmap_record Bitmap_Record;
 typedef struct pgtk_bitmap_record Bitmap_Record;
 #endif /* HAVE_PGTK */
 
-#ifdef HAVE_WGPU
-/* The wgpu backend keeps images as plain in-memory pixel containers (the
+#ifdef HAVE_WLSHM
+/* The wlshm backend keeps images as plain in-memory pixel containers (the
    same minimal struct USE_CAIRO uses), which it uploads to GPU textures at
    draw time.  Pixel access is therefore pure buffer math.  */
-typedef struct wgpu_bitmap_record Bitmap_Record;
+typedef struct wlshm_bitmap_record Bitmap_Record;
 #define GET_PIXEL image_pix_context_get_pixel
 #define PUT_PIXEL image_pix_container_put_pixel
 #define NO_PIXMAP 0
@@ -170,7 +170,7 @@ typedef struct wgpu_bitmap_record Bitmap_Record;
 #define RED16_FROM_ULONG(color)		(RED_FROM_ULONG (color) * 0x101)
 #define GREEN16_FROM_ULONG(color)	(GREEN_FROM_ULONG (color) * 0x101)
 #define BLUE16_FROM_ULONG(color)	(BLUE_FROM_ULONG (color) * 0x101)
-#endif /* HAVE_WGPU */
+#endif /* HAVE_WLSHM */
 
 #if (defined HAVE_X_WINDOWS \
      && ! (defined HAVE_NTGUI || defined USE_CAIRO || defined HAVE_NS))
@@ -250,7 +250,7 @@ static HBITMAP w32_create_pixmap_from_bitmap_data (int, int, char *);
 static void anim_prune_animation_cache (Lisp_Object);
 #endif
 
-#if defined (USE_CAIRO) || defined (HAVE_WGPU)
+#if defined (USE_CAIRO) || defined (HAVE_WLSHM)
 
 static Emacs_Pix_Container
 image_create_pix_container (unsigned int width, unsigned int height,
@@ -267,7 +267,7 @@ image_create_pix_container (unsigned int width, unsigned int height,
 							 ? CAIRO_FORMAT_A8
 							 : CAIRO_FORMAT_RGB24),
 							width);
-#else /* HAVE_WGPU: 4-byte aligned rows (A8 padded, or 32bpp).  */
+#else /* HAVE_WLSHM: 4-byte aligned rows (A8 padded, or 32bpp).  */
   pimg->bytes_per_line = (depth == 1 ? ((width + 3) & ~3) : width * 4);
 #endif
   pimg->data = xmalloc (pimg->bytes_per_line * height);
@@ -378,7 +378,7 @@ cr_put_image_to_cr_data (struct image *img)
 }
 #endif	/* USE_CAIRO */
 
-#endif	/* USE_CAIRO || HAVE_WGPU */
+#endif	/* USE_CAIRO || HAVE_WLSHM */
 
 #ifdef HAVE_NS
 /* Use with images created by ns_image_for_XPM.  */
@@ -4077,7 +4077,7 @@ image_create_x_image_and_pixmap_1 (struct frame *f, int width, int height, int d
                                    Emacs_Pix_Container *pimg,
                                    Emacs_Pixmap *pixmap, Picture *picture)
 {
-#if defined USE_CAIRO || defined HAVE_WGPU
+#if defined USE_CAIRO || defined HAVE_WLSHM
   eassert (input_blocked_p ());
 
   /* Allocate a pixmap of the same size.  */
@@ -4264,7 +4264,7 @@ static void
 gui_put_x_image (struct frame *f, Emacs_Pix_Container pimg,
                  Emacs_Pixmap pixmap, int width, int height)
 {
-#if defined USE_CAIRO || defined HAVE_HAIKU || defined HAVE_NS || defined HAVE_WGPU
+#if defined USE_CAIRO || defined HAVE_HAIKU || defined HAVE_NS || defined HAVE_WLSHM
   eassert (pimg == pixmap);
 #elif defined HAVE_X_WINDOWS
   GC gc;
@@ -4380,7 +4380,7 @@ image_unget_x_image_or_dc (struct image *img, bool mask_p,
 static Emacs_Pix_Container
 image_get_x_image (struct frame *f, struct image *img, bool mask_p)
 {
-#if defined USE_CAIRO || defined (HAVE_HAIKU) || defined (HAVE_WGPU)
+#if defined USE_CAIRO || defined (HAVE_HAIKU) || defined (HAVE_WLSHM)
   return !mask_p ? img->pixmap : img->mask;
 #elif defined HAVE_X_WINDOWS || defined HAVE_ANDROID
   XImage *ximg_in_img = !mask_p ? img->ximg : img->mask_img;
@@ -7241,7 +7241,7 @@ image_edge_detection (struct frame *f, struct image *img,
 
 
 #if defined HAVE_X_WINDOWS || defined USE_CAIRO || defined HAVE_HAIKU	\
-  || defined HAVE_ANDROID || defined HAVE_WGPU
+  || defined HAVE_ANDROID || defined HAVE_WLSHM
 
 static void
 image_pixmap_draw_cross (struct frame *f, Emacs_Pixmap pixmap,
@@ -7290,15 +7290,15 @@ image_pixmap_draw_cross (struct frame *f, Emacs_Pixmap pixmap,
 #else
   emacs_abort ();
 #endif
-#elif defined HAVE_WGPU
-  /* M1 stub: disabled-image cross-out is cosmetic; the wgpu glyph/image
+#elif defined HAVE_WLSHM
+  /* M1 stub: disabled-image cross-out is cosmetic; the wlshm glyph/image
      drawing path lands in a later milestone.  */
   (void) f; (void) pixmap; (void) x; (void) y;
   (void) width; (void) height; (void) color;
 #endif
 }
 
-#endif	/* HAVE_X_WINDOWS || USE_CAIRO || HAVE_HAIKU || HAVE_WGPU */
+#endif	/* HAVE_X_WINDOWS || USE_CAIRO || HAVE_HAIKU || HAVE_WLSHM */
 
 /* Transform image IMG on frame F so that it looks disabled.  */
 
@@ -7349,9 +7349,9 @@ image_disable_image (struct frame *f, struct image *img)
 #define MaskForeground(f)  PIX_MASK_DRAW
 #endif	/* USE_CAIRO || HAVE_HAIKU */
 
-#if !defined USE_CAIRO && !defined HAVE_HAIKU && !defined HAVE_WGPU
+#if !defined USE_CAIRO && !defined HAVE_HAIKU && !defined HAVE_WLSHM
       image_sync_to_pixmaps (f, img);
-#endif	/* !USE_CAIRO && !HAVE_HAIKU && !HAVE_WGPU */
+#endif	/* !USE_CAIRO && !HAVE_HAIKU && !HAVE_WLSHM */
       image_pixmap_draw_cross (f, img->pixmap, 0, 0, img->width, img->height,
 			       CrossForeground (f));
       if (img->mask)

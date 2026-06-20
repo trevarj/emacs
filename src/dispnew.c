@@ -7306,10 +7306,10 @@ init_display_interactive (void)
     }
 #endif
 
-#ifdef HAVE_WGPU
+#ifdef HAVE_WLSHM
   if (!inhibit_window_system && !will_dump_p ())
     {
-      Vinitial_window_system = Qwgpu;
+      Vinitial_window_system = Qwlshm;
       return;
     }
 #endif

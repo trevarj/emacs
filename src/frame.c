@@ -314,8 +314,8 @@ See also `frame-live-p'.  */)
       return Qns;
     case output_pgtk:
       return Qpgtk;
-    case output_wgpu:
-      return Qwgpu;
+    case output_wlshm:
+      return Qwlshm;
     case output_haiku:
       return Qhaiku;
     case output_android:
@@ -6044,7 +6044,7 @@ gui_set_scroll_bar_height (struct frame *f, Lisp_Object arg, Lisp_Object oldval)
 }
 
 #if (defined HAVE_PGTK || defined HAVE_NTGUI \
-     || defined HAVE_HAIKU || defined HAVE_NS || defined HAVE_WGPU)
+     || defined HAVE_HAIKU || defined HAVE_NS || defined HAVE_WLSHM)
 void
 gui_set_alpha (struct frame *f, Lisp_Object arg, Lisp_Object oldval)
 {
@@ -7122,7 +7122,7 @@ have changed.  */)
 #ifdef HAVE_WINDOW_SYSTEM
 
 # if (defined USE_GTK || defined HAVE_PGTK || defined HAVE_NS || defined HAVE_XINERAMA \
-      || defined HAVE_XRANDR)
+      || defined HAVE_XRANDR || defined HAVE_WLSHM)
 void
 free_monitors (struct MonitorInfo *monitors, int n_monitors)
 {
@@ -7258,7 +7258,7 @@ syms_of_frame (void)
   DEFSYM (Qpc, "pc");
   DEFSYM (Qns, "ns");
   DEFSYM (Qpgtk, "pgtk");
-  DEFSYM (Qwgpu, "wgpu");
+  DEFSYM (Qwlshm, "wlshm");
   DEFSYM (Qhaiku, "haiku");
   DEFSYM (Qandroid, "android");
   DEFSYM (Qvisible, "visible");
