@@ -1640,14 +1640,9 @@ wlshm_set_window_size (struct frame *f, bool change_gravity,
      placement happens later in Fx_show_tip via wlshm_window_set_geometry.  */
   wlshm_window_set_size (WLSHM_FRAME_HANDLE (f), width, height);
 
-  int tw = FRAME_PIXEL_TO_TEXT_WIDTH (f, width);
-  int th = FRAME_PIXEL_TO_TEXT_HEIGHT (f, height);
-  int lh = FRAME_LINE_HEIGHT (f), cw = FRAME_COLUMN_WIDTH (f);
-  if (lh > 0)
-    th -= th % lh;
-  if (cw > 0)
-    tw -= tw % cw;
-  change_frame_size (f, tw, th, false, true, false);
+  /* WIDTH/HEIGHT are the native (pixel) size; change_frame_size converts to
+     text internally, so pass them straight through (no double conversion).  */
+  change_frame_size (f, width, height, false, true, false);
   SET_FRAME_GARBAGED (f);
   unblock_input ();
 }
@@ -2256,9 +2251,9 @@ wlshm_clear_frame (struct frame *f)
   wlshm_cur = f;
   float r, g, b;
   wlshm_unpack_pixel (FRAME_BACKGROUND_PIXEL (f), &r, &g, &b);
-  /* Clear the whole surface, not just the frame: when the frame rounds down
-     to whole rows/columns it is slightly smaller than the Wayland surface,
-     and the leftover strip would otherwise show stale pixels.  */
+  /* Clear at least the whole surface: the frame is sized to fill it exactly,
+     but if a configure has been received and the frame not yet resized the
+     surface could momentarily be larger -- cover it so no stale pixels show.  */
   uint32_t sw = 0, sh = 0;
   wlshm_window_size (WLSHM_FRAME_HANDLE (f), &sw, &sh);
   float w = (float) max ((int) sw, FRAME_PIXEL_WIDTH (f));
@@ -3038,16 +3033,14 @@ wlshm_read_socket (struct terminal *terminal, struct input_event *hold_quit)
 	    uint32_t cw2 = (uint32_t) evs[i].x, ch2 = (uint32_t) evs[i].y;
 	    if (cw2 >= 16 && ch2 >= 16)
 	      {
-		int tw = FRAME_PIXEL_TO_TEXT_WIDTH (f, (int) cw2);
-		int th = FRAME_PIXEL_TO_TEXT_HEIGHT (f, (int) ch2);
-		/* Whole rows/columns only, so the mode line stays on a row
-		   boundary (avoids a fractional last row overlapping it).  */
-		int lh = FRAME_LINE_HEIGHT (f), cw = FRAME_COLUMN_WIDTH (f);
-		if (lh > 0)
-		  th -= th % lh;
-		if (cw > 0)
-		  tw -= tw % cw;
-		change_frame_size (f, tw, th, false, true, false);
+		/* change_frame_size takes the NATIVE (pixel) size and does the
+		   pixel->text conversion itself (see dispnew.c), so pass the
+		   configured surface size straight through -- exactly like
+		   xterm's ConfigureNotify path.  Pre-converting here with
+		   FRAME_PIXEL_TO_TEXT_WIDTH double-subtracted the fringe and
+		   scroll-bar extents, shrinking the frame ~32px below the
+		   surface and leaving an unfilled strip on the right/bottom.  */
+		change_frame_size (f, (int) cw2, (int) ch2, false, true, false);
 		SET_FRAME_GARBAGED (f);
 	      }
 	  }
