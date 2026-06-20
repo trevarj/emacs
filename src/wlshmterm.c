@@ -2071,12 +2071,31 @@ wlshm_update_begin (struct frame *f)
   unblock_input ();
 }
 
+static void
+wlshm_update_end (struct frame *f)
+{
+  /* Mouse highlight may be displayed again (update_window_begin deferred it
+     for the duration of the update).  Without this the hover highlight on
+     buttons / mode-line elements / links never reappears after a redisplay.  */
+  MOUSE_HL_INFO (f)->mouse_face_defer = false;
+}
+
 static void wlshm_redraw_scroll_bars (struct frame *f);
 
 static void
 wlshm_frame_up_to_date (struct frame *f)
 {
   block_input ();
+  /* Re-establish the mouse-face hover highlight after a complete frame update.
+     A full/garbage redraw repaints rows from the glyph matrix with their
+     normal faces, wiping the highlight overlay (mouse-face on buttons,
+     mode-line elements, links) so hovering appears to do nothing.  Re-run
+     note_mouse_highlight at the last pointer position to redraw it onto the
+     canvas before we present (mirrors xterm/pgtk frame_up_to_date).  This
+     relies on wlshm_update_end having cleared mouse_face_defer; for a garbage
+     redraw update_window_begin already reset mouse_face_window, so this
+     recomputes from scratch rather than early-returning.  */
+  FRAME_MOUSE_UPDATE (f);
   /* Repaint scroll bars on top of the freshly-drawn text before presenting,
      so the text redisplay doesn't leave them overpainted.  */
   wlshm_redraw_scroll_bars (f);
@@ -3711,6 +3730,7 @@ wlshm_create_terminal (struct wlshm_display_info *dpyinfo)
 
   terminal->clear_frame_hook = wlshm_clear_frame;
   terminal->update_begin_hook = wlshm_update_begin;
+  terminal->update_end_hook = wlshm_update_end;
   terminal->ring_bell_hook = wlshm_ring_bell;
   terminal->read_socket_hook = wlshm_read_socket;
   terminal->mouse_position_hook = wlshm_mouse_position;
