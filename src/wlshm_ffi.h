@@ -227,13 +227,28 @@ int wlshm_window_take_resize(uint64_t win, uint32_t *w, uint32_t *h);
 void wlshm_window_close(uint64_t win);
 
 /**
- * Set `win`'s geometry.  For a Pending popup/tooltip this CREATES the
- * xdg_popup anchored at (x,y) in the parent's geometry with content size
+ * Set `win`'s geometry AND position.  For a Pending popup/tooltip this CREATES
+ * the xdg_popup anchored at (x,y) in the parent's geometry with content size
  * (w,h) — so it floats over the parent (never tiled) and is placed precisely.
- * For an existing window it just records the size (the next present allocates a
- * buffer of that size).
+ * For an already-mapped popup it repositions it to (x,y) (e.g. a reused tooltip
+ * following the pointer).  For a toplevel it just records the size (the next
+ * present allocates a buffer of that size).
+ *
+ * NOTE: this is the *positioned* entry point.  Frame-size requests that carry
+ * no meaningful position (the set_window_size hook) must use
+ * `wlshm_window_set_size` instead, or a tooltip would be created/anchored at a
+ * bogus (0,0) before its real position has been computed.
  */
 void wlshm_window_set_geometry(uint64_t win, int x, int y, int w, int h);
+
+/**
+ * Set `win`'s content size WITHOUT touching its position.  Used by the
+ * set_window_size hook, which has no position to offer.  A Pending popup is
+ * left Pending (it becomes a real popup only via the positioned
+ * `wlshm_window_set_geometry`), so a tooltip is never anchored at (0,0) before
+ * `compute_tip_xy` has run.
+ */
+void wlshm_window_set_size(uint64_t win, int w, int h);
 
 /**
  * Reparent `win` to `parent` (xdg_toplevel.set_parent).  `parent` 0 clears it.

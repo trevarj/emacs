@@ -214,6 +214,8 @@ struct AppState {
     cursor_shape_mgr: Option<CursorShapeManager>,
     cursor_shape_device: Option<WpCursorShapeDeviceV1>,
     pointer_enter_serial: u32,
+    /// Monotonic token for xdg_popup.reposition requests.
+    reposition_token: u32,
     current_cursor: u32,
     mods: u32,
     timer_fd: i32,
@@ -328,6 +330,7 @@ impl Backend {
             cursor_shape_mgr,
             cursor_shape_device: None,
             pointer_enter_serial: 0,
+            reposition_token: 0,
             current_cursor: 0,
             mods: 0,
             timer_fd: unsafe {
@@ -432,6 +435,52 @@ impl Backend {
         id
     }
 
+    /// Build an xdg_positioner anchored at (x,y) in the parent's window
+    /// geometry, sized (w,h).  Shared by popup creation and reposition so the
+    /// placement rules stay identical.
+    fn make_positioner(&self, x: i32, y: i32, w: i32, h: i32) -> Option<XdgPositioner> {
+        let positioner = match XdgPositioner::new(&self.state.xdg_shell) {
+            Ok(p) => p,
+            Err(e) => { eprintln!("wlshm: positioner: {e}"); return None; }
+        };
+        positioner.set_size(w.max(1), h.max(1));
+        // 1x1 anchor rect at the requested point; popup's top-left lands there.
+        positioner.set_anchor_rect(x, y, 1, 1);
+        positioner.set_anchor(Anchor::TopLeft);
+        positioner.set_gravity(Gravity::BottomRight);
+        // Keep it on-screen: slide, then flip, then resize as needed.
+        positioner.set_constraint_adjustment(
+            ConstraintAdjustment::SlideX
+                | ConstraintAdjustment::SlideY
+                | ConstraintAdjustment::FlipY
+                | ConstraintAdjustment::ResizeX
+                | ConstraintAdjustment::ResizeY,
+        );
+        Some(positioner)
+    }
+
+    /// Reposition an already-mapped xdg_popup (e.g. a reused tooltip moving with
+    /// the pointer) via xdg_popup.reposition.  No-op for non-popups.  Returns
+    /// true if a reposition request was sent.
+    fn reposition_popup(&mut self, id: u64, x: i32, y: i32, w: i32, h: i32) -> bool {
+        let Some(popup) = self.state.windows.get(&id).and_then(|w| match &w.role {
+            Role::Popup(p) => Some(p.clone()),
+            _ => None,
+        }) else {
+            return false;
+        };
+        let Some(positioner) = self.make_positioner(x, y, w, h) else { return false; };
+        self.state.reposition_token = self.state.reposition_token.wrapping_add(1);
+        popup.reposition(&positioner, self.state.reposition_token);
+        if let Some(wl) = self.state.windows.get_mut(&id) {
+            wl.size = (w.max(1) as u32, h.max(1) as u32);
+        }
+        // Pump the reposition/configure round-trip so the new geometry is in
+        // effect before the C side presents the next buffer.
+        let _ = self.event_queue.roundtrip(&mut self.state);
+        true
+    }
+
     /// Turn a Pending window into a real xdg_popup anchored at (x,y) in the
     /// parent's geometry with content size (w,h).  Returns true on success.
     fn make_popup(&mut self, id: u64, x: i32, y: i32, w: i32, h: i32) -> bool {
@@ -447,23 +496,10 @@ impl Backend {
                 return false;
             }
         };
-        let positioner = match XdgPositioner::new(&self.state.xdg_shell) {
-            Ok(p) => p,
-            Err(e) => { eprintln!("wlshm: positioner: {e}"); return false; }
+        let positioner = match self.make_positioner(x, y, w, h) {
+            Some(p) => p,
+            None => return false,
         };
-        positioner.set_size(w.max(1), h.max(1));
-        // 1x1 anchor rect at the requested point; popup's top-left lands there.
-        positioner.set_anchor_rect(x, y, 1, 1);
-        positioner.set_anchor(Anchor::TopLeft);
-        positioner.set_gravity(Gravity::BottomRight);
-        // Keep it on-screen: slide, then flip, then resize as needed.
-        positioner.set_constraint_adjustment(
-            ConstraintAdjustment::SlideX
-                | ConstraintAdjustment::SlideY
-                | ConstraintAdjustment::FlipY
-                | ConstraintAdjustment::ResizeX
-                | ConstraintAdjustment::ResizeY,
-        );
         let popup = match Popup::new(
             &parent_xdg, &positioner, &self.qh,
             &self.state.compositor, &self.state.xdg_shell,
@@ -1240,11 +1276,17 @@ pub extern "C" fn wlshm_window_close(win: u64) {
 
 // --- M6 stubs (signatures wired now to avoid a second FFI churn) -----------
 
-/// Set `win`'s geometry.  For a Pending popup/tooltip this CREATES the
-/// xdg_popup anchored at (x,y) in the parent's geometry with content size
+/// Set `win`'s geometry AND position.  For a Pending popup/tooltip this CREATES
+/// the xdg_popup anchored at (x,y) in the parent's geometry with content size
 /// (w,h) — so it floats over the parent (never tiled) and is placed precisely.
-/// For an existing window it just records the size (the next present allocates a
-/// buffer of that size).
+/// For an already-mapped popup it repositions it to (x,y) (e.g. a reused tooltip
+/// following the pointer).  For a toplevel it just records the size (the next
+/// present allocates a buffer of that size).
+///
+/// NOTE: this is the *positioned* entry point.  Frame-size requests that carry
+/// no meaningful position (the set_window_size hook) must use
+/// `wlshm_window_set_size` instead, or a tooltip would be created/anchored at a
+/// bogus (0,0) before its real position has been computed.
 #[no_mangle]
 pub extern "C" fn wlshm_window_set_geometry(win: u64, x: c_int, y: c_int, w: c_int, h: c_int) {
     if w <= 0 || h <= 0 {
@@ -1253,15 +1295,45 @@ pub extern "C" fn wlshm_window_set_geometry(win: u64, x: c_int, y: c_int, w: c_i
     with_backend(
         |b| {
             let Some(id) = b.resolve(win) else { return };
-            let pending = matches!(
-                b.state.windows.get(&id).map(|w| &w.role),
-                Some(Role::Pending { .. })
-            );
-            if pending {
-                b.make_popup(id, x, y, w, h);
-            } else if let Some(wl) = b.state.windows.get_mut(&id) {
+            match b.state.windows.get(&id).map(|w| &w.role) {
+                Some(Role::Pending { .. }) => {
+                    b.make_popup(id, x, y, w, h);
+                }
+                Some(Role::Popup(_)) => {
+                    b.reposition_popup(id, x, y, w, h);
+                }
+                _ => {
+                    if let Some(wl) = b.state.windows.get_mut(&id) {
+                        wl.size = (w as u32, h as u32);
+                        wl.configured = true;
+                    }
+                }
+            }
+        },
+        (),
+    );
+}
+
+/// Set `win`'s content size WITHOUT touching its position.  Used by the
+/// set_window_size hook, which has no position to offer.  A Pending popup is
+/// left Pending (it becomes a real popup only via the positioned
+/// `wlshm_window_set_geometry`), so a tooltip is never anchored at (0,0) before
+/// `compute_tip_xy` has run.
+#[no_mangle]
+pub extern "C" fn wlshm_window_set_size(win: u64, w: c_int, h: c_int) {
+    if w <= 0 || h <= 0 {
+        return;
+    }
+    with_backend(
+        |b| {
+            let Some(id) = b.resolve(win) else { return };
+            if let Some(wl) = b.state.windows.get_mut(&id) {
                 wl.size = (w as u32, h as u32);
-                wl.configured = true;
+                // A Pending popup stays Pending; toplevels mark themselves
+                // configured so the next present allocates the new buffer.
+                if !matches!(wl.role, Role::Pending { .. }) {
+                    wl.configured = true;
+                }
             }
         },
         (),
