@@ -291,6 +291,18 @@ DEFUN ("xw-color-values", Fxw_color_values, Sxw_color_values, 1, 2, 0,
   return list3i (col.red, col.green, col.blue);
 }
 
+DEFUN ("xw-color-defined-p", Fxw_color_defined_p, Sxw_color_defined_p, 1, 2, 0,
+       doc: /* SKIP: real doc in xfns.c.  */)
+  (Lisp_Object color, Lisp_Object frame)
+{
+  Emacs_Color col;
+  struct frame *f = decode_window_system_frame (frame);
+
+  CHECK_STRING (color);
+  return (wlshm_defined_color (f, SSDATA (color), &col, false, false)
+	  ? Qt : Qnil);
+}
+
 DEFUN ("x-display-planes", Fx_display_planes, Sx_display_planes, 0, 1, 0,
        doc: /* Return the number of bit planes of the wlshm display.
 The wlshm backend renders to a 24-bit (true color) RGBA target.  */)
@@ -942,6 +954,112 @@ Internal use only, use `display-monitor-attributes-list' instead.  */)
   return attributes_list;
 }
 
+/* Geometry of FRAME, like x_frame_geometry but for wlshm.  Wayland gives a
+   client no global toplevel position and wlshm draws no client-side border or
+   title bar (the compositor owns the decorations), so outer == native and the
+   reported position is (0,0).  ATTRIBUTE selects a sub-result (see below).  */
+static Lisp_Object
+wlshm_frame_geometry (Lisp_Object frame, Lisp_Object attribute)
+{
+  struct frame *f = decode_live_frame (frame);
+  int native_width = FRAME_PIXEL_WIDTH (f);
+  int native_height = FRAME_PIXEL_HEIGHT (f);
+  int outer_left = 0, outer_top = 0;
+  int outer_right = native_width, outer_bottom = native_height;
+  int native_left = 0, native_top = 0;
+  int native_right = native_width, native_bottom = native_height;
+  int internal_border_width = FRAME_INTERNAL_BORDER_WIDTH (f);
+  int inner_left = native_left + internal_border_width;
+  int inner_top = native_top + internal_border_width;
+  int inner_right = native_right - internal_border_width;
+  int inner_bottom = native_bottom - internal_border_width;
+
+  int menu_bar_height = FRAME_MENU_BAR_HEIGHT (f);
+  int menu_bar_width = menu_bar_height ? native_width : 0;
+  inner_top += menu_bar_height;
+
+  int tab_bar_height = FRAME_TAB_BAR_HEIGHT (f);
+  int tab_bar_width = (tab_bar_height
+		       ? native_width - 2 * internal_border_width : 0);
+  inner_top += tab_bar_height;
+
+  int tool_bar_height = FRAME_TOOL_BAR_HEIGHT (f);
+  int tool_bar_width = (tool_bar_height
+			? native_width - 2 * internal_border_width : 0);
+  if (EQ (FRAME_TOOL_BAR_POSITION (f), Qtop))
+    inner_top += tool_bar_height;
+  else
+    inner_bottom -= tool_bar_height;
+
+  if (EQ (attribute, Qouter_edges))
+    return list4i (outer_left, outer_top, outer_right, outer_bottom);
+  else if (EQ (attribute, Qnative_edges))
+    return list4i (native_left, native_top, native_right, native_bottom);
+  else if (EQ (attribute, Qinner_edges))
+    return list4i (inner_left, inner_top, inner_right, inner_bottom);
+  else
+    return
+      list (Fcons (Qouter_position,
+		   Fcons (make_fixnum (outer_left), make_fixnum (outer_top))),
+	    Fcons (Qouter_size,
+		   Fcons (make_fixnum (outer_right - outer_left),
+			  make_fixnum (outer_bottom - outer_top))),
+	    Fcons (Qexternal_border_size,
+		   Fcons (make_fixnum (0), make_fixnum (0))),
+	    Fcons (Qtitle_bar_size,
+		   Fcons (make_fixnum (0), make_fixnum (0))),
+	    Fcons (Qmenu_bar_external, Qnil),
+	    Fcons (Qmenu_bar_size,
+		   Fcons (make_fixnum (menu_bar_width),
+			  make_fixnum (menu_bar_height))),
+	    Fcons (Qtab_bar_size,
+		   Fcons (make_fixnum (tab_bar_width),
+			  make_fixnum (tab_bar_height))),
+	    Fcons (Qtool_bar_external, Qnil),
+	    Fcons (Qtool_bar_position, FRAME_TOOL_BAR_POSITION (f)),
+	    Fcons (Qtool_bar_size,
+		   Fcons (make_fixnum (tool_bar_width),
+			  make_fixnum (tool_bar_height))),
+	    Fcons (Qinternal_border_width,
+		   make_fixnum (internal_border_width)));
+}
+
+DEFUN ("wlshm-frame-geometry", Fwlshm_frame_geometry, Swlshm_frame_geometry,
+       0, 1, 0,
+       doc: /* Return geometric attributes of FRAME.
+FRAME must be a live frame and defaults to the selected one.  The return
+value is an association list of the same shape as `x-frame-geometry'.
+Wayland does not expose a toplevel's position or decorations to clients,
+so `outer-position' is reported as (0 . 0) and there is no title bar or
+external border.  */)
+  (Lisp_Object frame)
+{
+  return wlshm_frame_geometry (frame, Qnil);
+}
+
+DEFUN ("wlshm-frame-edges", Fwlshm_frame_edges, Swlshm_frame_edges, 0, 2, 0,
+       doc: /* Return edge coordinates of FRAME.
+FRAME must be a live frame and defaults to the selected one.  See
+`frame-edges' for the meaning of TYPE.  */)
+  (Lisp_Object frame, Lisp_Object type)
+{
+  return wlshm_frame_geometry (frame, ((EQ (type, Qouter_edges)
+					|| EQ (type, Qinner_edges))
+				       ? type : Qnative_edges));
+}
+
+DEFUN ("wlshm-frame-restack", Fwlshm_frame_restack, Swlshm_frame_restack,
+       2, 3, 0,
+       doc: /* Restack FRAME1 below FRAME2.
+On Wayland a client cannot control the stacking order of its toplevels,
+so this is a no-op that returns nil.  See `frame-restack'.  */)
+  (Lisp_Object frame1, Lisp_Object frame2, Lisp_Object above)
+{
+  decode_live_frame (frame1);
+  decode_live_frame (frame2);
+  return Qnil;
+}
+
 void
 syms_of_wlshmfns (void)
 {
@@ -953,6 +1071,10 @@ syms_of_wlshmfns (void)
   defsubr (&Sxw_display_color_p);
   defsubr (&Sx_display_grayscale_p);
   defsubr (&Sxw_color_values);
+  defsubr (&Sxw_color_defined_p);
+  defsubr (&Swlshm_frame_geometry);
+  defsubr (&Swlshm_frame_edges);
+  defsubr (&Swlshm_frame_restack);
   defsubr (&Sx_display_planes);
   defsubr (&Sx_display_color_cells);
   defsubr (&Sx_display_visual_class);
