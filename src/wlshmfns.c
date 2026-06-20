@@ -923,6 +923,10 @@ Return t on success.  Used by the graphical test harness.  */)
   (Lisp_Object file, Lisp_Object frame)
 {
   CHECK_STRING (file);
+  /* Debug/test surface: gated behind WLSHM_DEBUG so it stays inert in a
+     normal session (the graphical test harness always sets WLSHM_DEBUG=1).  */
+  if (!getenv ("WLSHM_DEBUG"))
+    error ("wlshm-dump-canvas is a debug primitive; set WLSHM_DEBUG to use it");
   struct frame *f = NILP (frame) ? SELECTED_FRAME ()
 				 : decode_window_system_frame (frame);
   return wlshm_dump_canvas_png (f, SSDATA (ENCODE_FILE (file))) ? Qt : Qnil;
