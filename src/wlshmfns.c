@@ -206,19 +206,11 @@ DEFUN ("x-create-frame", Fx_create_frame, Sx_create_frame, 1, 1, 0,
     uint32_t sw = 0, sh = 0;
     wlshm_window_size (WLSHM_FRAME_HANDLE (f), &sw, &sh);
     if (sw >= 16 && sh >= 16)
-      {
-	int tw = FRAME_PIXEL_TO_TEXT_WIDTH (f, (int) sw);
-	int th = FRAME_PIXEL_TO_TEXT_HEIGHT (f, (int) sh);
-	/* Round the text area down to whole rows/columns so the mode line
-	   lands on a glyph-row boundary; otherwise a fractional last row
-	   overlaps the mode line and leaves stale pixels there.  */
-	int lh = FRAME_LINE_HEIGHT (f), cw = FRAME_COLUMN_WIDTH (f);
-	if (lh > 0)
-	  th -= th % lh;
-	if (cw > 0)
-	  tw -= tw % cw;
-	change_frame_size (f, tw, th, false, true, false);
-      }
+      /* change_frame_size takes the native (pixel) size and converts to text
+	 internally; pass the surface size straight through so the frame fills
+	 it exactly.  (Pre-converting with FRAME_PIXEL_TO_TEXT_* here would
+	 double-subtract the fringe/scroll-bar extents.)  */
+      change_frame_size (f, (int) sw, (int) sh, false, true, false);
   }
 
   gui_default_parameter (f, parms, Qcursor_type, Qbox,
