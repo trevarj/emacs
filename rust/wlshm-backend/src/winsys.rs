@@ -151,6 +151,21 @@ const CLIPBOARD_MIME: &[&str] = &[
     "TEXT",
 ];
 
+/// MIME types we accept for a drag-and-drop drop, in preference order.  A
+/// `text/uri-list` is preferred (file drops); otherwise we fall back to plain
+/// text.  The matched type's index into this list <-> `is_uri_list` is decided
+/// by name (see `mime_is_uri_list`).
+const DND_MIME: &[&str] = &[
+    "text/uri-list",
+    "text/plain;charset=utf-8",
+    "text/plain",
+    "UTF8_STRING",
+];
+
+fn mime_is_uri_list(mime: &str) -> bool {
+    mime.eq_ignore_ascii_case("text/uri-list")
+}
+
 /// Build the itimerspec for key repeat: first expire after `delay_ms`, then
 /// every `rate_ms`.  Both are clamped to >= 1ms so the timer always arms.
 fn repeat_itimerspec(delay_ms: u32, rate_ms: u32) -> libc::itimerspec {
@@ -243,6 +258,18 @@ struct AppState {
     primary_device: Option<PrimarySelectionDevice>,
     primary_source: Option<PrimarySelectionSource>,
     primary_text: Vec<u8>,
+    /// Last drag-and-drop offer position + target while a drag hovers us, so a
+    /// `drop_performed` (which carries no coordinates) can report where the drop
+    /// landed.  Set in DnD `enter`/`motion`, cleared on `leave`.
+    dnd_pos: (i32, i32),
+    dnd_window: u64,
+    /// A drop awaiting its pipe read: (pipe, is_uri_list, x, y, window).  Set in
+    /// `drop_performed`; drained in `Backend::dispatch` (where the event queue
+    /// is available to roundtrip so the source can write the data).
+    pending_drop: Option<(ReadPipe, bool, i32, i32, u64)>,
+    /// Bytes of the most recent completed drop, handed to C via the
+    /// `wlshm_window_get_drop` side-channel after it pops the Drop event.
+    drop_text: Vec<u8>,
     /// Pending input events for Emacs's read_socket (each stamped .window).
     events: VecDeque<WlshmEvent>,
     /// Globals needed to mint new surfaces on demand.
@@ -366,6 +393,10 @@ impl Backend {
             primary_device: None,
             primary_source: None,
             primary_text: Vec::new(),
+            dnd_pos: (0, 0),
+            dnd_window: 0,
+            pending_drop: None,
+            drop_text: Vec::new(),
             events: VecDeque::new(),
             compositor,
             xdg_shell,
@@ -585,7 +616,24 @@ impl Backend {
             }
         }
         self.state.pump_repeat();
+        self.drain_pending_drop();
         Ok(())
+    }
+
+    /// If a drop landed (set in `drop_performed`), read its data from the
+    /// receive pipe and push a Drop event.  Done here (not in the AppState
+    /// callback) because reading needs a flush + roundtrip so the drag source
+    /// writes the bytes, and the event queue lives on `Backend`.
+    fn drain_pending_drop(&mut self) {
+        let Some((pipe, is_uri, x, y, win)) = self.state.pending_drop.take() else { return };
+        let _ = self.conn.flush();
+        let _ = self.event_queue.roundtrip(&mut self.state);
+        let bytes = read_pipe_timeout(&pipe, 500);
+        if bytes.is_empty() {
+            return;
+        }
+        self.state.drop_text = bytes;
+        self.state.push(WlshmEvent::drop(x, y, is_uri).on(win));
     }
 
     /// Resolve a handle (0 = primary) to a live window id.
@@ -1049,13 +1097,71 @@ impl PointerHandler for AppState {
     }
 }
 
+impl AppState {
+    /// Pick the best DnD mime an offer advertises (preference order in
+    /// `DND_MIME`), and tell the source we accept it with a Copy action so the
+    /// drag cursor shows "will drop" and the source keeps the data alive.
+    /// Returns the accepted mime, if any.
+    fn dnd_accept(&self) -> Option<String> {
+        let offer = self.data_device.as_ref()?.data().drag_offer()?;
+        let mime = offer.with_mime_types(|types: &[String]| {
+            DND_MIME
+                .iter()
+                .find(|m| types.iter().any(|t| t.eq_ignore_ascii_case(m)))
+                .map(|m| m.to_string())
+        })?;
+        // Accept the chosen mime and advertise Copy as both supported and
+        // preferred so the compositor settles on a non-"ask" action.
+        offer.accept_mime_type(self.serial, Some(mime.clone()));
+        offer.set_actions(DndAction::Copy, DndAction::Copy);
+        Some(mime)
+    }
+}
+
 impl DataDeviceHandler for AppState {
     fn enter(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataDevice,
-             _: f64, _: f64, _: &wl_surface::WlSurface) {}
-    fn leave(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataDevice) {}
-    fn motion(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataDevice, _: f64, _: f64) {}
+             x: f64, y: f64, surface: &wl_surface::WlSurface) {
+        self.dnd_window = self.id_for_surface(surface);
+        self.dnd_pos = (x as i32, y as i32);
+        self.dnd_accept();
+    }
+    fn leave(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataDevice) {
+        self.dnd_window = 0;
+        self.dnd_pos = (0, 0);
+    }
+    fn motion(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataDevice, x: f64, y: f64) {
+        self.dnd_pos = (x as i32, y as i32);
+        // Re-accept on motion: some sources only honor the action after the
+        // pointer has moved within the surface.
+        self.dnd_accept();
+    }
     fn selection(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataDevice) {}
-    fn drop_performed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataDevice) {}
+    fn drop_performed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataDevice) {
+        let Some(offer) = self.data_device.as_ref().and_then(|d| d.data().drag_offer()) else {
+            return;
+        };
+        let Some(mime) = self.dnd_accept() else {
+            // Nothing we can take: end the drag so the source isn't stuck.
+            offer.finish();
+            return;
+        };
+        let is_uri = mime_is_uri_list(&mime);
+        // Open the receive pipe now; the actual bytes are read later in
+        // Backend::dispatch where the event queue can roundtrip so the source
+        // gets a chance to write.  finish() tells the source the transfer is
+        // accepted (the fd stays valid for reading after finish()).
+        match offer.receive(mime) {
+            Ok(pipe) => {
+                let (x, y) = self.dnd_pos;
+                let win = if self.dnd_window != 0 { self.dnd_window } else { self.primary() };
+                self.pending_drop = Some((pipe, is_uri, x, y, win));
+                offer.finish();
+            }
+            Err(_) => {
+                offer.finish();
+            }
+        }
+    }
 }
 
 impl DataSourceHandler for AppState {
@@ -1653,6 +1759,35 @@ pub unsafe extern "C" fn wlshm_window_get_clipboard(
         }),
         None => -1,
     }
+}
+
+/// Retrieve the payload of the most recently delivered Drop event.  Writes a
+/// pointer/length valid until the next call into *out_ptr/*out_len and returns
+/// 0; -1 if there is no pending drop text.  C must call this right after it pops
+/// a `WlshmEventKind_Drop` event (whose `.button` flags a `text/uri-list`).
+///
+/// # Safety
+/// `out_ptr` and `out_len` must be valid pointers.
+#[no_mangle]
+pub unsafe extern "C" fn wlshm_window_get_drop(
+    out_ptr: *mut *const u8,
+    out_len: *mut usize,
+) -> c_int {
+    with_backend(
+        |b| {
+            if b.state.drop_text.is_empty() {
+                return -1;
+            }
+            if !out_ptr.is_null() {
+                *out_ptr = b.state.drop_text.as_ptr();
+            }
+            if !out_len.is_null() {
+                *out_len = b.state.drop_text.len();
+            }
+            0
+        },
+        -1,
+    )
 }
 
 /// Release our ownership of the CLIPBOARD selection.

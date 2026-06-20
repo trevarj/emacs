@@ -107,6 +107,47 @@
   (and (memq selection wlshm--native-selections)
        (wlshm-selection-exists-p selection)))
 
+;;; Drag-and-drop (receive).
+;; A drop from another Wayland client arrives as a DRAG_N_DROP_EVENT built in
+;; wlshmterm.c, whose .arg is `(uri-list . STRING)' (file drops) or
+;; `(text . STRING)' (plain text).  We route it through dnd.el just like the X
+;; and pgtk backends do.
+
+(require 'dnd)
+
+(defun wlshm-dnd-handle-drag-n-drop-event (event)
+  "Receive a drag-and-drop EVENT on a wlshm frame.
+EVENT is `(drag-n-drop POSITION (TAG . DATA))'.  When TAG is `uri-list'
+the URIs are opened via `dnd-handle-multiple-urls'; when TAG is `text'
+the data is inserted via `dnd-insert-text'."
+  (interactive "e")
+  (let* ((payload (nth 2 event))
+         (tag (car-safe payload))
+         (data (cdr-safe payload))
+         (posn (event-start event))
+         (window (posn-window posn))
+         (frame (cond ((framep window) window)
+                      ((windowp window) (window-frame window)))))
+    (when frame
+      (raise-frame frame)
+      (select-frame frame))
+    (when (windowp window)
+      (select-window window))
+    (cond
+     ((eq tag 'uri-list)
+      ;; text/uri-list: CRLF-separated URIs; skip blank and comment lines.
+      (let ((urls (seq-remove
+                   (lambda (s) (or (string-empty-p s)
+                                   (string-prefix-p "#" s)))
+                   (split-string (string-trim-right data) "[\r\n]+"))))
+        (when urls
+          (dnd-handle-multiple-urls window urls 'copy))))
+     ((eq tag 'text)
+      (dnd-insert-text window 'copy data)))))
+
+(define-key special-event-map [drag-n-drop]
+            #'wlshm-dnd-handle-drag-n-drop-event)
+
 ;; Any display name maps to the wlshm backend.
 (add-to-list 'display-format-alist '(".*" . wlshm))
 

@@ -58,6 +58,14 @@ typedef enum {
    * Compositor asked the window to close.
    */
   WlshmEventKind_Close = 8,
+  /**
+   * A drag-and-drop drop occurred; x/y carry the surface-relative drop
+   * position, `window` the target.  The dropped payload (text or
+   * `text/uri-list`) is retrieved via a side-channel getter on the C side
+   * (`wlshm_window_get_drop`) because the POD event can't carry a string.
+   * `button` is reused as a flag: 1 = the payload is a `text/uri-list`.
+   */
+  WlshmEventKind_Drop = 9,
 } WlshmEventKind;
 
 /**
@@ -326,6 +334,17 @@ int wlshm_window_set_clipboard(const uint8_t *data, uintptr_t len);
  * `out_ptr` and `out_len` must be valid pointers.
  */
 int wlshm_window_get_clipboard(const uint8_t **out_ptr, uintptr_t *out_len);
+
+/**
+ * Retrieve the payload of the most recently delivered Drop event.  Writes a
+ * pointer/length valid until the next call into *out_ptr/*out_len and returns
+ * 0; -1 if there is no pending drop text.  C must call this right after it pops
+ * a `WlshmEventKind_Drop` event (whose `.button` flags a `text/uri-list`).
+ *
+ * # Safety
+ * `out_ptr` and `out_len` must be valid pointers.
+ */
+int wlshm_window_get_drop(const uint8_t **out_ptr, uintptr_t *out_len);
 
 /**
  * Release our ownership of the CLIPBOARD selection.
