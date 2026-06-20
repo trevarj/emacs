@@ -1627,7 +1627,10 @@ wlshm_set_window_size (struct frame *f, bool change_gravity,
   block_input ();
   FRAME_X_OUTPUT (f)->preferred_width = width;
   FRAME_X_OUTPUT (f)->preferred_height = height;
-  wlshm_window_set_geometry (WLSHM_FRAME_HANDLE (f), 0, 0, width, height);
+  /* Size only: this hook carries no position.  Using set_geometry here would
+     anchor a not-yet-positioned tooltip popup at (0,0); the positioned
+     placement happens later in Fx_show_tip via wlshm_window_set_geometry.  */
+  wlshm_window_set_size (WLSHM_FRAME_HANDLE (f), width, height);
 
   int tw = FRAME_PIXEL_TO_TEXT_WIDTH (f, width);
   int th = FRAME_PIXEL_TO_TEXT_HEIGHT (f, height);
