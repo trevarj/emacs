@@ -354,6 +354,44 @@ wlshm_scale_pixel (unsigned long p, double factor)
   return ((unsigned long) r << 16) | ((unsigned long) g << 8) | b;
 }
 
+/* Compute a 3D-relief shadow color from packed pixel P: scale by FACTOR
+   (>1 lighter, <1 darker) and, for dark colors, add an extra DELTA boost so
+   the relief stays visible on mid-tone backgrounds.  Ported from
+   pgtk_compute_lighter_color (computed in 16-bit color space so the result
+   matches the other backends; DELTA is the 16-bit 0x8000/0x4000 amount).  */
+static unsigned long
+wlshm_relief_color (unsigned long p, double factor, int delta)
+{
+  long r = (long) ((p >> 16) & 0xff) * 257;	/* 8-bit -> 16-bit */
+  long g = (long) ((p >> 8) & 0xff) * 257;
+  long b = (long) (p & 0xff) * 257;
+  long nr = min (0xffff, (long) (factor * r));
+  long ng = min (0xffff, (long) (factor * g));
+  long nb = min (0xffff, (long) (factor * b));
+  long bright = (2 * r + 3 * g + b) / 6;
+  /* HIGHLIGHT_COLOR_DARK_BOOST_LIMIT (== 48000), as in the other backends.  */
+  if (bright < 48000)
+    {
+      double dimness = 1 - (double) bright / 48000;
+      int min_delta = (int) (delta * dimness * factor / 2);
+      if (factor < 1)
+	{
+	  nr = max (0, nr - min_delta);
+	  ng = max (0, ng - min_delta);
+	  nb = max (0, nb - min_delta);
+	}
+      else
+	{
+	  nr = min (0xffff, nr + min_delta);
+	  ng = min (0xffff, ng + min_delta);
+	  nb = min (0xffff, nb + min_delta);
+	}
+    }
+  return ((unsigned long) (nr >> 8) << 16
+	  | (unsigned long) (ng >> 8) << 8
+	  | (unsigned long) (nb >> 8));
+}
+
 /* Draw the face box around glyph string S: a flat box for FACE_SIMPLE_BOX, or
    a 3D raised/sunken relief (light top/left, dark bottom/right, swapped when
    sunken) otherwise.  */
@@ -378,9 +416,15 @@ wlshm_draw_glyph_string_box (struct glyph_string *s)
     top_left = bottom_right = s->face->box_color;
   else
     {
-      /* Derive relief colors from the face background.  */
-      unsigned long light = wlshm_scale_pixel (s->face->background, 1.4);
-      unsigned long dark = wlshm_scale_pixel (s->face->background, 0.55);
+      /* Derive the relief shadows.  When the box was given an explicit :color
+	 alongside a 3D :style (e.g. mode-line-highlight's grey40 released
+	 button), shade that color rather than the face background, matching
+	 pgtk_setup_relief_colors -- otherwise the relief is computed off the
+	 wrong (often near-white) base and the edges wash out.  */
+      unsigned long base = (s->face->use_box_color_for_shadows_p
+			    ? s->face->box_color : s->face->background);
+      unsigned long light = wlshm_relief_color (base, 1.2, 0x8000);
+      unsigned long dark = wlshm_relief_color (base, 0.6, 0x4000);
       bool raised = (s->face->box == FACE_RAISED_BOX);
       top_left = raised ? light : dark;
       bottom_right = raised ? dark : light;
