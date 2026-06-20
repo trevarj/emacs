@@ -1021,13 +1021,21 @@ wlshm_draw_glyph_string (struct glyph_string *s)
 
     case STRETCH_GLYPH:
       {
+	/* Background inset vertically by the box line, then the box -- so a
+	   stretch glyph that falls inside a face's box run (e.g. the padding
+	   between mode-line elements) continues the box's top/bottom edges
+	   instead of leaving a gap in the outline.  Mirrors the CHAR_GLYPH
+	   path and pgtk_draw_stretch_glyph_string.  */
+	int box_line = max (s->face->box_horizontal_line_width, 0);
 	float r, g, b;
 	wlshm_unpack_pixel (bg, &r, &g, &b);
 	block_input ();
-	wlshm_window_rect ((float) s->x, (float) s->y,
-			  (float) s->background_width, (float) s->height,
-			  r, g, b, 1.0f);
+	wlshm_window_rect ((float) s->x, (float) (s->y + box_line),
+			  (float) s->background_width,
+			  (float) (s->height - 2 * box_line), r, g, b, 1.0f);
 	unblock_input ();
+	if (!s->for_overlaps)
+	  wlshm_draw_glyph_string_box (s);
       }
       break;
 
