@@ -78,7 +78,13 @@ use wayland_client::{
         wl_data_source::WlDataSource, wl_keyboard::WlKeyboard, wl_output,
         wl_pointer::WlPointer, wl_seat::WlSeat, wl_shm, wl_surface,
     },
-    Connection, EventQueue, Proxy, QueueHandle,
+    Connection, Dispatch, EventQueue, Proxy, QueueHandle,
+};
+// text-input-v3 (IME).  Not wrapped by sctk 0.19, so we bind the manager from
+// the registry and implement Dispatch for both objects ourselves below.
+use wayland_protocols::wp::text_input::zv3::client::{
+    zwp_text_input_manager_v3::ZwpTextInputManagerV3,
+    zwp_text_input_v3::{self, ZwpTextInputV3},
 };
 
 use crate::event::{WlshmEvent, WLSHM_MOD_ALT, WLSHM_MOD_CTRL, WLSHM_MOD_LOGO, WLSHM_MOD_SHIFT};
@@ -270,6 +276,22 @@ struct AppState {
     /// Bytes of the most recent completed drop, handed to C via the
     /// `wlshm_window_get_drop` side-channel after it pops the Drop event.
     drop_text: Vec<u8>,
+    // --- IME (zwp_text_input_v3) ---
+    /// The manager global, if the compositor exposes text-input-v3.  Absent on
+    /// compositors without an IME bridge (e.g. plain weston in CI).
+    text_input_mgr: Option<ZwpTextInputManagerV3>,
+    /// The per-seat text-input object (created once a seat is known).
+    text_input: Option<ZwpTextInputV3>,
+    /// Whether we currently have text-input enabled (i.e. a wlshm surface holds
+    /// keyboard focus).  Used to avoid redundant enable/disable churn.
+    text_input_enabled: bool,
+    /// Pending preedit text accumulated from `preedit_string`, applied on `done`.
+    pending_preedit: String,
+    /// Pending committed text accumulated from `commit_string`, applied on `done`.
+    pending_commit: String,
+    /// The most recent preedit string, handed to C via the
+    /// `wlshm_window_get_preedit` side-channel after it pops a Preedit event.
+    preedit_text: Vec<u8>,
     /// Pending input events for Emacs's read_socket (each stamped .window).
     events: VecDeque<WlshmEvent>,
     /// Globals needed to mint new surfaces on demand.
@@ -300,6 +322,43 @@ impl AppState {
 
     fn push(&mut self, e: WlshmEvent) {
         self.events.push_back(e);
+    }
+
+    /// Turn the IME on for the focused surface: per text-input-v3, enable()
+    /// declares we accept input, then commit() flushes the request.  Called
+    /// when a wlshm surface gains keyboard focus.  No-op if already enabled or
+    /// the compositor lacks text-input.
+    fn enable_text_input(&mut self) {
+        if self.text_input_enabled {
+            return;
+        }
+        if let Some(ti) = self.text_input.as_ref() {
+            ti.enable();
+            // We don't track surrounding text or a cursor rectangle yet; a bare
+            // enable+commit is enough for compose/CJK candidate delivery.
+            ti.commit();
+            self.text_input_enabled = true;
+        }
+    }
+
+    /// Turn the IME off (surface lost keyboard focus): disable() + commit().
+    /// Also drops any in-progress preedit so a stale composition doesn't linger.
+    fn disable_text_input(&mut self) {
+        if !self.text_input_enabled {
+            return;
+        }
+        if let Some(ti) = self.text_input.as_ref() {
+            ti.disable();
+            ti.commit();
+        }
+        self.text_input_enabled = false;
+        // Clear any dangling preedit on blur.
+        if !self.pending_preedit.is_empty() || !self.preedit_text.is_empty() {
+            self.pending_preedit.clear();
+            self.preedit_text.clear();
+            let win = self.primary();
+            self.push(WlshmEvent::preedit().on(win));
+        }
     }
 
     /// Arm the repeat timerfd: first fire after `delay`, then every `rate` ms.
@@ -363,6 +422,11 @@ impl Backend {
         // Optional: absent on compositors without zwp_primary_selection.
         let primary_manager = PrimarySelectionManagerState::bind(&globals, &qh).ok();
         let cursor_shape_mgr = CursorShapeManager::bind(&globals, &qh).ok();
+        // text-input-v3 manager.  Bound raw (sctk doesn't wrap it); absent on
+        // compositors without IME support, in which case IME is silently a no-op.
+        let text_input_mgr = globals
+            .bind::<ZwpTextInputManagerV3, _, _>(&qh, 1..=1, ())
+            .ok();
 
         let mut state = AppState {
             registry_state: RegistryState::new(&globals),
@@ -397,6 +461,12 @@ impl Backend {
             dnd_window: 0,
             pending_drop: None,
             drop_text: Vec::new(),
+            text_input_mgr,
+            text_input: None,
+            text_input_enabled: false,
+            pending_preedit: String::new(),
+            pending_commit: String::new(),
+            preedit_text: Vec::new(),
             events: VecDeque::new(),
             compositor,
             xdg_shell,
@@ -420,6 +490,14 @@ impl Backend {
         if let Some(mgr) = state.primary_manager.as_ref() {
             if let Some(seat) = state.seat_state.seats().next() {
                 state.primary_device = Some(mgr.get_selection_device(&qh, &seat));
+            }
+        }
+        // Create the per-seat text-input object so the compositor can route IME
+        // events to us.  We only enable() it once a wlshm surface gains keyboard
+        // focus (see KeyboardHandler::enter), per the text-input-v3 lifecycle.
+        if let Some(mgr) = state.text_input_mgr.as_ref() {
+            if let Some(seat) = state.seat_state.seats().next() {
+                state.text_input = Some(mgr.get_text_input(&seat, &qh, ()));
             }
         }
 
@@ -950,10 +1028,14 @@ impl KeyboardHandler for AppState {
         let id = self.id_for_surface(surface);
         self.focused_window = Some(id);
         self.push(WlshmEvent::focus(true).on(id));
+        // Activate the IME for this surface (text-input-v3 enable+commit).
+        self.enable_text_input();
     }
     fn leave(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlKeyboard,
              surface: &wl_surface::WlSurface, _: u32) {
         self.disarm_repeat();
+        // Deactivate the IME (text-input-v3 disable+commit) before we forget focus.
+        self.disable_text_input();
         let id = self.id_for_surface(surface);
         self.push(WlshmEvent::focus(false).on(id));
     }
@@ -1008,6 +1090,87 @@ impl KeyboardHandler for AppState {
         if modifiers.shift { m |= WLSHM_MOD_SHIFT; }
         if modifiers.logo { m |= WLSHM_MOD_LOGO; }
         self.mods = m;
+    }
+}
+
+// --- text-input-v3 (IME) raw Dispatch impls ---
+//
+// sctk 0.19 doesn't wrap text-input, so we implement wayland-client's Dispatch
+// for the manager (no events) and the text-input object directly.  The protocol
+// is double-buffered: preedit_string/commit_string/delete_surrounding_text set
+// pending state, and `done` applies it.  We accumulate into pending_preedit /
+// pending_commit and flush on `done`.
+
+impl Dispatch<ZwpTextInputManagerV3, ()> for AppState {
+    fn event(
+        _state: &mut Self,
+        _proxy: &ZwpTextInputManagerV3,
+        _event: <ZwpTextInputManagerV3 as Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        // zwp_text_input_manager_v3 has no events.
+    }
+}
+
+impl Dispatch<ZwpTextInputV3, ()> for AppState {
+    fn event(
+        state: &mut Self,
+        _proxy: &ZwpTextInputV3,
+        event: <ZwpTextInputV3 as Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        use zwp_text_input_v3::Event;
+        match event {
+            // The compositor tells us which surface the IME is now bound to.
+            // We already track focus via wl_keyboard enter/leave and enable on
+            // that, so these are informational; keep focused_window in sync.
+            Event::Enter { surface } => {
+                let id = state.id_for_surface(&surface);
+                state.focused_window = Some(id);
+                state.enable_text_input();
+            }
+            Event::Leave { .. } => {
+                state.disable_text_input();
+            }
+            // Pending preedit; applied on `done`.  Null text clears it.
+            Event::PreeditString { text, .. } => {
+                state.pending_preedit = text.unwrap_or_default();
+            }
+            // Pending committed (final) text; applied on `done`.
+            Event::CommitString { text } => {
+                if let Some(t) = text {
+                    state.pending_commit.push_str(&t);
+                }
+            }
+            // We don't expose surrounding text, so honour deletions as
+            // backspaces over the committed buffer is not feasible here; the
+            // common compose/CJK cases don't rely on it.  Ignore for now.
+            Event::DeleteSurroundingText { .. } => {}
+            // Apply the double-buffered pending state.
+            Event::Done { .. } => {
+                let win = state.primary();
+                // Committed text first: deliver as ordinary KeyPress events
+                // (one per codepoint, no modifiers) so it flows through the
+                // tested keystroke path in wlshm_read_socket.
+                if !state.pending_commit.is_empty() {
+                    let committed = std::mem::take(&mut state.pending_commit);
+                    for ch in committed.chars() {
+                        state.push(WlshmEvent::key(0, ch as u32, 0).on(win));
+                    }
+                }
+                // Then the new preedit (may be empty == cleared).  Hand the
+                // string to C via the side-channel buffer and push a Preedit
+                // event so the elisp handler redraws the composition overlay.
+                let preedit = std::mem::take(&mut state.pending_preedit);
+                state.preedit_text = preedit.into_bytes();
+                state.push(WlshmEvent::preedit().on(win));
+            }
+            _ => {}
+        }
     }
 }
 
@@ -1783,6 +1946,33 @@ pub unsafe extern "C" fn wlshm_window_get_drop(
             }
             if !out_len.is_null() {
                 *out_len = b.state.drop_text.len();
+            }
+            0
+        },
+        -1,
+    )
+}
+
+/// Retrieve the current IME preedit (composition) string.  Writes a
+/// pointer/length valid until the next call into *out_ptr/*out_len and returns
+/// 0; -1 if there is no preedit object at all.  The buffer is UTF-8 and may be
+/// empty (length 0) to mean "clear the preedit".  C must call this right after
+/// it pops a `WlshmEventKind_Preedit` event.
+///
+/// # Safety
+/// `out_ptr` and `out_len` must be valid pointers.
+#[no_mangle]
+pub unsafe extern "C" fn wlshm_window_get_preedit(
+    out_ptr: *mut *const u8,
+    out_len: *mut usize,
+) -> c_int {
+    with_backend(
+        |b| {
+            if !out_ptr.is_null() {
+                *out_ptr = b.state.preedit_text.as_ptr();
+            }
+            if !out_len.is_null() {
+                *out_len = b.state.preedit_text.len();
             }
             0
         },

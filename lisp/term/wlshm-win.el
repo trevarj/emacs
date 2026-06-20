@@ -148,6 +148,51 @@ the data is inserted via `dnd-insert-text'."
 (define-key special-event-map [drag-n-drop]
             #'wlshm-dnd-handle-drag-n-drop-event)
 
+
+;;; Input method (preedit display).
+;; A Wayland IME (zwp_text_input_v3) drives composition through wlshmterm.c,
+;; which posts committed text as ordinary keystrokes and the in-progress
+;; preedit as a PREEDIT_TEXT_EVENT.  We display the preedit with a zero-width
+;; overlay at point, exactly as the pgtk/x/android backends do.  EVENT's
+;; payload `(nth 1 event)' is a list of parts `(STRING . ATTRS)'; ATTRS may
+;; carry `ul'/`fg'/`bg'.  text-input-v3 sends a single underlined segment.
+
+(defvar wlshm-preedit-overlay nil
+  "Overlay showing the IME preedit (composition) text, or nil.")
+
+(defun wlshm-preedit-text (event)
+  "Display IME preedit text carried by EVENT.
+EVENT is a `preedit-text' event whose payload is a list of parts
+\(STRING . ATTRS); a nil payload clears the preedit."
+  (interactive "e")
+  (when wlshm-preedit-overlay
+    (delete-overlay wlshm-preedit-overlay))
+  (setq wlshm-preedit-overlay nil)
+  (let ((ovstr "")
+        (idx 0)
+        atts str color face-name)
+    (dolist (part (nth 1 event))
+      (setq str (car part))
+      (setq face-name (intern (format "wlshm-im-%d" idx)))
+      (eval `(defface ,face-name nil "Face of input method preedit." :group 'wlshm))
+      (setq atts nil)
+      (when (setq color (cdr-safe (assq 'fg (cdr part))))
+        (setq atts (append atts `(:foreground ,color))))
+      (when (setq color (cdr-safe (assq 'bg (cdr part))))
+        (setq atts (append atts `(:background ,color))))
+      (when (setq color (cdr-safe (assq 'ul (cdr part))))
+        ;; `ul' may be t (use the face's default underline) or a color.
+        (setq atts (append atts `(:underline ,color))))
+      (face-spec-set face-name `((t . ,atts)))
+      (add-text-properties 0 (length str) `(face ,face-name) str)
+      (setq ovstr (concat ovstr str))
+      (setq idx (1+ idx)))
+    (when (> (length ovstr) 0)
+      (setq wlshm-preedit-overlay (make-overlay (point) (point)))
+      (overlay-put wlshm-preedit-overlay 'before-string ovstr))))
+
+(define-key special-event-map [preedit-text] #'wlshm-preedit-text)
+
 ;; Any display name maps to the wlshm backend.
 (add-to-list 'display-format-alist '(".*" . wlshm))
 
