@@ -134,5 +134,13 @@
 (unless (fboundp 'mouse-highlight-info)
   (defun wlshm-test-mouse-face-active-p () 'unknown))
 
+;; Disable the menu/tool bar ONCE at load, so the initial frame settles
+;; bar-free before any scene renders.  (Toggling the mode per-scene races the
+;; async menu-bar resize, leaving a stale bar in the dump.)  Since x-create-frame
+;; now honors menu-bar-mode/tool-bar-mode, -Q frames start with bars.
+(when (display-graphic-p)
+  (menu-bar-mode -1)
+  (tool-bar-mode -1))
+
 (provide 'wlshm-interaction-tests)
 ;;; interaction-tests.el ends here

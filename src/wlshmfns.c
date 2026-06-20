@@ -173,11 +173,17 @@ DEFUN ("x-create-frame", Fx_create_frame, Sx_create_frame, 1, 1, 0,
 		     FRAME_LINES (f) * FRAME_LINE_HEIGHT (f), 5, true,
 		     Qx_create_frame_1);
 
-  gui_default_parameter (f, parms, Qmenu_bar_lines, make_fixnum (0),
+  /* Honor menu-bar-mode/tab-bar-mode/tool-bar-mode on the initial frame (was
+     hardcoded to 0 before the bars were drawn), mirroring pgtk -- otherwise the
+     menu/tool bar only appears after toggling the mode off and on.  */
+  gui_default_parameter (f, parms, Qmenu_bar_lines,
+			 NILP (Vmenu_bar_mode) ? make_fixnum (0) : make_fixnum (1),
 			 NULL, NULL, RES_TYPE_NUMBER);
-  gui_default_parameter (f, parms, Qtab_bar_lines, make_fixnum (0),
+  gui_default_parameter (f, parms, Qtab_bar_lines,
+			 NILP (Vtab_bar_mode) ? make_fixnum (0) : make_fixnum (1),
 			 NULL, NULL, RES_TYPE_NUMBER);
-  gui_default_parameter (f, parms, Qtool_bar_lines, make_fixnum (0),
+  gui_default_parameter (f, parms, Qtool_bar_lines,
+			 NILP (Vtool_bar_mode) ? make_fixnum (0) : make_fixnum (1),
 			 NULL, NULL, RES_TYPE_NUMBER);
   gui_default_parameter (f, parms, Qbuffer_predicate, Qnil,
 			 "bufferPredicate", "BufferPredicate", RES_TYPE_SYMBOL);
