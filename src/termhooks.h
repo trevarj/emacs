@@ -63,7 +63,7 @@ enum output_method
   output_w32,
   output_ns,
   output_pgtk,
-  output_wgpu,
+  output_wlshm,
   output_haiku,
   output_android,
 };
@@ -538,7 +538,7 @@ struct terminal
     struct w32_display_info *w32;		/* w32term.h */
     struct ns_display_info *ns;			/* nsterm.h */
     struct pgtk_display_info *pgtk;		/* pgtkterm.h */
-    struct wgpu_display_info *wgpu;		/* wgputerm.h */
+    struct wlshm_display_info *wlshm;		/* wlshmterm.h */
     struct haiku_display_info *haiku;		/* haikuterm.h */
     struct android_display_info *android;	/* androidterm.h */
   } display_info;
@@ -615,7 +615,7 @@ struct terminal
   void (*query_frame_background_color) (struct frame *f, Emacs_Color *bgcolor);
 
 #if defined (HAVE_X_WINDOWS) || defined (HAVE_NTGUI) || defined (HAVE_PGTK) \
-  || defined (HAVE_ANDROID) || defined (HAVE_WGPU)
+  || defined (HAVE_ANDROID) || defined (HAVE_WLSHM)
   /* On frame F, translate pixel colors to RGB values for the NCOLORS
      colors in COLORS.  Use cached information, if available.  */
 
@@ -958,9 +958,9 @@ extern struct terminal *terminal_list;
 #elif defined (HAVE_ANDROID)
 #define TERMINAL_FONT_CACHE(t)						\
   (t->type == output_android ? t->display_info.android->name_list_element : Qnil)
-#elif defined (HAVE_WGPU)
+#elif defined (HAVE_WLSHM)
 #define TERMINAL_FONT_CACHE(t)						\
-  (t->type == output_wgpu ? t->display_info.wgpu->name_list_element : Qnil)
+  (t->type == output_wlshm ? t->display_info.wlshm->name_list_element : Qnil)
 #endif
 
 extern struct terminal *decode_live_terminal (Lisp_Object);

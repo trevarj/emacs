@@ -2431,12 +2431,13 @@ Using an Emacs configured with --with-x-toolkit=lucid does not have this problem
       syms_of_fontset ();
       syms_of_xsettings ();
 #endif /* HAVE_PGTK */
-#ifdef HAVE_WGPU
-      syms_of_wgputerm ();
-      syms_of_wgpufns ();
-      syms_of_wgpufont ();
+#ifdef HAVE_WLSHM
+      syms_of_wlshmterm ();
+      syms_of_wlshmfns ();
+      /* The font driver is ftcrfont (Cairo + FreeType); its syms are
+	 registered by syms_of_font -> syms_of_ftcrfont under USE_CAIRO.  */
       syms_of_fontset ();
-#endif /* HAVE_WGPU */
+#endif /* HAVE_WLSHM */
 #ifdef HAVE_HAIKU
       syms_of_haikuterm ();
       syms_of_haikufns ();

@@ -1,0 +1,15 @@
+// Minimal nested-niri config for the wlshm interaction test tier.
+//
+// Run nested in an existing Wayland session (winit backend); it creates its
+// own wayland-N socket and advertises zwp_virtual_keyboard_manager_v1 +
+// zwlr_virtual_pointer_manager_v1, so wtype/wlrctl can inject input.  Kept
+// deliberately bare so it launches nothing and matches no user autostart.
+
+input {
+    keyboard {
+        repeat-delay 250
+        repeat-rate 50
+    }
+}
+
+prefer-no-csd

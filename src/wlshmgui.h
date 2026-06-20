@@ -1,14 +1,14 @@
-/* Definitions and headers for the wgpu (Wayland + GPU) backend.
+/* Definitions and headers for the wlshm (Wayland + GPU) backend.
 
-This file is part of a personal-fork experiment (see wgpu-backend-plan.md).
+This file is part of a personal-fork experiment (see wlshm-backend-plan.md).
 It mirrors pgtkgui.h: it supplies the X-flavored type/aliases the generic
 display code still expects, but with backend-neutral handle types since the
-wgpu backend talks raw Wayland (no Gdk/Xlib).
+wlshm backend talks raw Wayland (no Gdk/Xlib).
 
 M0: scaffold.  */
 
-#ifndef __WGPUGUI_H__
-#define __WGPUGUI_H__
+#ifndef __WLSHMGUI_H__
+#define __WLSHMGUI_H__
 
 /* Emulate XCharStruct.  */
 typedef struct _XCharStruct
@@ -33,7 +33,7 @@ typedef unichar XChar2b;
 #define XCHAR2B_BYTE2(chp) \
   (*(chp) & 0x00ff)
 
-/* Backend-neutral handles.  The wgpu backend manages real cursors/windows on
+/* Backend-neutral handles.  The wlshm backend manages real cursors/windows on
    the Rust side; here they are opaque.  */
 typedef void *Emacs_Cursor;
 
@@ -107,4 +107,4 @@ typedef struct
    (nr).width  = (pwidth),				\
    (nr).height = (pheight))
 
-#endif /* __WGPUGUI_H__ */
+#endif /* __WLSHMGUI_H__ */

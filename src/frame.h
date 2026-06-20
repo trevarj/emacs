@@ -657,7 +657,7 @@ struct frame
     struct w32_output *w32;		/* From w32term.h.  */
     struct ns_output *ns;		/* From nsterm.h.  */
     struct pgtk_output *pgtk;		/* From pgtkterm.h. */
-    struct wgpu_output *wgpu;		/* From wgputerm.h. */
+    struct wlshm_output *wlshm;		/* From wlshmterm.h. */
     struct haiku_output *haiku;		/* From haikuterm.h. */
     struct android_output *android;	/* From androidterm.h.  */
   }
@@ -963,10 +963,10 @@ default_pixels_per_inch_y (void)
 #else
 #define FRAME_ANDROID_P(f) ((f)->output_method == output_android)
 #endif
-#ifndef HAVE_WGPU
-#define FRAME_WGPU_P(f) false
+#ifndef HAVE_WLSHM
+#define FRAME_WLSHM_P(f) false
 #else
-#define FRAME_WGPU_P(f) ((f)->output_method == output_wgpu)
+#define FRAME_WLSHM_P(f) ((f)->output_method == output_wlshm)
 #endif
 
 /* FRAME_WINDOW_P tests whether the frame is a graphical window system
@@ -989,8 +989,8 @@ default_pixels_per_inch_y (void)
 #ifdef HAVE_ANDROID
 #define FRAME_WINDOW_P(f) FRAME_ANDROID_P (f)
 #endif
-#ifdef HAVE_WGPU
-#define FRAME_WINDOW_P(f) FRAME_WGPU_P (f)
+#ifdef HAVE_WLSHM
+#define FRAME_WINDOW_P(f) FRAME_WLSHM_P (f)
 #endif
 #ifndef FRAME_WINDOW_P
 #define FRAME_WINDOW_P(f) ((void) (f), false)

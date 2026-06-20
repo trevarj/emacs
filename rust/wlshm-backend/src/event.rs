@@ -9,7 +9,7 @@ use std::collections::VecDeque;
 /// Kind of input event. ABI-stable: values must not be reordered.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum WgpuEventKind {
+pub enum WlshmEventKind {
     KeyPress = 0,
     FocusIn = 1,
     FocusOut = 2,
@@ -21,25 +21,29 @@ pub enum WgpuEventKind {
     PointerRelease = 5,
     /// Scroll wheel/axis; axis_x/axis_y carry the (hi-res) deltas.
     PointerAxis = 6,
+    /// Compositor asked the window to resize; x/y carry the new w/h (pixels).
+    Configure = 7,
+    /// Compositor asked the window to close.
+    Close = 8,
 }
 
 /// Modifier bits (our own encoding; translated to Emacs modifiers on the C
 /// side).  Shift is reported but usually already baked into `unichar`.
-pub const WGPU_MOD_SHIFT: u32 = 1 << 0;
-pub const WGPU_MOD_CTRL: u32 = 1 << 1;
-pub const WGPU_MOD_ALT: u32 = 1 << 2;
-pub const WGPU_MOD_LOGO: u32 = 1 << 3;
+pub const WLSHM_MOD_SHIFT: u32 = 1 << 0;
+pub const WLSHM_MOD_CTRL: u32 = 1 << 1;
+pub const WLSHM_MOD_ALT: u32 = 1 << 2;
+pub const WLSHM_MOD_LOGO: u32 = 1 << 3;
 
 /// A backend input event, ABI-stable for the C side.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct WgpuEvent {
-    pub kind: WgpuEventKind,
+pub struct WlshmEvent {
+    pub kind: WlshmEventKind,
     /// xkb/X keysym (KeyPress).
     pub keysym: u32,
     /// Unicode codepoint, or 0 if the key produced no text (KeyPress).
     pub unichar: u32,
-    /// Modifier mask (WGPU_MOD_*).
+    /// Modifier mask (WLSHM_MOD_*).
     pub modifiers: u32,
     /// Pointer position in surface pixels (PointerMotion/Press/Release).
     pub x: i32,
@@ -51,10 +55,12 @@ pub struct WgpuEvent {
     /// Hi-res scroll deltas (PointerAxis); +y scrolls down, +x scrolls right.
     pub axis_x: i32,
     pub axis_y: i32,
+    /// Opaque window handle this event belongs to (0 = unknown/primary).
+    pub window: u64,
 }
 
-impl WgpuEvent {
-    fn blank(kind: WgpuEventKind) -> Self {
+impl WlshmEvent {
+    fn blank(kind: WlshmEventKind) -> Self {
         Self {
             kind,
             keysym: 0,
@@ -66,30 +72,45 @@ impl WgpuEvent {
             time: 0,
             axis_x: 0,
             axis_y: 0,
+            window: 0,
         }
     }
 
+    /// Stamp the originating window handle (builder style).
+    pub fn on(mut self, window: u64) -> Self {
+        self.window = window;
+        self
+    }
+
+    pub fn configure(w: i32, h: i32) -> Self {
+        Self { x: w, y: h, ..Self::blank(WlshmEventKind::Configure) }
+    }
+
+    pub fn close() -> Self {
+        Self::blank(WlshmEventKind::Close)
+    }
+
     pub fn key(keysym: u32, unichar: u32, modifiers: u32) -> Self {
-        Self { keysym, unichar, modifiers, ..Self::blank(WgpuEventKind::KeyPress) }
+        Self { keysym, unichar, modifiers, ..Self::blank(WlshmEventKind::KeyPress) }
     }
 
     pub fn focus(gained: bool) -> Self {
         Self::blank(if gained {
-            WgpuEventKind::FocusIn
+            WlshmEventKind::FocusIn
         } else {
-            WgpuEventKind::FocusOut
+            WlshmEventKind::FocusOut
         })
     }
 
     pub fn motion(x: i32, y: i32, modifiers: u32, time: u32) -> Self {
-        Self { x, y, modifiers, time, ..Self::blank(WgpuEventKind::PointerMotion) }
+        Self { x, y, modifiers, time, ..Self::blank(WlshmEventKind::PointerMotion) }
     }
 
     pub fn button(press: bool, button: u32, x: i32, y: i32, modifiers: u32, time: u32) -> Self {
         let kind = if press {
-            WgpuEventKind::PointerPress
+            WlshmEventKind::PointerPress
         } else {
-            WgpuEventKind::PointerRelease
+            WlshmEventKind::PointerRelease
         };
         Self { button, x, y, modifiers, time, ..Self::blank(kind) }
     }
@@ -102,7 +123,7 @@ impl WgpuEvent {
             y,
             modifiers,
             time,
-            ..Self::blank(WgpuEventKind::PointerAxis)
+            ..Self::blank(WlshmEventKind::PointerAxis)
         }
     }
 }
@@ -111,7 +132,7 @@ impl WgpuEvent {
 /// via read_socket_hook).
 #[derive(Default)]
 pub struct EventQueue {
-    q: VecDeque<WgpuEvent>,
+    q: VecDeque<WlshmEvent>,
 }
 
 impl EventQueue {
@@ -119,13 +140,13 @@ impl EventQueue {
         Self { q: VecDeque::new() }
     }
 
-    pub fn push(&mut self, e: WgpuEvent) {
+    pub fn push(&mut self, e: WlshmEvent) {
         self.q.push_back(e);
     }
 
     /// Drain at most `out.len()` events into `out`, preserving FIFO order.
     /// Returns the number written.
-    pub fn drain_into(&mut self, out: &mut [WgpuEvent]) -> usize {
+    pub fn drain_into(&mut self, out: &mut [WlshmEvent]) -> usize {
         let n = out.len().min(self.q.len());
         for slot in out.iter_mut().take(n) {
             *slot = self.q.pop_front().expect("queue underflow");
@@ -150,9 +171,9 @@ mod tests {
     fn drain_respects_capacity_and_order() {
         let mut q = EventQueue::new();
         for i in 0..5 {
-            q.push(WgpuEvent::key(i, i, 0));
+            q.push(WlshmEvent::key(i, i, 0));
         }
-        let mut out = [WgpuEvent::key(99, 0, 0); 3];
+        let mut out = [WlshmEvent::key(99, 0, 0); 3];
         assert_eq!(q.drain_into(&mut out), 3);
         assert_eq!(out[0].keysym, 0);
         assert_eq!(out[2].keysym, 2);
@@ -162,7 +183,7 @@ mod tests {
     #[test]
     fn drain_empty_returns_zero() {
         let mut q = EventQueue::new();
-        let mut out = [WgpuEvent::key(0, 0, 0); 2];
+        let mut out = [WlshmEvent::key(0, 0, 0); 2];
         assert_eq!(q.drain_into(&mut out), 0);
     }
 }

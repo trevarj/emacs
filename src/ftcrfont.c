@@ -28,6 +28,8 @@ along with GNU Emacs.  If not, see <https://www.gnu.org/licenses/>.  */
 #include "haikuterm.h"
 #include "haiku_support.h"
 #include "termchar.h"
+#elif defined HAVE_WLSHM
+#include "wlshmterm.h"
 #else
 #include "pgtkterm.h"
 #endif
@@ -176,6 +178,13 @@ ftcrfont_open (struct frame *f, Lisp_Object entity, int pixel_size)
   cairo_font_options_t *options = xsettings_get_font_options ();
 #else
   cairo_font_options_t *options = cairo_font_options_create ();
+#ifdef HAVE_WLSHM
+  /* No xsettings/GTK to consult; pick sane defaults so text is antialiased
+     and lightly hinted.  */
+  cairo_font_options_set_antialias (options, CAIRO_ANTIALIAS_GRAY);
+  cairo_font_options_set_hint_style (options, CAIRO_HINT_STYLE_SLIGHT);
+  cairo_font_options_set_hint_metrics (options, CAIRO_HINT_METRICS_ON);
+#endif
 #endif
 #ifdef USE_BE_CAIRO
   if (be_use_subpixel_antialiasing ())
@@ -563,6 +572,8 @@ ftcrfont_draw (struct glyph_string *s,
 #ifndef USE_BE_CAIRO
 #ifdef HAVE_X_WINDOWS
   cr = x_begin_cr_clip (f, s->gc);
+#elif defined HAVE_WLSHM
+  cr = wlshm_begin_cr_clip (f);
 #else
   cr = pgtk_begin_cr_clip (f);
 #endif
@@ -585,6 +596,9 @@ ftcrfont_draw (struct glyph_string *s,
 #ifndef USE_BE_CAIRO
 #ifdef HAVE_X_WINDOWS
       x_set_cr_source_with_gc_background (f, s->gc, s->hl != DRAW_CURSOR);
+#elif defined HAVE_WLSHM
+      wlshm_set_cr_source_with_color (f, s->xgcv.background,
+				     s->hl != DRAW_CURSOR);
 #else
       pgtk_set_cr_source_with_color (f, s->xgcv.background,
 				     s->hl != DRAW_CURSOR);
@@ -614,6 +628,8 @@ ftcrfont_draw (struct glyph_string *s,
 #ifndef USE_BE_CAIRO
 #ifdef HAVE_X_WINDOWS
   x_set_cr_source_with_gc_foreground (f, s->gc, false);
+#elif defined HAVE_WLSHM
+  wlshm_set_cr_source_with_color (f, s->xgcv.foreground, false);
 #else
   pgtk_set_cr_source_with_color (f, s->xgcv.foreground, false);
 #endif
@@ -629,6 +645,8 @@ ftcrfont_draw (struct glyph_string *s,
 #ifndef USE_BE_CAIRO
 #ifdef HAVE_X_WINDOWS
   x_end_cr_clip (f);
+#elif defined HAVE_WLSHM
+  wlshm_end_cr_clip (f);
 #else
   pgtk_end_cr_clip (f);
 #endif

@@ -1,0 +1,30 @@
+[package]
+name = "wlshm-backend"
+version = "0.1.0"
+edition = "2021"
+# NOTE: "wlshm" is now a historical name.  This backend pivoted to CPU/software
+# rendering: Emacs draws with Cairo onto a persistent canvas and we present it
+# through a wl_shm double buffer.  No GPU/Vulkan/wlshm crate is used anymore.
+description = "Raw Wayland + CPU (Cairo-on-wl_shm) graphical backend for Emacs (FFI staticlib)."
+license = "GPL-3.0-or-later"
+publish = false
+
+[lib]
+# staticlib -> libwlshm_backend.a linked into the emacs binary.
+# rlib      -> lets tests/benches drive the crate as a Rust library.
+name = "wlshm_backend"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+# Raw Wayland client (window, xdg-shell, input, wl_shm pool).
+smithay-client-toolkit = "0.19"
+wayland-client = "0.31"
+# Force the system libwayland backend (matches the libwayland-client we link).
+wayland-backend = { version = "0.3", features = ["client_system"] }
+log = "0.4"
+libc = "0.2"               # timerfd for client-side key repeat
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
