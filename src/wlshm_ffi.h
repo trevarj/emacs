@@ -342,6 +342,38 @@ int wlshm_window_owns_clipboard(void);
  */
 int wlshm_window_clipboard_exists(void);
 
+/**
+ * Take ownership of the PRIMARY selection with `len` bytes at `data`.
+ *
+ * # Safety
+ * `data` must point to at least `len` readable bytes.
+ */
+int wlshm_window_set_primary(const uint8_t *data, uintptr_t len);
+
+/**
+ * Read the PRIMARY selection.  Writes a pointer/length valid until the next
+ * call into *out_ptr/*out_len and returns 0; -1 if empty.
+ *
+ * # Safety
+ * `out_ptr` and `out_len` must be valid pointers.
+ */
+int wlshm_window_get_primary(const uint8_t **out_ptr, uintptr_t *out_len);
+
+/**
+ * Release our ownership of the PRIMARY selection.
+ */
+void wlshm_window_disown_primary(void);
+
+/**
+ * 1 if we own the PRIMARY selection, else 0.
+ */
+int wlshm_window_owns_primary(void);
+
+/**
+ * 1 if a PRIMARY selection exists (we or another client own it), else 0.
+ */
+int wlshm_window_primary_exists(void);
+
 #ifdef __cplusplus
 }  // extern "C"
 #endif  // __cplusplus

@@ -31,9 +31,14 @@ use smithay_client_toolkit::{
         data_source::{CopyPasteSource, DataSourceHandler},
         DataDeviceManagerState, ReadPipe, WritePipe,
     },
-    delegate_compositor, delegate_data_device, delegate_output, delegate_registry,
-    delegate_shm, delegate_xdg_popup, delegate_xdg_shell, delegate_xdg_window,
+    delegate_compositor, delegate_data_device, delegate_output, delegate_primary_selection,
+    delegate_registry, delegate_shm, delegate_xdg_popup, delegate_xdg_shell, delegate_xdg_window,
     output::{OutputHandler, OutputState},
+    primary_selection::{
+        device::{PrimarySelectionDevice, PrimarySelectionDeviceHandler},
+        selection::{PrimarySelectionSource, PrimarySelectionSourceHandler},
+        PrimarySelectionManagerState,
+    },
     registry::{ProvidesRegistryState, RegistryState},
     registry_handlers,
     reexports::protocols::wp::cursor_shape::v1::client::wp_cursor_shape_device_v1::{
@@ -60,6 +65,10 @@ use smithay_client_toolkit::{
 };
 use smithay_client_toolkit::reexports::protocols::xdg::shell::client::xdg_positioner::{
     Anchor, ConstraintAdjustment, Gravity,
+};
+use smithay_client_toolkit::reexports::protocols::wp::primary_selection::zv1::client::{
+    zwp_primary_selection_device_v1::ZwpPrimarySelectionDeviceV1,
+    zwp_primary_selection_source_v1::ZwpPrimarySelectionSourceV1,
 };
 use wayland_client::{
     backend::ObjectId,
@@ -228,6 +237,12 @@ struct AppState {
     data_device: Option<DataDevice>,
     clipboard_source: Option<CopyPasteSource>,
     clipboard_text: Vec<u8>,
+    // PRIMARY selection (Wayland zwp_primary_selection): a parallel path to the
+    // CLIPBOARD above.  The manager is optional (not all compositors expose it).
+    primary_manager: Option<PrimarySelectionManagerState>,
+    primary_device: Option<PrimarySelectionDevice>,
+    primary_source: Option<PrimarySelectionSource>,
+    primary_text: Vec<u8>,
     /// Pending input events for Emacs's read_socket (each stamped .window).
     events: VecDeque<WlshmEvent>,
     /// Globals needed to mint new surfaces on demand.
@@ -318,6 +333,8 @@ impl Backend {
         let xdg_shell = XdgShell::bind(&globals, &qh).map_err(|e| format!("xdg_wm_base: {e}"))?;
         let shm = Shm::bind(&globals, &qh).map_err(|e| format!("wl_shm: {e}"))?;
         let data_device_manager = DataDeviceManagerState::bind(&globals, &qh).ok();
+        // Optional: absent on compositors without zwp_primary_selection.
+        let primary_manager = PrimarySelectionManagerState::bind(&globals, &qh).ok();
         let cursor_shape_mgr = CursorShapeManager::bind(&globals, &qh).ok();
 
         let mut state = AppState {
@@ -345,6 +362,10 @@ impl Backend {
             data_device: None,
             clipboard_source: None,
             clipboard_text: Vec::new(),
+            primary_manager,
+            primary_device: None,
+            primary_source: None,
+            primary_text: Vec::new(),
             events: VecDeque::new(),
             compositor,
             xdg_shell,
@@ -363,6 +384,11 @@ impl Backend {
         if let Some(mgr) = state.data_device_manager.as_ref() {
             if let Some(seat) = state.seat_state.seats().next() {
                 state.data_device = Some(mgr.get_data_device(&qh, &seat));
+            }
+        }
+        if let Some(mgr) = state.primary_manager.as_ref() {
+            if let Some(seat) = state.seat_state.seats().next() {
+                state.primary_device = Some(mgr.get_selection_device(&qh, &seat));
             }
         }
 
@@ -669,6 +695,41 @@ impl Backend {
         let _ = self.event_queue.roundtrip(&mut self.state);
         Some(read_pipe_timeout(&pipe, 500))
     }
+
+    // --- PRIMARY selection: parallel to the clipboard methods above. ---
+
+    fn set_primary(&mut self, text: &[u8]) -> bool {
+        let Some(mgr) = self.state.primary_manager.as_ref() else { return false };
+        let Some(dev) = self.state.primary_device.as_ref() else { return false };
+        let source = mgr.create_selection_source(&self.qh, CLIPBOARD_MIME.iter().copied());
+        source.set_selection(dev, self.state.serial);
+        self.state.primary_text = text.to_vec();
+        self.state.primary_source = Some(source);
+        let _ = self.conn.flush();
+        true
+    }
+
+    fn disown_primary(&mut self) {
+        self.state.primary_source = None;
+        self.state.primary_text.clear();
+    }
+
+    fn get_primary(&mut self) -> Option<Vec<u8>> {
+        if self.state.primary_source.is_some() {
+            return Some(self.state.primary_text.clone());
+        }
+        let offer = self.state.primary_device.as_ref()?.data().selection_offer()?;
+        let mime = offer.with_mime_types(|types| {
+            CLIPBOARD_MIME
+                .iter()
+                .find(|m| types.iter().any(|t| t == *m))
+                .map(|m| m.to_string())
+        })?;
+        let pipe = offer.receive(mime).ok()?;
+        let _ = self.conn.flush();
+        let _ = self.event_queue.roundtrip(&mut self.state);
+        Some(read_pipe_timeout(&pipe, 500))
+    }
 }
 
 /// Read all data from a clipboard pipe, non-blocking with a total timeout so a
@@ -792,6 +853,11 @@ impl SeatHandler for AppState {
         if self.data_device.is_none() {
             if let Some(mgr) = self.data_device_manager.as_ref() {
                 self.data_device = Some(mgr.get_data_device(qh, &seat));
+            }
+        }
+        if self.primary_device.is_none() {
+            if let Some(mgr) = self.primary_manager.as_ref() {
+                self.primary_device = Some(mgr.get_selection_device(qh, &seat));
             }
         }
     }
@@ -1014,6 +1080,28 @@ impl DataOfferHandler for AppState {
     fn selected_action(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &mut DragOffer, _: DndAction) {}
 }
 
+// PRIMARY selection handlers, mirroring the data_device ones above.
+impl PrimarySelectionDeviceHandler for AppState {
+    // A new primary selection was offered: the offer is stored on the device's
+    // user data (PrimarySelectionDeviceData), read back in get_primary.
+    fn selection(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &ZwpPrimarySelectionDeviceV1) {}
+}
+
+impl PrimarySelectionSourceHandler for AppState {
+    // A client wants our primary text: write it to the fd, mirroring
+    // DataSourceHandler::send_request for the clipboard.
+    fn send_request(&mut self, _: &Connection, _: &QueueHandle<Self>,
+                    _: &ZwpPrimarySelectionSourceV1, _mime: String, mut write_pipe: WritePipe) {
+        use std::io::Write;
+        let _ = write_pipe.write_all(&self.primary_text);
+        let _ = write_pipe.flush();
+    }
+    fn cancelled(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &ZwpPrimarySelectionSourceV1) {
+        self.primary_source = None;
+        self.primary_text.clear();
+    }
+}
+
 impl ProvidesRegistryState for AppState {
     fn registry(&mut self) -> &mut RegistryState {
         &mut self.registry_state
@@ -1028,6 +1116,7 @@ delegate_seat!(AppState);
 delegate_keyboard!(AppState);
 delegate_pointer!(AppState);
 delegate_data_device!(AppState);
+delegate_primary_selection!(AppState);
 delegate_xdg_shell!(AppState);
 delegate_xdg_window!(AppState);
 delegate_xdg_popup!(AppState);
@@ -1587,6 +1676,77 @@ pub extern "C" fn wlshm_window_clipboard_exists() -> c_int {
             let foreign = b
                 .state
                 .data_device
+                .as_ref()
+                .map(|d| d.data().selection_offer().is_some())
+                .unwrap_or(false);
+            (owned || foreign) as c_int
+        },
+        0,
+    )
+}
+
+// --- PRIMARY selection FFI: parallel to the CLIPBOARD functions above. ---
+
+/// Take ownership of the PRIMARY selection with `len` bytes at `data`.
+///
+/// # Safety
+/// `data` must point to at least `len` readable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn wlshm_window_set_primary(data: *const u8, len: usize) -> c_int {
+    if data.is_null() {
+        return -1;
+    }
+    let bytes = std::slice::from_raw_parts(data, len);
+    with_backend(|b| if b.set_primary(bytes) { 0 } else { -1 }, -1)
+}
+
+/// Read the PRIMARY selection.  Writes a pointer/length valid until the next
+/// call into *out_ptr/*out_len and returns 0; -1 if empty.
+///
+/// # Safety
+/// `out_ptr` and `out_len` must be valid pointers.
+#[no_mangle]
+pub unsafe extern "C" fn wlshm_window_get_primary(
+    out_ptr: *mut *const u8,
+    out_len: *mut usize,
+) -> c_int {
+    match with_backend(|b| b.get_primary(), None) {
+        Some(bytes) => CLIPBOARD_BUF.with(|b| {
+            let mut b = b.borrow_mut();
+            *b = bytes;
+            if !out_ptr.is_null() {
+                *out_ptr = b.as_ptr();
+            }
+            if !out_len.is_null() {
+                *out_len = b.len();
+            }
+            0
+        }),
+        None => -1,
+    }
+}
+
+/// Release our ownership of the PRIMARY selection.
+#[no_mangle]
+pub extern "C" fn wlshm_window_disown_primary() {
+    with_backend(|b| b.disown_primary(), ());
+}
+
+/// 1 if we own the PRIMARY selection, else 0.
+#[no_mangle]
+pub extern "C" fn wlshm_window_owns_primary() -> c_int {
+    with_backend(|b| b.state.primary_source.is_some() as c_int, 0)
+}
+
+/// 1 if a PRIMARY selection exists (we or another client own it), else 0.
+#[no_mangle]
+pub extern "C" fn wlshm_window_primary_exists() -> c_int {
+    with_backend(
+        |b| {
+            let owned = b.state.primary_source.is_some();
+            let foreign = b
+                .state
+                .primary_device
                 .as_ref()
                 .map(|d| d.data().selection_offer().is_some())
                 .unwrap_or(false);
