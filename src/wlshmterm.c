@@ -2016,6 +2016,147 @@ wlshm_set_child_frame_border_width (struct frame *f, Lisp_Object arg,
     }
 }
 
+/* Tab bar, tool bar, and menu bar are drawn internally (no toolkit): the
+   display engine lays them out as pseudo-window rows and the RIF draws them
+   (text tabs, image tool-bar buttons, menu-bar text).  These handlers just
+   allocate/free the rows and resize the frame.  Ported from the android
+   backend (the closest no-toolkit, internal-everything model).  */
+
+static void
+wlshm_change_tool_bar_height (struct frame *f, int height)
+{
+  int unit = FRAME_LINE_HEIGHT (f);
+  int old_height = FRAME_TOOL_BAR_HEIGHT (f);
+  int lines = (height + unit - 1) / unit;
+  Lisp_Object fullscreen = get_frame_param (f, Qfullscreen);
+
+  fset_redisplay (f);
+  FRAME_TOOL_BAR_HEIGHT (f) = height;
+  FRAME_TOOL_BAR_LINES (f) = lines;
+  store_frame_param (f, Qtool_bar_lines, make_fixnum (lines));
+
+  if (WLSHM_FRAME_HANDLE (f) && FRAME_TOOL_BAR_HEIGHT (f) == 0)
+    {
+      clear_frame (f);
+      clear_current_matrices (f);
+    }
+  if ((height < old_height) && WINDOWP (f->tool_bar_window))
+    clear_glyph_matrix (XWINDOW (f->tool_bar_window)->current_matrix);
+
+  if (!f->tool_bar_resized)
+    {
+      if (NILP (fullscreen) || EQ (fullscreen, Qfullwidth))
+	adjust_frame_size (f, FRAME_TEXT_WIDTH (f), FRAME_TEXT_HEIGHT (f),
+			   1, false, Qtool_bar_lines);
+      else
+	adjust_frame_size (f, -1, -1, 4, false, Qtool_bar_lines);
+      f->tool_bar_resized = f->tool_bar_redisplayed;
+    }
+  else
+    adjust_frame_size (f, -1, -1, 3, false, Qtool_bar_lines);
+
+  adjust_frame_glyphs (f);
+  SET_FRAME_GARBAGED (f);
+}
+
+static void
+wlshm_set_tool_bar_lines (struct frame *f, Lisp_Object value, Lisp_Object oldval)
+{
+  int nlines;
+  if (FRAME_MINIBUF_ONLY_P (f))
+    return;
+  nlines = RANGED_FIXNUMP (0, value, INT_MAX) ? XFIXNAT (value) : 0;
+  /* Skip the no-op (e.g. the 0 -> 0 set at frame creation): an unconditional
+     change_tool_bar_height would do spurious adjust_frame_glyphs/garbage that
+     perturbs fringe layout.  */
+  if (nlines != FRAME_TOOL_BAR_LINES (f))
+    wlshm_change_tool_bar_height (f, nlines * FRAME_LINE_HEIGHT (f));
+}
+
+static void
+wlshm_set_tool_bar_position (struct frame *f, Lisp_Object new_value,
+			     Lisp_Object old_value)
+{
+  if (!EQ (new_value, Qtop) && !EQ (new_value, Qbottom))
+    error ("Tool bar position must be either `top' or `bottom'");
+  if (EQ (new_value, old_value))
+    return;
+  fset_tool_bar_position (f, new_value);
+  adjust_frame_size (f, -1, -1, 3, false, Qtool_bar_position);
+  adjust_frame_glyphs (f);
+  SET_FRAME_GARBAGED (f);
+}
+
+static void
+wlshm_change_tab_bar_height (struct frame *f, int height)
+{
+  int unit = FRAME_LINE_HEIGHT (f);
+  int old_height = FRAME_TAB_BAR_HEIGHT (f);
+  int lines = height / unit;
+  Lisp_Object fullscreen = get_frame_param (f, Qfullscreen);
+
+  if (lines == 0 && height != 0)
+    lines = 1;
+  fset_redisplay (f);
+  FRAME_TAB_BAR_HEIGHT (f) = height;
+  FRAME_TAB_BAR_LINES (f) = lines;
+  store_frame_param (f, Qtab_bar_lines, make_fixnum (lines));
+
+  if (WLSHM_FRAME_HANDLE (f) && FRAME_TAB_BAR_HEIGHT (f) == 0)
+    {
+      clear_frame (f);
+      clear_current_matrices (f);
+    }
+  if ((height < old_height) && WINDOWP (f->tab_bar_window))
+    clear_glyph_matrix (XWINDOW (f->tab_bar_window)->current_matrix);
+
+  if (!f->tab_bar_resized)
+    {
+      if (NILP (fullscreen) || EQ (fullscreen, Qfullwidth))
+	adjust_frame_size (f, FRAME_TEXT_WIDTH (f), FRAME_TEXT_HEIGHT (f),
+			   1, false, Qtab_bar_lines);
+      else
+	adjust_frame_size (f, -1, -1, 4, false, Qtab_bar_lines);
+      f->tab_bar_resized = f->tab_bar_redisplayed;
+    }
+  else
+    adjust_frame_size (f, -1, -1, 3, false, Qtab_bar_lines);
+
+  adjust_frame_glyphs (f);
+  SET_FRAME_GARBAGED (f);
+}
+
+static void
+wlshm_set_tab_bar_lines (struct frame *f, Lisp_Object value, Lisp_Object oldval)
+{
+  int olines = FRAME_TAB_BAR_LINES (f);
+  int nlines;
+  if (FRAME_MINIBUF_ONLY_P (f))
+    return;
+  nlines = RANGED_FIXNUMP (0, value, INT_MAX) ? XFIXNAT (value) : 0;
+  if (nlines != olines && (olines == 0 || nlines == 0))
+    wlshm_change_tab_bar_height (f, nlines * FRAME_LINE_HEIGHT (f));
+}
+
+static void
+wlshm_set_menu_bar_lines (struct frame *f, Lisp_Object value, Lisp_Object oldval)
+{
+  int nlines;
+  int olines = FRAME_MENU_BAR_LINES (f);
+
+  if (FRAME_MINIBUF_ONLY_P (f) || FRAME_PARENT_FRAME (f))
+    return;
+  nlines = TYPE_RANGED_FIXNUMP (int, value) ? XFIXNUM (value) : 0;
+
+  fset_redisplay (f);
+  FRAME_MENU_BAR_LINES (f) = nlines;
+  FRAME_MENU_BAR_HEIGHT (f) = nlines * FRAME_LINE_HEIGHT (f);
+  if (WLSHM_FRAME_HANDLE (f))
+    wlshm_clear_under_internal_border (f);
+  if (nlines != olines)
+    adjust_frame_size (f, -1, -1, 3, true, Qmenu_bar_lines);
+}
+
 /* Positional, indexed by frame parameter (mirrors pgtk_frame_parm_handlers).
    gui_set_* are the shared generic handlers; the remaining NULLs are genuine
    Wayland-limitation no-ops (override-redirect, skip-taskbar, z-group, sticky,
@@ -2036,7 +2177,7 @@ frame_parm_handler wlshm_frame_parm_handlers[] = {
   wlshm_set_internal_border_width,
   gui_set_right_divider_width,
   gui_set_bottom_divider_width,
-  NULL,				/* menu_bar_lines */
+  wlshm_set_menu_bar_lines,
   NULL,				/* mouse_color */
   wlshm_explicitly_set_name,
   gui_set_scroll_bar_width,
@@ -2046,8 +2187,8 @@ frame_parm_handler wlshm_frame_parm_handlers[] = {
   gui_set_vertical_scroll_bars,
   gui_set_horizontal_scroll_bars,
   gui_set_visibility,
-  NULL,				/* tab_bar_lines */
-  NULL,				/* tool_bar_lines */
+  wlshm_set_tab_bar_lines,
+  wlshm_set_tool_bar_lines,
   wlshm_set_scroll_bar_foreground,
   wlshm_set_scroll_bar_background,
   gui_set_screen_gamma,
@@ -2059,7 +2200,7 @@ frame_parm_handler wlshm_frame_parm_handlers[] = {
   gui_set_font_backend,
   gui_set_alpha,
   NULL,				/* sticky */
-  NULL,				/* tool_bar_position */
+  wlshm_set_tool_bar_position,
   0,
   wlshm_set_undecorated,
   wlshm_set_parent_frame,
@@ -3820,6 +3961,8 @@ wlshm_create_terminal (struct wlshm_display_info *dpyinfo)
   terminal->frame_up_to_date_hook = wlshm_frame_up_to_date;
   terminal->delete_terminal_hook = wlshm_delete_terminal;
   terminal->get_focus_frame = wlshm_get_focus_frame;
+  terminal->change_tab_bar_height_hook = wlshm_change_tab_bar_height;
+  terminal->change_tool_bar_height_hook = wlshm_change_tool_bar_height;
   terminal->get_string_resource_hook = wlshm_get_string_resource;
   terminal->set_new_font_hook = wlshm_new_font;
   terminal->defined_color_hook = wlshm_defined_color;
