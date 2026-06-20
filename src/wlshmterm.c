@@ -3167,7 +3167,7 @@ wlshm_read_socket (struct terminal *terminal, struct input_event *hold_quit)
   return count;
 }
 
-static void
+void
 wlshm_delete_terminal (struct terminal *terminal)
 {
   /* Windows are leaked at process exit (the connection is ManuallyDrop on the
