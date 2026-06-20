@@ -65,9 +65,9 @@
   (setq wlshm-initialized t))
 
 ;;; Selection / clipboard.
-;; Backed by the Wayland data-device (system CLIPBOARD).  PRIMARY is not yet
-;; supported, so we only act on the CLIPBOARD selection; other selections are
-;; no-ops here (kept in the kill ring as usual).
+;; Backed by the Wayland data-device (system CLIPBOARD) and the
+;; primary-selection protocol (PRIMARY).  The internal functions dispatch on
+;; the selection symbol; SECONDARY is unsupported (kept in the kill ring).
 
 (declare-function wlshm-own-selection-internal "wlshmfns.c"
                   (selection value &optional frame))
@@ -80,10 +80,13 @@
 (declare-function wlshm-selection-exists-p "wlshmfns.c"
                   (&optional selection terminal))
 
+;; Selections handled natively by the wlshm backend.
+(defconst wlshm--native-selections '(CLIPBOARD PRIMARY))
+
 (cl-defmethod gui-backend-set-selection (selection value
                                          &context (window-system wlshm))
-  (if (not (eq selection 'CLIPBOARD))
-      ;; Let the default (kill-ring) handling stand for PRIMARY/SECONDARY.
+  (if (not (memq selection wlshm--native-selections))
+      ;; Let the default (kill-ring) handling stand for SECONDARY etc.
       'foreign-selection
     (if value
         (wlshm-own-selection-internal selection value)
@@ -91,16 +94,18 @@
 
 (cl-defmethod gui-backend-get-selection (selection-symbol target-type
                                          &context (window-system wlshm))
-  (when (eq selection-symbol 'CLIPBOARD)
+  (when (memq selection-symbol wlshm--native-selections)
     (wlshm-get-selection-internal selection-symbol target-type)))
 
 (cl-defmethod gui-backend-selection-owner-p (selection
                                              &context (window-system wlshm))
-  (and (eq selection 'CLIPBOARD) (wlshm-selection-owner-p selection)))
+  (and (memq selection wlshm--native-selections)
+       (wlshm-selection-owner-p selection)))
 
 (cl-defmethod gui-backend-selection-exists-p (selection
                                               &context (window-system wlshm))
-  (and (eq selection 'CLIPBOARD) (wlshm-selection-exists-p selection)))
+  (and (memq selection wlshm--native-selections)
+       (wlshm-selection-exists-p selection)))
 
 ;; Any display name maps to the wlshm backend.
 (add-to-list 'display-format-alist '(".*" . wlshm))

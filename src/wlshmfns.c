@@ -859,43 +859,63 @@ Value is t if tooltip was open, nil otherwise.  */)
 }
 
 /* ------------------------------------------------------------------ */
-/* Clipboard (CLIPBOARD selection).  Thin shims over the Rust Wayland   */
-/* data-device clipboard; the lisp methods in term/wlshm-win.el gate     */
-/* these to the CLIPBOARD selection (PRIMARY is not yet supported).     */
+/* Selections.  Thin shims over the Rust Wayland data-device           */
+/* (CLIPBOARD) and primary-selection (PRIMARY) protocols.  These DEFUNs */
+/* dispatch on the SELECTION symbol: 'PRIMARY uses the primary FFI,     */
+/* anything else (the lisp gates to 'CLIPBOARD) uses the clipboard FFI. */
+/* SECONDARY is unsupported.  The lisp methods live in                  */
+/* term/wlshm-win.el.                                                   */
 /* ------------------------------------------------------------------ */
+
+/* True if SELECTION names the Wayland PRIMARY selection.  */
+static bool
+wlshm_is_primary (Lisp_Object selection)
+{
+  return EQ (selection, QPRIMARY);
+}
 
 DEFUN ("wlshm-own-selection-internal", Fwlshm_own_selection_internal,
        Swlshm_own_selection_internal, 2, 3, 0,
-       doc: /* Assert ownership of the clipboard with VALUE (a string).
-SELECTION and FRAME are accepted for compatibility; only the system
-CLIPBOARD is supported.  */)
+       doc: /* Assert ownership of SELECTION with VALUE (a string).
+SELECTION may be `CLIPBOARD' or `PRIMARY'; FRAME is accepted for
+compatibility.  */)
   (Lisp_Object selection, Lisp_Object value, Lisp_Object frame)
 {
   CHECK_STRING (value);
   Lisp_Object enc = ENCODE_UTF_8 (value);
-  wlshm_window_set_clipboard ((const uint8_t *) SDATA (enc),
-			     (uintptr_t) SBYTES (enc));
+  if (wlshm_is_primary (selection))
+    wlshm_window_set_primary ((const uint8_t *) SDATA (enc),
+			      (uintptr_t) SBYTES (enc));
+  else
+    wlshm_window_set_clipboard ((const uint8_t *) SDATA (enc),
+			       (uintptr_t) SBYTES (enc));
   return value;
 }
 
 DEFUN ("wlshm-disown-selection-internal", Fwlshm_disown_selection_internal,
        Swlshm_disown_selection_internal, 1, 3, 0,
-       doc: /* Release ownership of the clipboard.  */)
+       doc: /* Release ownership of SELECTION (`CLIPBOARD' or `PRIMARY').  */)
   (Lisp_Object selection, Lisp_Object time_object, Lisp_Object terminal)
 {
-  wlshm_window_disown_clipboard ();
+  if (wlshm_is_primary (selection))
+    wlshm_window_disown_primary ();
+  else
+    wlshm_window_disown_clipboard ();
   return Qt;
 }
 
 DEFUN ("wlshm-get-selection-internal", Fwlshm_get_selection_internal,
        Swlshm_get_selection_internal, 2, 4, 0,
-       doc: /* Return the clipboard text, or nil if empty.  */)
+       doc: /* Return the text of SELECTION (`CLIPBOARD' or `PRIMARY'), or nil.  */)
   (Lisp_Object selection_symbol, Lisp_Object target_type,
    Lisp_Object time_stamp, Lisp_Object terminal)
 {
   const uint8_t *ptr = NULL;
   uintptr_t len = 0;
-  if (wlshm_window_get_clipboard (&ptr, &len) != 0 || ptr == NULL || len == 0)
+  int rc = wlshm_is_primary (selection_symbol)
+    ? wlshm_window_get_primary (&ptr, &len)
+    : wlshm_window_get_clipboard (&ptr, &len);
+  if (rc != 0 || ptr == NULL || len == 0)
     return Qnil;
   Lisp_Object bytes = make_unibyte_string ((const char *) ptr, (ptrdiff_t) len);
   return code_convert_string_norecord (bytes, Qutf_8, false);
@@ -903,18 +923,24 @@ DEFUN ("wlshm-get-selection-internal", Fwlshm_get_selection_internal,
 
 DEFUN ("wlshm-selection-owner-p", Fwlshm_selection_owner_p,
        Swlshm_selection_owner_p, 0, 2, 0,
-       doc: /* Return t if this Emacs owns the clipboard.  */)
+       doc: /* Return t if this Emacs owns SELECTION (`CLIPBOARD' or `PRIMARY').  */)
   (Lisp_Object selection, Lisp_Object terminal)
 {
-  return wlshm_window_owns_clipboard () ? Qt : Qnil;
+  int owns = wlshm_is_primary (selection)
+    ? wlshm_window_owns_primary ()
+    : wlshm_window_owns_clipboard ();
+  return owns ? Qt : Qnil;
 }
 
 DEFUN ("wlshm-selection-exists-p", Fwlshm_selection_exists_p,
        Swlshm_selection_exists_p, 0, 2, 0,
-       doc: /* Return t if there is a clipboard selection.  */)
+       doc: /* Return t if SELECTION (`CLIPBOARD' or `PRIMARY') exists.  */)
   (Lisp_Object selection, Lisp_Object terminal)
 {
-  return wlshm_window_clipboard_exists () ? Qt : Qnil;
+  int exists = wlshm_is_primary (selection)
+    ? wlshm_window_primary_exists ()
+    : wlshm_window_clipboard_exists ();
+  return exists ? Qt : Qnil;
 }
 
 DEFUN ("wlshm-dump-canvas", Fwlshm_dump_canvas, Swlshm_dump_canvas, 1, 2, 0,
