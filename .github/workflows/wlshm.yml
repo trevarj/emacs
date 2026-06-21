@@ -1,0 +1,111 @@
+# wlshm.yml --- rebase wlshm-backend onto master, verify it builds, open a PR.
+#
+# Flow:
+#   1. Rebase wlshm-backend onto origin/master (abort + fail on conflict).
+#   2. Build the wlshm backend natively (apt deps + rustup) and run the
+#      render tests (advisory).
+#   3. ONLY if the build is green: force-push the rebased commits to the
+#      throwaway branch `ci/wlshm-rebased` and open/update a PR against master.
+#
+# This never rewrites wlshm-backend itself.  When the PR is green you fast-
+# forward your local wlshm-backend onto master by hand.
+#
+# Runner: GitHub-hosted ubuntu-latest.  The build uses Ubuntu's C dependencies
+# and a rustup toolchain (NOT Guix -- the hosted-runner Guix path is too old to
+# parse the v4 Cargo.lock, and pulling current Guix from the 1.4 distro package
+# fails to bootstrap).  test/manual/wlshm/ci-build.sh remains the Guix build for
+# local / self-hosted use.
+#
+# NOTE: the rebase target is *origin/master* (your fork's master).  Keep your
+# fork's master synced with upstream Emacs (the GitHub "Sync fork" button), or
+# change the fetch/rebase below to a real upstream remote.
+
+name: wlshm rebase + build + PR
+
+on:
+  schedule:
+    # Monthly rebase check (1st of the month, 06:00 UTC).
+    - cron: '0 6 1 * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: wlshm-rebase
+  cancel-in-progress: true
+
+jobs:
+  rebase-build-pr:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      REBASE_BRANCH: ci/wlshm-rebased
+
+    steps:
+      - name: Checkout wlshm-backend (full history)
+        uses: actions/checkout@v4
+        with:
+          ref: wlshm-backend
+          fetch-depth: 0
+
+      - name: Rebase onto origin/master (abort on conflict)
+        run: |
+          set -eu
+          git config user.name  "wlshm-ci"
+          git config user.email "wlshm-ci@users.noreply.github.com"
+          git fetch origin master
+          echo "Rebasing $(git rev-parse --short HEAD) onto origin/master..."
+          if ! git rebase origin/master; then
+            git rebase --abort || true
+            echo "::error::Rebase onto origin/master has conflicts; resolve locally."
+            exit 1
+          fi
+          echo "Rebase clean. HEAD is now $(git rev-parse --short HEAD)."
+
+      - name: Install build dependencies (apt)
+        run: |
+          set -eu
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential autoconf automake texinfo pkg-config \
+            libgnutls28-dev libgmp-dev libncurses-dev \
+            libcairo2-dev libfreetype-dev libfontconfig-dev libharfbuzz-dev \
+            libwayland-dev wayland-protocols libxkbcommon-dev \
+            libpng-dev libjpeg-dev libtiff-dev libgif-dev librsvg2-dev \
+            weston imagemagick gdb fonts-dejavu-core
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build + render tests (wlshm)
+        run: ./test/manual/wlshm/ci-build-native.sh
+
+      - name: Publish rebased branch and open/update PR
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          git push --force origin "HEAD:${REBASE_BRANCH}"
+          existing="$(gh pr list --head "${REBASE_BRANCH}" --base master \
+                        --state open --json number --jq '.[0].number' || true)"
+          if [ -n "${existing}" ]; then
+            echo "PR #${existing} updated by the force-push."
+          else
+            gh pr create --base master --head "${REBASE_BRANCH}" \
+              --title "wlshm-backend rebased onto master" \
+              --body "Automated: \`wlshm-backend\` rebased onto \`master\` and verified to build (render tests advisory). When green, fast-forward your local \`wlshm-backend\` and force-update it."
+          fi
+
+      - name: Upload test artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wlshm-test-artifacts
+          path: |
+            /tmp/wlshm-tests/**
+            config.log
+          if-no-files-found: ignore
+          retention-days: 7
