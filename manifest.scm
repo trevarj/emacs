@@ -16,6 +16,16 @@
 (use-modules (gnu packages)
              (guix profiles))
 
+;; wtype/wlrctl drive the tier-3 nested-niri interaction tests and come from
+;; personal channels.  CI builds against core Guix only and runs just tier-1/2,
+;; so it sets WLSHM_CI=1 to drop them and keep the manifest resolvable with no
+;; extra channels.
+(define interactive-test-tools
+  (if (getenv "WLSHM_CI")
+      '()
+      (list "wtype"           ; virtual-keyboard injection (nested-niri)
+            "wlrctl")))       ; virtual-pointer injection
+
 (concatenate-manifests
  (list
   ;; (1) Everything needed to build Emacs itself, tracking emacs-next.
@@ -39,13 +49,11 @@
          "harfbuzz"
          ;; A font so fontconfig can resolve the default frame font.
          "font-dejavu"
-         ;; Graphical test harness (test/manual/wlshm/run-tests.sh):
+         ;; Render-test harness (tier-1/2, test/manual/wlshm/run-tests.sh):
          ;;   weston  - headless compositor for on-screen render goldens
-         ;;   wtype   - virtual-keyboard injection (nested-niri interaction)
-         ;;   wlrctl  - virtual-pointer injection
          ;;   gdb     - watchdog backtraces on hang/crash
-         ;; (niri itself is taken from the system profile.)
          "weston"
-         "wtype"
-         "wlrctl"
-         "gdb"))))
+         "gdb"))
+
+  ;; (3) Tier-3 interaction tools (wtype/wlrctl); skipped under WLSHM_CI.
+  (specifications->manifest interactive-test-tools)))
