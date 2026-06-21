@@ -33,7 +33,9 @@ check_x_display_info (Lisp_Object object)
 }
 
 DEFUN ("wlshm-scale-factor", Fwlshm_scale_factor, Swlshm_scale_factor, 0, 0, 0,
-       doc: /* Return the integer HiDPI scale factor of the wlshm display.  */)
+       doc: /* Return the wlshm display's logical scale factor (an integer).
+HiDPI crispness is handled transparently by the per-frame Cairo device scale,
+so Emacs works in logical pixels and this is 1 in the normal case.  */)
   (void)
 {
   return make_fixnum (x_display_list ? (EMACS_INT) x_display_list->scale : 1);

@@ -18,6 +18,7 @@ logic of its own.  See wlshm-backend-plan.md.  */
 #include "termhooks.h"
 #include "dispextern.h"
 #include <stdarg.h>
+#include <math.h>		/* lround for HiDPI logical<->physical scaling */
 #include "font.h"
 #include "fontset.h"
 #include <cairo-ft.h>		/* FcPattern + cairo-ft, prereqs for ftfont.h */
@@ -136,6 +137,7 @@ wlshm_ensure_canvas (void)
       return;
     }
   struct wlshm_output *o = FRAME_X_OUTPUT (f);
+  /* W/H are LOGICAL pixels (the xdg configure size Emacs works in).  */
   uint32_t w = 0, h = 0;
   wlshm_window_size (WLSHM_FRAME_HANDLE (f), &w, &h);
   if (w == 0 || h == 0)
@@ -143,7 +145,24 @@ wlshm_ensure_canvas (void)
       w = 800;
       h = 600;
     }
-  if (!o->canvas || o->canvas_w != (int) w || o->canvas_h != (int) h)
+  /* HiDPI: the wl_shm buffer is allocated at PHYSICAL pixels
+     (round(logical * scale)); the compositor's wp_viewport (fractional path)
+     or set_buffer_scale (integer fallback) maps it back to the logical surface
+     size.  Cairo gets a device scale so every drawing call keeps using logical
+     coordinates yet rasterizes crisply at the physical resolution (ftcrfont's
+     cairo glyph path honors the device scale).  scale120 == 120 -> 1.0, i.e.
+     byte-identical to the non-HiDPI path.  */
+  uint32_t scale120 = wlshm_window_scale120 (WLSHM_FRAME_HANDLE (f));
+  if (scale120 < 120)
+    scale120 = 120;
+  double scale = (double) scale120 / 120.0;
+  int pw = (int) lround ((double) w * scale);
+  int ph = (int) lround ((double) h * scale);
+  if (pw < 1)
+    pw = 1;
+  if (ph < 1)
+    ph = 1;
+  if (!o->canvas || o->canvas_w != pw || o->canvas_h != ph)
     {
       if (o->cr)
 	{
@@ -155,11 +174,13 @@ wlshm_ensure_canvas (void)
 	  cairo_surface_destroy (o->canvas);
 	  o->canvas = NULL;
 	}
-      o->canvas = cairo_image_surface_create (CAIRO_FORMAT_RGB24,
-					      (int) w, (int) h);
+      o->canvas = cairo_image_surface_create (CAIRO_FORMAT_RGB24, pw, ph);
+      /* Device scale: logical coords -> physical pixels.  At scale 1.0 this is
+	 the identity, leaving the scale-1 output byte-identical.  */
+      cairo_surface_set_device_scale (o->canvas, scale, scale);
       o->cr = cairo_create (o->canvas);
-      o->canvas_w = (int) w;
-      o->canvas_h = (int) h;
+      o->canvas_w = pw;
+      o->canvas_h = ph;
     }
   wlshm_canvas = o->canvas;
   wlshm_cr = o->cr;
@@ -1201,6 +1222,17 @@ wlshm_scroll_run (struct window *w, struct run *run)
       unsigned char *data = cairo_image_surface_get_data (wlshm_canvas);
       int stride = cairo_image_surface_get_stride (wlshm_canvas);
       int cw = wlshm_canvas_w, ch = wlshm_canvas_h;
+      /* The copy box (x/width/from_y/to_y/height) is in LOGICAL coordinates,
+	 but this raw-pixel memmove operates on the PHYSICAL buffer.  Scale the
+	 box by the canvas device scale (== physical/logical).  At scale 1.0
+	 these multiplications are the identity (byte-identical path).  */
+      double dsx = 1.0, dsy = 1.0;
+      cairo_surface_get_device_scale (wlshm_canvas, &dsx, &dsy);
+      x = (int) lround (x * dsx);
+      width = (int) lround (width * dsx);
+      from_y = (int) lround (from_y * dsy);
+      to_y = (int) lround (to_y * dsy);
+      height = (int) lround (height * dsy);
       /* Clamp the copy box to the canvas.  */
       if (x < 0)
 	x = 0;
@@ -1752,14 +1784,12 @@ wlshm_default_font_parameter (struct frame *f, Lisp_Object parms)
 
   if (!FONTP (font) && !STRINGP (font))
     {
-      /* Use an explicit pixel size scaled by the HiDPI factor, so the
-	 default font is readable and unambiguous (avoids the point-size /
-	 face-height path that can collapse to 1px).  */
-      int scale = (int) dpyinfo->scale;
-      if (scale < 1)
-	scale = 1;
+      /* Use an explicit LOGICAL pixel size (avoids the point-size /
+	 face-height path that can collapse to 1px).  HiDPI crispness comes
+	 entirely from the Cairo device scale on the canvas, so the font stays
+	 logical -- bumping it by the scale here would double-scale the text.  */
       char sized[64];
-      snprintf (sized, sizeof sized, "Monospace:pixelsize=%d", 14 * scale);
+      snprintf (sized, sizeof sized, "Monospace:pixelsize=%d", 14);
       const char *names[] = { sized, "monospace-10", "fixed", NULL };
       for (int i = 0; names[i]; i++)
 	{
@@ -4087,11 +4117,10 @@ wlshm_term_init (Lisp_Object display_name)
     current_kboard = terminal->kboard;
   terminal->kboard->reference_count++;
 
-  /* Normalize font sizes for HiDPI: a scale-2 display gets 192 DPI so a
-     10pt font renders ~26px instead of ~13px.  */
-  int scale = wlshm_window_scale (0);
-  if (scale < 1)
-    scale = 1;
+  /* Emacs works in LOGICAL pixels: HiDPI crispness is handled transparently
+     by the Cairo device scale on each frame's canvas (logical drawing,
+     physical rasterization), so the display resolution and scale stay logical
+     (96 DPI, scale 1).  dpyinfo->scale is informational only.  */
   dpyinfo->name_list_element = Fcons (display_name, Qnil);
   /* Load the X11 color-name database so named face colors resolve.  */
   if (NILP (wlshm_color_map))
@@ -4102,7 +4131,7 @@ wlshm_term_init (Lisp_Object display_name)
   dpyinfo->smallest_char_width = 1;
   dpyinfo->resx = 96.0;
   dpyinfo->resy = 96.0;
-  dpyinfo->scale = scale;
+  dpyinfo->scale = 1.0;
   reset_mouse_highlight (&dpyinfo->mouse_highlight);
 
   terminal->name = xlispstrdup (display_name);

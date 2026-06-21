@@ -86,6 +86,17 @@ use wayland_protocols::wp::text_input::zv3::client::{
     zwp_text_input_manager_v3::ZwpTextInputManagerV3,
     zwp_text_input_v3::{self, ZwpTextInputV3},
 };
+// HiDPI fractional scaling: wp_fractional_scale_v1 (the compositor sends the
+// preferred scale as scale*120) + wp_viewporter (maps the physical-pixel buffer
+// down to the logical surface size).  Neither is wrapped by sctk 0.19, so we
+// bind the managers from the registry and implement Dispatch ourselves.
+use wayland_protocols::wp::fractional_scale::v1::client::{
+    wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1,
+    wp_fractional_scale_v1::{self, WpFractionalScaleV1},
+};
+use wayland_protocols::wp::viewporter::client::{
+    wp_viewport::WpViewport, wp_viewporter::WpViewporter,
+};
 
 use crate::event::{WlshmEvent, WLSHM_MOD_ALT, WLSHM_MOD_CTRL, WLSHM_MOD_LOGO, WLSHM_MOD_SHIFT};
 
@@ -213,9 +224,16 @@ struct WlWindow {
     role: Role,
     /// wl_shm slot pool: source of the (double-buffered) buffers we present.
     pool: SlotPool,
+    /// Logical surface size in LOGICAL pixels (xdg configure sizes are logical).
     size: (u32, u32),
-    /// Integer output scale factor (1, 2, ...).
-    scale: i32,
+    /// Scale * 120 (the wp_fractional_scale_v1 unit).  120 == 1.0.  With the
+    /// fractional+viewport path this is fractional (e.g. 180 == 1.5x); with the
+    /// integer fallback it is the wl_output scale * 120.  Default 120.
+    scale120: u32,
+    /// Per-surface fractional-scale + viewport objects (fractional path only).
+    /// Absent when the compositor lacks the protocols (integer fallback).
+    fractional: Option<WpFractionalScaleV1>,
+    viewport: Option<WpViewport>,
     /// New size the compositor asked for, pending delivery to Emacs.
     pending_resize: Option<(u32, u32)>,
     configured: bool,
@@ -303,7 +321,12 @@ struct AppState {
     surface_to_id: HashMap<ObjectId, u64>,
     focused_window: Option<u64>,
     next_id: u64,
-    default_scale: i32,
+    /// Fallback integer output scale * 120 (used until a window learns its own
+    /// scale; also the basis for the integer fallback path).  Default 120.
+    default_scale120: u32,
+    /// HiDPI fractional scaling globals (absent -> integer fallback path).
+    fractional_mgr: Option<WpFractionalScaleManagerV1>,
+    viewporter: Option<WpViewporter>,
 }
 
 impl AppState {
@@ -427,6 +450,13 @@ impl Backend {
         let text_input_mgr = globals
             .bind::<ZwpTextInputManagerV3, _, _>(&qh, 1..=1, ())
             .ok();
+        // HiDPI fractional scaling: bind the fractional-scale manager and the
+        // viewporter.  Both optional; if either is missing we use the classic
+        // integer wl_output scale + wl_surface.set_buffer_scale fallback.
+        let fractional_mgr = globals
+            .bind::<WpFractionalScaleManagerV1, _, _>(&qh, 1..=1, ())
+            .ok();
+        let viewporter = globals.bind::<WpViewporter, _, _>(&qh, 1..=1, ()).ok();
 
         let mut state = AppState {
             registry_state: RegistryState::new(&globals),
@@ -475,7 +505,9 @@ impl Backend {
             surface_to_id: HashMap::new(),
             focused_window: None,
             next_id: 1,
-            default_scale: 1,
+            default_scale120: 120,
+            fractional_mgr,
+            viewporter,
         };
 
         // Roundtrip so seats/outputs are known.
@@ -501,10 +533,14 @@ impl Backend {
             }
         }
 
+        // Integer-fallback default scale: the largest wl_output scale (only
+        // used when the fractional-scale protocol is unavailable; with it the
+        // per-surface preferred_scale event drives the scale instead).
         for output in state.output_state.outputs() {
             if let Some(info) = state.output_state.info(&output) {
-                if info.scale_factor > state.default_scale {
-                    state.default_scale = info.scale_factor;
+                let s120 = (info.scale_factor.max(1) as u32) * 120;
+                if s120 > state.default_scale120 {
+                    state.default_scale120 = s120;
                 }
             }
         }
@@ -527,7 +563,11 @@ impl Backend {
         };
         let id = self.state.next_id;
         self.state.next_id += 1;
-        let scale = self.state.default_scale.max(1);
+        // Popups/tooltips render at logical scale (scale120 == 120): they are
+        // small, fixed-size surfaces presented in logical pixels, so we don't
+        // attach a fractional-scale/viewport to them.  Toplevels (Emacs frames)
+        // get the HiDPI treatment below.
+        let scale120 = 120;
 
         if (kind == 1 || kind == 2) && parent != 0 {
             // Defer: become an xdg_popup at set_geometry time.
@@ -535,7 +575,9 @@ impl Backend {
                 role: Role::Pending { parent, grab: kind == 1 },
                 pool,
                 size: (1, 1),
-                scale,
+                scale120,
+                fractional: None,
+                viewport: None,
                 pending_resize: None,
                 configured: false,
             });
@@ -552,6 +594,33 @@ impl Backend {
         window.set_title(title);
         window.set_app_id("org.gnu.emacs.wlshm");
         window.set_min_size(Some((160, 120)));
+
+        // HiDPI fractional scaling: attach a wp_fractional_scale_v1 (delivers
+        // preferred_scale = scale*120) and a wp_viewport (maps the physical
+        // buffer down to the logical surface) to the toplevel's surface.  Both
+        // are created BEFORE the first commit so the compositor can send the
+        // initial preferred_scale.  Absent globals -> integer fallback.
+        let wl_surf = window.wl_surface().clone();
+        let fractional = self.state.fractional_mgr.as_ref().map(|mgr| {
+            mgr.get_fractional_scale(&wl_surf, &self.qh, id)
+        });
+        let viewport = self.state.viewporter.as_ref().map(|vp| {
+            vp.get_viewport(&wl_surf, &self.qh, ())
+        });
+        // Default scale: with the fractional path, start at 1.0 and let the
+        // preferred_scale event correct it; with the integer fallback, use the
+        // wl_output scale up front.
+        let scale120 = if fractional.is_some() {
+            120
+        } else {
+            self.state.default_scale120.max(120)
+        };
+        // Integer fallback only: set the buffer scale on the surface so the
+        // compositor knows the buffer is at N* physical density.  The fractional
+        // path leaves buffer_scale at 1 and relies on the viewport instead.
+        if fractional.is_none() {
+            wl_surf.set_buffer_scale((scale120 / 120) as i32);
+        }
         window.commit();
 
         let sid = window.wl_surface().id();
@@ -560,7 +629,9 @@ impl Backend {
             role: Role::Toplevel(window),
             pool,
             size: (800, 600),
-            scale,
+            scale120,
+            fractional,
+            viewport,
             pending_resize: None,
             configured: false,
         });
@@ -906,12 +977,30 @@ fn read_pipe_timeout(pipe: &ReadPipe, timeout_ms: u64) -> Vec<u8> {
 
 impl CompositorHandler for AppState {
     fn scale_factor_changed(&mut self, _: &Connection, _: &QueueHandle<Self>, s: &wl_surface::WlSurface, new: i32) {
-        if new >= 1 {
-            let id = self.id_for_surface(s);
-            if let Some(w) = self.windows.get_mut(&id) {
-                w.scale = new;
-            }
+        if new < 1 {
+            return;
         }
+        let id = self.id_for_surface(s);
+        let Some(w) = self.windows.get_mut(&id) else { return };
+        // Integer fallback only: when the fractional-scale protocol is active
+        // (per-surface wp_fractional_scale_v1), the preferred_scale event is
+        // authoritative and we ignore the wl_output integer scale here.
+        if w.fractional.is_some() {
+            return;
+        }
+        let new120 = (new as u32) * 120;
+        if w.scale120 == new120 {
+            return;
+        }
+        w.scale120 = new120;
+        // Tell the compositor the buffer is at N* density (classic HiDPI), then
+        // recreate the canvas via a same-size Configure (see the fractional
+        // handler for the rationale).
+        if let Some(surface) = w.wl_surface() {
+            surface.set_buffer_scale(new);
+        }
+        let (lw, lh) = w.size;
+        self.push(WlshmEvent::configure(lw as i32, lh as i32).on(id));
     }
     fn transform_changed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: wl_output::Transform) {}
     fn frame(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: u32) {}
@@ -939,6 +1028,12 @@ impl WindowHandler for AppState {
             w.configured = true;
             w.pending_resize = Some(w.size);
             let (sw, sh) = w.size;
+            // Fractional path: the viewport maps the physical-pixel buffer down
+            // to the LOGICAL surface size the compositor just told us.  (No-op
+            // when there is no viewport, i.e. the integer fallback.)
+            if let Some(vp) = w.viewport.as_ref() {
+                vp.set_destination(sw as i32, sh as i32);
+            }
             self.push(WlshmEvent::configure(sw as i32, sh as i32).on(id));
         }
     }
@@ -1170,6 +1265,82 @@ impl Dispatch<ZwpTextInputV3, ()> for AppState {
                 state.push(WlshmEvent::preedit().on(win));
             }
             _ => {}
+        }
+    }
+}
+
+// --- HiDPI fractional scaling raw Dispatch impls ---
+//
+// sctk 0.19 doesn't wrap wp_fractional_scale / wp_viewporter, so we implement
+// wayland-client's Dispatch directly.  The managers and viewport have no events;
+// only wp_fractional_scale_v1 emits `preferred_scale` (scale*120).
+
+impl Dispatch<WpFractionalScaleManagerV1, ()> for AppState {
+    fn event(
+        _state: &mut Self,
+        _proxy: &WpFractionalScaleManagerV1,
+        _event: <WpFractionalScaleManagerV1 as Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        // wp_fractional_scale_manager_v1 has no events.
+    }
+}
+
+impl Dispatch<WpViewporter, ()> for AppState {
+    fn event(
+        _state: &mut Self,
+        _proxy: &WpViewporter,
+        _event: <WpViewporter as Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        // wp_viewporter has no events.
+    }
+}
+
+impl Dispatch<WpViewport, ()> for AppState {
+    fn event(
+        _state: &mut Self,
+        _proxy: &WpViewport,
+        _event: <WpViewport as Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        // wp_viewport has no events.
+    }
+}
+
+// The wp_fractional_scale_v1's user-data is the owning window handle (u64).
+impl Dispatch<WpFractionalScaleV1, u64> for AppState {
+    fn event(
+        state: &mut Self,
+        _proxy: &WpFractionalScaleV1,
+        event: <WpFractionalScaleV1 as Proxy>::Event,
+        data: &u64,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        if let wp_fractional_scale_v1::Event::PreferredScale { scale } = event {
+            let id = *data;
+            let Some(w) = state.windows.get_mut(&id) else { return };
+            if scale == 0 || w.scale120 == scale {
+                return;
+            }
+            w.scale120 = scale;
+            // Re-arm the viewport at the current logical size (unchanged), then
+            // ask Emacs to recreate its canvas at the new physical size: a
+            // Configure carrying the SAME logical size triggers
+            // change_frame_size + garbage + redisplay on the C side, and the C
+            // wlshm_ensure_canvas re-queries the (now larger) physical size.
+            let (lw, lh) = w.size;
+            if let Some(vp) = w.viewport.as_ref() {
+                vp.set_destination(lw as i32, lh as i32);
+            }
+            state.push(WlshmEvent::configure(lw as i32, lh as i32).on(id));
         }
     }
 }
@@ -1486,17 +1657,30 @@ pub extern "C" fn wlshm_window_dispatch() -> c_int {
     )
 }
 
-/// Integer output scale factor of window `win` (1 = default).
+/// Rounded integer scale factor of window `win` (1 = default).  Kept for
+/// callers (e.g. Emacs DPI/resolution) that want a plain integer; the precise
+/// fractional value is `wlshm_window_scale120`.
 #[no_mangle]
 pub extern "C" fn wlshm_window_scale(win: u64) -> c_int {
+    let s120 = wlshm_window_scale120(win);
+    ((s120 + 60) / 120).max(1) as c_int
+}
+
+/// Scale factor of window `win` times 120 (the wp_fractional_scale_v1 unit).
+/// 120 == 1.0, 180 == 1.5x, 240 == 2.0x.  The C side multiplies the logical
+/// surface size by this/120 to size its physical-pixel Cairo canvas, and sets
+/// the Cairo device scale to this/120 so all drawing stays in logical
+/// coordinates yet rasterizes at physical resolution.
+#[no_mangle]
+pub extern "C" fn wlshm_window_scale120(win: u64) -> u32 {
     with_backend(
         |b| {
             b.resolve(win)
                 .and_then(|id| b.state.windows.get(&id))
-                .map(|w| w.scale)
-                .unwrap_or(b.state.default_scale.max(1))
+                .map(|w| w.scale120)
+                .unwrap_or(b.state.default_scale120.max(120))
         },
-        1,
+        120,
     )
 }
 

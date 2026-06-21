@@ -54,14 +54,13 @@
   (cl-assert (not wlshm-initialized))
   (create-default-fontset)
   (x-open-connection (or display "wayland") x-command-line-resources t)
-  ;; Normalize font size for HiDPI: pick a pixel size scaled by the output
-  ;; scale factor, and pin it (with an explicit pixelsize so the face system
-  ;; doesn't collapse the size).  Only if the user hasn't set a font.
-  (let ((scale (if (fboundp 'wlshm-scale-factor) (wlshm-scale-factor) 1)))
-    (unless (or (assq 'font default-frame-alist)
-                (assq 'font initial-frame-alist))
-      (push (cons 'font (format "Monospace:pixelsize=%d" (* 14 (max 1 scale))))
-            default-frame-alist)))
+  ;; Pin a LOGICAL default pixel size (explicit pixelsize so the face system
+  ;; doesn't collapse the size), only if the user hasn't set a font.  HiDPI
+  ;; crispness is handled by the Cairo device scale on the canvas, so the font
+  ;; stays logical -- scaling it here too would double-scale the text.
+  (unless (or (assq 'font default-frame-alist)
+              (assq 'font initial-frame-alist))
+    (push (cons 'font "Monospace:pixelsize=14") default-frame-alist))
   (setq wlshm-initialized t))
 
 ;;; Selection / clipboard.

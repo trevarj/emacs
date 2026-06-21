@@ -23,8 +23,9 @@ wayland-client = "0.31"
 # wayland-protocols 0.32 in transitively but doesn't wrap text-input, so we bind
 # zwp_text_input_manager_v3 / zwp_text_input_v3 ourselves via raw Dispatch impls.
 # The "unstable" feature gates the text_input module; "client" generates the
-# client-side proxies.
-wayland-protocols = { version = "0.32", features = ["client", "unstable"] }
+# client-side proxies.  "staging" gates wp_fractional_scale_v1 (HiDPI fractional
+# scaling); wp_viewporter is in the always-on stable set.
+wayland-protocols = { version = "0.32", features = ["client", "unstable", "staging"] }
 # Force the system libwayland backend (matches the libwayland-client we link).
 wayland-backend = { version = "0.3", features = ["client_system"] }
 log = "0.4"
