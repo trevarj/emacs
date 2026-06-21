@@ -260,6 +260,32 @@ wlshm_window_rect (float x, float y, float w, float h,
   cairo_restore (wlshm_cr);
 }
 
+/* Blend two packed pixels (defined later; also used by the scroll bar).  */
+static unsigned long wlshm_blend_pixel (unsigned long a, unsigned long b,
+					double t);
+
+/* Strength of the mouse-face hover tint: how far the background is blended
+   toward the foreground.  */
+#define WLSHM_HOVER_BLEND 0.18
+
+/* Draw the hover background for a mouse-face highlighted glyph string S: a
+   clean flat (square) fill of the run's background BG tinted toward the
+   foreground FG, replacing the face's beveled box.  Filling the glyph string's
+   own cell makes adjacent strings of one run tile into a single solid button.
+   Square edges (AA-none canvas) keep it crisp.  */
+static void
+wlshm_draw_mouse_face_bg (struct glyph_string *s, unsigned long bg,
+			  unsigned long fg)
+{
+  int box_line = max (s->face->box_horizontal_line_width, 0);
+  unsigned long tint = wlshm_blend_pixel (bg, fg, WLSHM_HOVER_BLEND);
+  float tr, tg, tb;
+  wlshm_unpack_pixel (tint, &tr, &tg, &tb);
+  wlshm_window_rect ((float) s->x, (float) (s->y + box_line),
+		     (float) s->background_width,
+		     (float) (s->height - 2 * box_line), tr, tg, tb, 1.0f);
+}
+
 /* Cairo clip/source helpers used by ftcrfont.c for glyph drawing.  */
 cairo_t *
 wlshm_begin_cr_clip (struct frame *f)
@@ -991,21 +1017,27 @@ wlshm_draw_glyph_string (struct glyph_string *s)
     case CHAR_GLYPH:
     case COMPOSITE_GLYPH:
       {
-	/* Background (inset vertically by the box line so the box shows).  */
+	/* Background (inset vertically by the box line so the box shows).  A
+	   mouse-face hover draws a modern rounded "pill" instead, replacing the
+	   face's beveled box.  */
 	if (!s->background_filled_p && !s->for_overlaps)
 	  {
 	    int box_line = max (s->face->box_horizontal_line_width, 0);
 	    float r, g, b;
 	    wlshm_unpack_pixel (bg, &r, &g, &b);
 	    block_input ();
-	    wlshm_window_rect ((float) s->x, (float) (s->y + box_line),
-			      (float) s->background_width,
-			      (float) (s->height - 2 * box_line), r, g, b, 1.0f);
+	    if (s->hl == DRAW_MOUSE_FACE)
+	      wlshm_draw_mouse_face_bg (s, bg, fg);
+	    else
+	      wlshm_window_rect ((float) s->x, (float) (s->y + box_line),
+				(float) s->background_width,
+				(float) (s->height - 2 * box_line), r, g, b, 1.0f);
 	    unblock_input ();
 	    s->background_filled_p = true;
 	  }
 
-	if (!s->for_overlaps)
+	/* The pill replaces the box for hover; otherwise draw the face's box.  */
+	if (!s->for_overlaps && s->hl != DRAW_MOUSE_FACE)
 	  wlshm_draw_glyph_string_box (s);
 
 	/* Glyphs (background already drawn above).  */
@@ -1068,11 +1100,14 @@ wlshm_draw_glyph_string (struct glyph_string *s)
 	float r, g, b;
 	wlshm_unpack_pixel (bg, &r, &g, &b);
 	block_input ();
-	wlshm_window_rect ((float) s->x, (float) (s->y + box_line),
-			  (float) s->background_width,
-			  (float) (s->height - 2 * box_line), r, g, b, 1.0f);
+	if (s->hl == DRAW_MOUSE_FACE)
+	  wlshm_draw_mouse_face_bg (s, bg, fg);
+	else
+	  wlshm_window_rect ((float) s->x, (float) (s->y + box_line),
+			    (float) s->background_width,
+			    (float) (s->height - 2 * box_line), r, g, b, 1.0f);
 	unblock_input ();
-	if (!s->for_overlaps)
+	if (!s->for_overlaps && s->hl != DRAW_MOUSE_FACE)
 	  wlshm_draw_glyph_string_box (s);
       }
       break;
