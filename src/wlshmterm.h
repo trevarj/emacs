@@ -296,7 +296,7 @@ struct scroll_bar
 #define VERTICAL_SCROLL_BAR_TOP_RANGE(f, height)	\
   (VERTICAL_SCROLL_BAR_INSIDE_HEIGHT (f, height) - VERTICAL_SCROLL_BAR_MIN_HANDLE)
 #define HORIZONTAL_SCROLL_BAR_INSIDE_WIDTH(f, width)	\
-  ((width) - HORIZONTAL_SCROLL_BAR_LEFT_BORDER - HORIZONTAL_SCROLL_BAR_LEFT_BORDER)
+  ((width) - HORIZONTAL_SCROLL_BAR_LEFT_BORDER - HORIZONTAL_SCROLL_BAR_RIGHT_BORDER)
 #define HORIZONTAL_SCROLL_BAR_INSIDE_HEIGHT(f, height)	\
   ((height) - HORIZONTAL_SCROLL_BAR_TOP_BORDER - HORIZONTAL_SCROLL_BAR_BOTTOM_BORDER)
 #define HORIZONTAL_SCROLL_BAR_LEFT_RANGE(f, width)	\
@@ -307,7 +307,6 @@ struct scroll_bar
 extern struct wlshm_display_info *x_display_list;
 
 extern struct wlshm_display_info *wlshm_term_init (Lisp_Object display_name);
-extern struct wlshm_display_info *check_x_display_info (Lisp_Object object);
 extern struct terminal *wlshm_create_terminal (struct wlshm_display_info *dpyinfo);
 extern void wlshm_delete_terminal (struct terminal *terminal);
 
@@ -348,10 +347,5 @@ extern void wlshm_glyph_string_colors (struct glyph_string *s, unsigned long *fg
 				      unsigned long *bg);
 extern bool wlshm_defined_color (struct frame *f, const char *name,
 				Emacs_Color *color, bool alloc, bool make_index);
-
-/* Backend Lisp functions called from the generic core (menu.c, xfaces.c).  */
-extern Lisp_Object Fx_hide_tip (void);
-extern Lisp_Object Fxw_display_color_p (Lisp_Object terminal);
-extern Lisp_Object Fx_display_grayscale_p (Lisp_Object terminal);
 
 #endif /* WLSHMTERM_H */

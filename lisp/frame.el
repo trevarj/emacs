@@ -3005,6 +3005,8 @@ If DISPLAY is omitted or nil, it defaults to the selected frame's display."
 		  (&optional terminal))
 (declare-function pgtk-display-monitor-attributes-list "pgtkfns.c"
 		  (&optional terminal))
+(declare-function wlshm-display-monitor-attributes-list "wlshmfns.c"
+		  (&optional terminal))
 (declare-function haiku-display-monitor-attributes-list "haikufns.c"
 		  (&optional terminal))
 (declare-function android-display-monitor-attributes-list "androidfns.c"

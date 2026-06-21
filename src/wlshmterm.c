@@ -116,7 +116,11 @@ static int wlshm_canvas_w, wlshm_canvas_h;
 static struct frame *
 wlshm_canvas_frame (void)
 {
-  if (wlshm_cur && FRAME_LIVE_P (wlshm_cur) && FRAME_WLSHM_P (wlshm_cur))
+  /* Also require FRAME_X_OUTPUT: during teardown a frame can be live but have
+     its output transiently freed, and wlshm_ensure_canvas would then deref a
+     NULL output.  Mirrors the selected-frame fallback check below.  */
+  if (wlshm_cur && FRAME_LIVE_P (wlshm_cur) && FRAME_WLSHM_P (wlshm_cur)
+      && FRAME_X_OUTPUT (wlshm_cur))
     return wlshm_cur;
   struct frame *sf = SELECTED_FRAME ();
   if (sf && FRAME_WLSHM_P (sf) && FRAME_X_OUTPUT (sf))
@@ -185,10 +189,30 @@ wlshm_ensure_canvas (void)
 	  o->canvas = NULL;
 	}
       o->canvas = cairo_image_surface_create (CAIRO_FORMAT_RGB24, pw, ph);
+      /* Cairo returns a nil surface (NULL data) at huge physical sizes or under
+	 wl_shm/memory pressure; bail rather than later memcpy'ing from NULL.  */
+      if (cairo_surface_status (o->canvas) != CAIRO_STATUS_SUCCESS)
+	{
+	  cairo_surface_destroy (o->canvas);
+	  o->canvas = NULL;
+	  wlshm_canvas = NULL;
+	  wlshm_cr = NULL;
+	  return;
+	}
       /* Device scale: logical coords -> physical pixels.  At scale 1.0 this is
 	 the identity, leaving the scale-1 output byte-identical.  */
       cairo_surface_set_device_scale (o->canvas, scale, scale);
       o->cr = cairo_create (o->canvas);
+      if (cairo_status (o->cr) != CAIRO_STATUS_SUCCESS)
+	{
+	  cairo_destroy (o->cr);
+	  o->cr = NULL;
+	  cairo_surface_destroy (o->canvas);
+	  o->canvas = NULL;
+	  wlshm_canvas = NULL;
+	  wlshm_cr = NULL;
+	  return;
+	}
       /* Sharp (non-antialiased) shape rasterization for fills/clips/rects.
 	 With a fractional device scale, AA'd rect/clip edges land on half
 	 physical pixels and bleed into faint outlines around glyph-cell
@@ -1305,18 +1329,34 @@ wlshm_scroll_run (struct window *w, struct run *run)
 	 these multiplications are the identity (byte-identical path).  */
       double dsx = 1.0, dsy = 1.0;
       cairo_surface_get_device_scale (wlshm_canvas, &dsx, &dsy);
-      x = (int) lround (x * dsx);
-      width = (int) lround (width * dsx);
-      from_y = (int) lround (from_y * dsy);
-      to_y = (int) lround (to_y * dsy);
-      height = (int) lround (height * dsy);
+      /* Round the box EDGES and difference them, rather than rounding each
+	 offset and extent independently: at a fractional scale the latter can
+	 drift 1px and leave a stale row/column.  At scale 1.0 this is the
+	 identity (byte-identical path).  */
+      int phys_x = (int) lround (x * dsx);
+      width = (int) lround ((x + width) * dsx) - phys_x;
+      int phys_from = (int) lround (from_y * dsy);
+      int phys_to = (int) lround (to_y * dsy);
+      height = (int) lround ((from_y + height) * dsy) - phys_from;
+      x = phys_x;
+      from_y = phys_from;
+      to_y = phys_to;
       /* Clamp the copy box to the canvas.  */
       if (x < 0)
 	x = 0;
       if (x + width > cw)
 	width = cw - x;
-      if (from_y < 0 || to_y < 0)
-	width = 0;
+      /* Clamp negative source/dest offsets to 0 and recompute height, so the
+	 later from_y/to_y + height clamps operate on valid bases (a negative
+	 base would otherwise mask a real overflow).  Advance both bases by the
+	 same deficit to keep source/dest rows aligned.  */
+      int top_deficit = max (max (-from_y, -to_y), 0);
+      if (top_deficit > 0)
+	{
+	  from_y += top_deficit;
+	  to_y += top_deficit;
+	  height -= top_deficit;
+	}
       if (from_y + height > ch)
 	height = ch - from_y;
       if (to_y + height > ch)
@@ -1476,22 +1516,27 @@ wlshm_draw_fringe_bitmap (struct window *w, struct glyph_row *row,
 
 	  cairo_surface_t *mask
 	    = cairo_image_surface_create (CAIRO_FORMAT_A1, fb->wd, fb->h);
-	  int stride = cairo_image_surface_get_stride (mask);
-	  unsigned char *data = cairo_image_surface_get_data (mask);
-	  for (int i = 0; i < fb->h; i++)
-	    *((unsigned short *) (data + i * stride)) = fb->bits[i];
-	  cairo_surface_mark_dirty (mask);
+	  /* Skip the bitmap if the mask surface couldn't be allocated (its data
+	     would be NULL); the row still renders, just without the indicator.  */
+	  if (cairo_surface_status (mask) == CAIRO_STATUS_SUCCESS)
+	    {
+	      int stride = cairo_image_surface_get_stride (mask);
+	      unsigned char *data = cairo_image_surface_get_data (mask);
+	      for (int i = 0; i < fb->h; i++)
+		*((unsigned short *) (data + i * stride)) = fb->bits[i];
+	      cairo_surface_mark_dirty (mask);
 
-	  cairo_save (wlshm_cr);
-	  /* Clip to the row's visible band so partial rows don't overflow.  */
-	  int clip_h = p->ny > 0 ? p->ny : fb->h;
-	  cairo_rectangle (wlshm_cr, p->x, p->y, fb->wd, clip_h);
-	  cairo_clip (wlshm_cr);
-	  cairo_set_source_rgb (wlshm_cr, r, g, b);
-	  /* Offset by -dh so visible rows [dh, dh+h) land at p->y (partial
-	     rows at window edges; dh is 0 in the common case).  */
-	  cairo_mask_surface (wlshm_cr, mask, p->x, p->y - p->dh);
-	  cairo_restore (wlshm_cr);
+	      cairo_save (wlshm_cr);
+	      /* Clip to the row's visible band so partial rows don't overflow.  */
+	      int clip_h = p->ny > 0 ? p->ny : fb->h;
+	      cairo_rectangle (wlshm_cr, p->x, p->y, fb->wd, clip_h);
+	      cairo_clip (wlshm_cr);
+	      cairo_set_source_rgb (wlshm_cr, r, g, b);
+	      /* Offset by -dh so visible rows [dh, dh+h) land at p->y (partial
+		 rows at window edges; dh is 0 in the common case).  */
+	      cairo_mask_surface (wlshm_cr, mask, p->x, p->y - p->dh);
+	      cairo_restore (wlshm_cr);
+	    }
 	  cairo_surface_destroy (mask);
 	}
     }
@@ -3753,8 +3798,21 @@ wlshm_render_menu (struct frame *f, struct wlshm_mrow *rows, int n, int hi,
   int phys_h = (int) lround (menu_h * scale);
   cairo_surface_t *s
     = cairo_image_surface_create (CAIRO_FORMAT_RGB24, phys_w, phys_h);
+  /* Bail on allocation failure (nil surface has NULL data); callers treat a
+     NULL return like the empty-menu case and skip presenting it.  */
+  if (cairo_surface_status (s) != CAIRO_STATUS_SUCCESS)
+    {
+      cairo_surface_destroy (s);
+      return NULL;
+    }
   cairo_surface_set_device_scale (s, scale, scale);
   cairo_t *cr = cairo_create (s);
+  if (cairo_status (cr) != CAIRO_STATUS_SUCCESS)
+    {
+      cairo_destroy (cr);
+      cairo_surface_destroy (s);
+      return NULL;
+    }
   /* Snap fills/clips/strokes to physical pixels (sharp at fractional scale);
      text uses cairo_show_text, which keeps the font's own AA.  */
   cairo_set_antialias (cr, CAIRO_ANTIALIAS_NONE);
@@ -3885,11 +3943,13 @@ wlshm_menu_modal_loop (struct frame *f, uint64_t pw,
 	    cairo_surface_destroy (surf);
 	  int tw, th, trh, tsh;
 	  surf = wlshm_render_menu (f, rows, n, hi, &tw, &th, &trh, &tsh);
-	  wlshm_window_present (pw, cairo_image_surface_get_data (surf),
-			       (uint32_t) cairo_image_surface_get_width (surf),
-			       (uint32_t) cairo_image_surface_get_height (surf),
-			       cairo_image_surface_get_stride (surf),
-			       0, 0, 0, 0);
+	  /* Skip presenting if the surface failed to allocate (NULL data).  */
+	  if (surf)
+	    wlshm_window_present (pw, cairo_image_surface_get_data (surf),
+				 (uint32_t) cairo_image_surface_get_width (surf),
+				 (uint32_t) cairo_image_surface_get_height (surf),
+				 cairo_image_surface_get_stride (surf),
+				 0, 0, 0, 0);
 	  need_draw = false;
 	}
       if (wlfd >= 0)
@@ -4059,6 +4119,9 @@ wlshm_menu_show (struct frame *f, int x, int y, int menuflags,
   int hi = wlshm_menu_first_selectable (rows, n);
   int mw, mh, rh, seph;
   cairo_surface_t *probe = wlshm_render_menu (f, rows, n, hi, &mw, &mh, &rh, &seph);
+  /* Bail if rendering failed: the geometry out-params are then unset.  */
+  if (!probe)
+    { wlshm_free_rows (rows, n); return Qnil; }
   cairo_surface_destroy (probe);	/* just for geometry */
 
   char *tc = STRINGP (title) ? SSDATA (ENCODE_UTF_8 (title)) : NULL;
@@ -4117,6 +4180,9 @@ wlshm_popup_dialog (struct frame *f, Lisp_Object header, Lisp_Object contents)
   int hi = wlshm_menu_first_selectable (rows, n);
   int mw, mh, rh, seph;
   cairo_surface_t *probe = wlshm_render_menu (f, rows, n, hi, &mw, &mh, &rh, &seph);
+  /* Bail if rendering failed: the geometry out-params are then unset.  */
+  if (!probe)
+    { wlshm_free_rows (rows, n); return Qnil; }
   cairo_surface_destroy (probe);
   uint64_t pw = wlshm_window_open (STRINGP (question) ? SSDATA (ENCODE_UTF_8 (question)) : NULL,
 				   WLSHM_FRAME_HANDLE (f), 1);
@@ -4295,6 +4361,10 @@ the test harness to prove menu rendering without the interactive loop.  */)
   int hi = FIXNUMP (highlight) ? XFIXNUM (highlight) : -1;
   int w, h, rh, sh;
   cairo_surface_t *s = wlshm_render_menu (f, rows, n, hi, &w, &h, &rh, &sh);
+  /* Render can fail to allocate its surface; report failure rather than
+     writing a NULL surface.  */
+  if (!s)
+    { wlshm_free_rows (rows, n); return Qnil; }
   cairo_status_t st
     = cairo_surface_write_to_png (s, SSDATA (ENCODE_FILE (file)));
   cairo_surface_destroy (s);

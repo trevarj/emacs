@@ -159,6 +159,14 @@ the data is inserted via `dnd-insert-text'."
 (defvar wlshm-preedit-overlay nil
   "Overlay showing the IME preedit (composition) text, or nil.")
 
+(defface wlshm-im-preedit
+  '((t :underline t))
+  "Face for input method preedit (composition) text.
+text-input-v3 only ever sends a single underlined segment, so this
+single reusable face covers the default styling.  Per-event color or
+underline overrides are layered on top via the `face' text property."
+  :group 'wlshm)
+
 (defun wlshm-preedit-text (event)
   "Display IME preedit text carried by EVENT.
 EVENT is a `preedit-text' event whose payload is a list of parts
@@ -168,12 +176,9 @@ EVENT is a `preedit-text' event whose payload is a list of parts
     (delete-overlay wlshm-preedit-overlay))
   (setq wlshm-preedit-overlay nil)
   (let ((ovstr "")
-        (idx 0)
-        atts str color face-name)
+        atts str color face)
     (dolist (part (nth 1 event))
       (setq str (car part))
-      (setq face-name (intern (format "wlshm-im-%d" idx)))
-      (eval `(defface ,face-name nil "Face of input method preedit." :group 'wlshm))
       (setq atts nil)
       (when (setq color (cdr-safe (assq 'fg (cdr part))))
         (setq atts (append atts `(:foreground ,color))))
@@ -182,10 +187,13 @@ EVENT is a `preedit-text' event whose payload is a list of parts
       (when (setq color (cdr-safe (assq 'ul (cdr part))))
         ;; `ul' may be t (use the face's default underline) or a color.
         (setq atts (append atts `(:underline ,color))))
-      (face-spec-set face-name `((t . ,atts)))
-      (add-text-properties 0 (length str) `(face ,face-name) str)
-      (setq ovstr (concat ovstr str))
-      (setq idx (1+ idx)))
+      ;; The `face' property accepts an attribute plist and a list of
+      ;; faces/plists.  Layer any per-event overrides on top of the
+      ;; reusable `wlshm-im-preedit' face instead of interning a fresh
+      ;; symbol and `eval'ing a `defface' on every keystroke.
+      (setq face (if atts (list atts 'wlshm-im-preedit) 'wlshm-im-preedit))
+      (add-text-properties 0 (length str) (list 'face face) str)
+      (setq ovstr (concat ovstr str)))
     (when (> (length ovstr) 0)
       (setq wlshm-preedit-overlay (make-overlay (point) (point)))
       (overlay-put wlshm-preedit-overlay 'before-string ovstr))))
