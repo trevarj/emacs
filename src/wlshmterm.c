@@ -4365,5 +4365,13 @@ syms_of_wlshmterm (void)
      doc: /* SKIP: real doc in xterm.c.  */);
   x_underline_at_descent_line = 0;
 
+  /* nil: this backend draws its own (non-toolkit) scroll bars.  Defining the
+     variable at all is what makes loadup.el preload scroll-bar.el, so
+     scroll-bar-mode and friends exist in the dumped image (they have no
+     autoload cookies; preloading is the only way they become available).  */
+  DEFVAR_LISP ("x-toolkit-scroll-bars", Vx_toolkit_scroll_bars,
+     doc: /* SKIP: real doc in xterm.c.  */);
+  Vx_toolkit_scroll_bars = Qnil;
+
   Fprovide (Qwlshm, Qnil);
 }
