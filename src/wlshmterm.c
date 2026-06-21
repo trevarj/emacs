@@ -3319,6 +3319,14 @@ wlshm_read_socket (struct terminal *terminal, struct input_event *hold_quit)
 	      {
 		dpyinfo->grabbed |= (1 << evs[i].button);
 		dpyinfo->last_mouse_frame = f;
+		/* The pointer is stationary at the press; clear any pending
+		   "moved" flag from gliding onto the target.  Otherwise the
+		   first event a down-mouse handler reads under `track-mouse'
+		   (e.g. widget-button-click) is a synthetic motion, which it
+		   treats as a drag and cancels -- so widget/custom buttons
+		   needed a second click.  A real drag re-sets mouse_moved on
+		   the next motion after the press.  */
+		f->mouse_moved = false;
 	      }
 	    else
 	      dpyinfo->grabbed &= ~(1 << evs[i].button);
