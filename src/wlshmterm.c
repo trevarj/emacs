@@ -4162,6 +4162,10 @@ wlshm_term_init (Lisp_Object display_name)
 					       Vdata_directory));
   dpyinfo->smallest_font_height = 1;
   dpyinfo->smallest_char_width = 1;
+  /* True-color depth: like pgtk.  A nonzero value (>= 2) also makes disabled
+     tool-bar images use the gray-fade path instead of a cross-out (the
+     monochrome n_planes < 2 fallback in image_disable_image).  */
+  dpyinfo->n_planes = 24;
   dpyinfo->resx = 96.0;
   dpyinfo->resy = 96.0;
   dpyinfo->scale = 1.0;
