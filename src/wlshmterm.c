@@ -3541,10 +3541,11 @@ wlshm_new_font (struct frame *f, Lisp_Object font_object, int fontset)
 /* not freeze).  menu_show_hook is synchronous and returns the chosen */
 /* item's value, exactly as the toolkit backends do.                  */
 /*                                                                    */
-/* Limitations (documented): the menu is shown as a single flat list  */
-/* (nested submenus are flattened with their pane headings); exact    */
-/* on-screen placement at (x,y) needs xdg-popup positioning (deferred */
-/* to M6) so the compositor currently places the undecorated popup.   */
+/* The popup is anchored at the requested frame-local (x,y) via an     */
+/* xdg_positioner (see make_positioner / wlshm_window_set_geometry),   */
+/* so menus open at the click/pointer just like the toolkit backends.  */
+/* Limitation (documented): the menu is shown as a single flat list    */
+/* (nested submenus are flattened with their pane headings).           */
 /* ------------------------------------------------------------------ */
 
 /* X keysyms we react to in the modal loop.  */
