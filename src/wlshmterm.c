@@ -971,9 +971,29 @@ wlshm_draw_image_glyph_string (struct glyph_string *s)
   if (s->slice.y + s->slice.height >= s->img->height)
     height -= box_line_vwidth;
 
-  if (height > s->slice.height
-      || s->img->hmargin || s->img->vmargin || s->img->mask
-      || s->img->pixmap == 0 || s->width != s->background_width)
+  /* Tool-bar button hover (RAISED) / press (SUNKEN): a clean flat tint over
+     the whole button cell instead of a 3D relief box tight around the icon,
+     matching the mode-line/menu-bar mouse-face hover.  Press is a touch
+     stronger than hover.  */
+  bool button_hl = (s->hl == DRAW_IMAGE_RAISED || s->hl == DRAW_IMAGE_SUNKEN);
+  if (button_hl)
+    {
+      double t = (s->hl == DRAW_IMAGE_SUNKEN
+		  ? WLSHM_HOVER_BLEND * 2.0 : WLSHM_HOVER_BLEND);
+      unsigned long tint = wlshm_blend_pixel (s->face->background,
+					      s->face->foreground, t);
+      float r, g, b;
+      wlshm_unpack_pixel (tint, &r, &g, &b);
+      wlshm_window_rect ((float) s->x, (float) s->y,
+			 (float) s->background_width, (float) s->height,
+			 r, g, b, 1.0f);
+      s->background_filled_p = true;
+    }
+
+  if (!s->background_filled_p
+      && (height > s->slice.height
+	  || s->img->hmargin || s->img->vmargin || s->img->mask
+	  || s->img->pixmap == 0 || s->width != s->background_width))
     {
       int x = s->x, y = s->y, width = s->background_width;
       if (s->first_glyph->left_box_line_p && s->slice.x == 0)
@@ -993,9 +1013,9 @@ wlshm_draw_image_glyph_string (struct glyph_string *s)
 
   wlshm_draw_image_foreground (s);
 
-  if (s->img->relief
-      || s->hl == DRAW_IMAGE_RAISED
-      || s->hl == DRAW_IMAGE_SUNKEN)
+  /* The flat tint replaces the relief for hover/press; an image with its own
+     :relief still gets one.  */
+  if (!button_hl && s->img->relief)
     wlshm_draw_image_relief (s);
 }
 
