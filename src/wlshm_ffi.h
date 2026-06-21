@@ -178,9 +178,20 @@ void wlshm_window_disarm_repeat(void);
 int wlshm_window_dispatch(void);
 
 /**
- * Integer output scale factor of window `win` (1 = default).
+ * Rounded integer scale factor of window `win` (1 = default).  Kept for
+ * callers (e.g. Emacs DPI/resolution) that want a plain integer; the precise
+ * fractional value is `wlshm_window_scale120`.
  */
 int wlshm_window_scale(uint64_t win);
+
+/**
+ * Scale factor of window `win` times 120 (the wp_fractional_scale_v1 unit).
+ * 120 == 1.0, 180 == 1.5x, 240 == 2.0x.  The C side multiplies the logical
+ * surface size by this/120 to size its physical-pixel Cairo canvas, and sets
+ * the Cairo device scale to this/120 so all drawing stays in logical
+ * coordinates yet rasterizes at physical resolution.
+ */
+uint32_t wlshm_window_scale120(uint64_t win);
 
 /**
  * Current size of window `win` in pixels, written to *w/*h.
