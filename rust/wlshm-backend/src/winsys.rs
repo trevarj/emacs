@@ -783,13 +783,42 @@ impl Backend {
         dmg_h: i32,
     ) {
         let Some(id) = self.resolve(win) else { return };
+        if src.is_null() {
+            return;
+        }
         // The window may have been torn down between resolve() and this lookup
         // (a close racing a present, e.g. via the menu modal loop or tooltip
         // force-present paths), so guard instead of unwrapping.
-        let Some(w) = self.state.windows.get_mut(&id) else { return };
-        if !w.configured || src.is_null() {
-            return;
+        let configured = match self.state.windows.get(&id) {
+            Some(w) => w.configured,
+            None => return,
+        };
+        if !configured {
+            // The surface is in the unconfigured xdg_surface state: it has
+            // either never been configured, or it was unmapped (wlshm_window_unmap
+            // commits a NULL buffer, which per xdg-shell returns the surface to
+            // the initial unconfigured state -- e.g. a child frame hidden and
+            // re-shown between completions).  Attaching a buffer now is
+            // xdg_surface error 3 (unconfigured_buffer) and the compositor kills
+            // us.  Re-enter the configure sequence: a buffer-less commit makes
+            // the compositor send a fresh configure (sctk acks it), flipping
+            // `configured` back to true.  Pending popups have no surface yet and
+            // are configured up front via make_popup, so they short-circuit here.
+            let Some(surface) = self.state.windows.get(&id).and_then(|w| w.wl_surface().cloned())
+            else {
+                return;
+            };
+            surface.commit();
+            let _ = self.conn.flush();
+            let _ = self.event_queue.roundtrip(&mut self.state);
+            let _ = self.event_queue.roundtrip(&mut self.state);
+            // Still unconfigured?  Bail; the frame is garbaged, so the next
+            // redisplay presents again and retries.
+            if !self.state.windows.get(&id).map(|w| w.configured).unwrap_or(false) {
+                return;
+            }
         }
+        let Some(w) = self.state.windows.get_mut(&id) else { return };
         // Size the buffer and copy from the SOURCE dimensions, NOT the window's
         // compositor-driven size.  The source (an Emacs frame canvas or a
         // fixed-size menu/tooltip surface) can differ from w.size: the
@@ -1822,9 +1851,13 @@ pub extern "C" fn wlshm_window_set_geometry(win: u64, x: c_int, y: c_int, w: c_i
                     b.reposition_popup(id, x, y, w, h);
                 }
                 _ => {
+                    // Toplevel: just record the requested size; the next present
+                    // allocates a buffer of that size.  `configured` is owned by
+                    // the real xdg configure handshake (and the remap path in
+                    // present()) -- faking it here would let present() commit a
+                    // buffer to an unconfigured surface (xdg_surface error 3).
                     if let Some(wl) = b.state.windows.get_mut(&id) {
                         wl.size = (w as u32, h as u32);
-                        wl.configured = true;
                     }
                 }
             }
@@ -1847,12 +1880,13 @@ pub extern "C" fn wlshm_window_set_size(win: u64, w: c_int, h: c_int) {
         |b| {
             let Some(id) = b.resolve(win) else { return };
             if let Some(wl) = b.state.windows.get_mut(&id) {
+                // Record the requested size only.  A Pending popup stays Pending
+                // (it becomes a real popup via wlshm_window_set_geometry).
+                // `configured` is owned by the xdg configure handshake and the
+                // remap path in present(); faking it here would let present()
+                // commit a buffer to an unconfigured surface (xdg_surface
+                // error 3, e.g. a child frame hidden and re-shown).
                 wl.size = (w as u32, h as u32);
-                // A Pending popup stays Pending; toplevels mark themselves
-                // configured so the next present allocates the new buffer.
-                if !matches!(wl.role, Role::Pending { .. }) {
-                    wl.configured = true;
-                }
             }
         },
         (),
@@ -1965,10 +1999,16 @@ pub extern "C" fn wlshm_window_unmap(win: u64) {
     with_backend(
         |b| {
             if let Some(id) = b.resolve(win) {
-                if let Some(w) = b.state.windows.get(&id) {
-                    let Some(surface) = w.wl_surface() else { return };
+                if let Some(w) = b.state.windows.get_mut(&id) {
+                    let Some(surface) = w.wl_surface().cloned() else { return };
                     surface.attach(None, 0, 0);
                     surface.commit();
+                    // Unmapping returns the surface to the unconfigured
+                    // xdg_surface state: a fresh configure is required before the
+                    // next buffer.  Clear `configured` so the remap path in
+                    // present() re-enters the configure sequence instead of
+                    // committing a buffer (xdg_surface error 3).
+                    w.configured = false;
                     let _ = b.conn.flush();
                 }
             }
