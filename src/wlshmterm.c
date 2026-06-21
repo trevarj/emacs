@@ -60,8 +60,8 @@ wlshm_log (const char *fmt, ...)
   if (!wlshm_log_enabled ())
     return;
   struct timespec t = current_timespec ();
-  fprintf (wlshm_log_fp, "[%ld.%03ld C] ", (long) t.tv_sec,
-	   (long) (t.tv_nsec / 1000000));
+  fprintf (wlshm_log_fp, "[%ld.%03ld C] ", t.tv_sec,
+	   t.tv_nsec / 1000000);
   va_list ap;
   va_start (ap, fmt);
   vfprintf (wlshm_log_fp, fmt, ap);
@@ -682,7 +682,12 @@ wlshm_draw_glyphless_glyph_string_foreground (struct glyph_string *s)
 
   for (i = 0; i < s->nchars; i++, glyph++)
     {
-      char buf[7];
+#ifdef GCC_LINT
+      enum { PACIFY_GCC_BUG_81401 = 1 };
+#else
+      enum { PACIFY_GCC_BUG_81401 = 0 };
+#endif
+      char buf[7 + PACIFY_GCC_BUG_81401];
       char *str = NULL;
       int len = glyph->u.glyphless.len;
 
@@ -2238,7 +2243,7 @@ wlshm_set_menu_bar_lines (struct frame *f, Lisp_Object value, Lisp_Object oldval
    gui_set_* are the shared generic handlers; the remaining NULLs are genuine
    Wayland-limitation no-ops (override-redirect, skip-taskbar, z-group, sticky,
    icon-name/type, mouse/border color) that the generic code tolerates.  */
-frame_parm_handler wlshm_frame_parm_handlers[] = {
+static frame_parm_handler wlshm_frame_parm_handlers[] = {
   gui_set_autoraise,
   gui_set_autolower,
   wlshm_set_background_color,
@@ -2482,9 +2487,9 @@ wlshm_blend_pixel (unsigned long a, unsigned long b, double t)
   float ar, ag, ab, br, bg, bb;
   wlshm_unpack_pixel (a, &ar, &ag, &ab);
   wlshm_unpack_pixel (b, &br, &bg, &bb);
-  int r = (int) ((ar + (br - ar) * t) * 255.0 + 0.5);
-  int g = (int) ((ag + (bg - ag) * t) * 255.0 + 0.5);
-  int bl = (int) ((ab + (bb - ab) * t) * 255.0 + 0.5);
+  int r = (int) (((double) ar + ((double) br - (double) ar) * t) * 255.0 + 0.5);
+  int g = (int) (((double) ag + ((double) bg - (double) ag) * t) * 255.0 + 0.5);
+  int bl = (int) (((double) ab + ((double) bb - (double) ab) * t) * 255.0 + 0.5);
   r = r < 0 ? 0 : (r > 255 ? 255 : r);
   g = g < 0 ? 0 : (g > 255 ? 255 : g);
   bl = bl < 0 ? 0 : (bl > 255 ? 255 : bl);
@@ -2596,6 +2601,7 @@ wlshm_scroll_bar_set_handle (struct scroll_bar *bar, int start, int end,
   struct frame *f = XFRAME (WINDOW_FRAME (XWINDOW (bar->window)));
   bool dragging = bar->dragging != -1;
   int top_range, length;
+  (void) f;			/* only consumed by macros that ignore it */
 
   if (!rebuild && start == bar->start && end == bar->end)
     return;
@@ -2924,6 +2930,7 @@ wlshm_scroll_bar_handle_click (struct scroll_bar *bar, int button, int mods,
 			       struct input_event *ie)
 {
   struct frame *f = XFRAME (WINDOW_FRAME (XWINDOW (bar->window)));
+  (void) f;			/* only consumed by macros that ignore it */
 
   EVENT_INIT (*ie);
   ie->kind = (bar->horizontal
@@ -3758,8 +3765,9 @@ wlshm_render_menu (struct frame *f, struct wlshm_mrow *rows, int n, int hi,
 	  if (hot)
 	    cairo_set_source_rgb (cr, 1, 1, 1);
 	  else if (rows[k].title)
-	    cairo_set_source_rgb (cr, fgr * 0.6 + 0.2, fgg * 0.6 + 0.2,
-				  fgb * 0.6 + 0.4);
+	    cairo_set_source_rgb (cr, (double) fgr * 0.6 + 0.2,
+				  (double) fgg * 0.6 + 0.2,
+				  (double) fgb * 0.6 + 0.4);
 	  else if (!rows[k].enabled)
 	    cairo_set_source_rgb (cr, (fgr + bgr) / 2, (fgg + bgg) / 2,
 				  (fgb + bgb) / 2);
