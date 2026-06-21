@@ -3036,6 +3036,12 @@ This inherits from the `tab-line' face."
      :inverse-video t)
     (((type x-toolkit))
      )
+    ;; wlshm draws its own menu bar (no toolkit), so give it a normal toolkit
+    ;; look instead of the plain-X inverse-video default.
+    (((type wlshm) (class color) (background light))
+     :background "grey90" :foreground "black")
+    (((type wlshm) (class color) (background dark))
+     :background "grey25" :foreground "white")
     (t
      :inverse-video t))
   "Basic face for the font and colors of the menu bar and popup menus."
