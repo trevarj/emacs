@@ -1,18 +1,17 @@
 /* Wayland + wlshm terminal backend for Emacs -- header.
 
 This file is part of a personal-fork experiment (see wlshm-backend-plan.md).
-The heavy lifting (Wayland, wlshm, glyph atlas, render thread) lives in the
-Rust crate rust/wlshm-backend; this C side is a thin shim that populates the
-redisplay interface + terminal hooks and forwards across the FFI declared in
+The Wayland windowing/event plumbing lives in the Rust crate
+rust/wlshm-backend; this C side holds the redisplay interface + terminal
+hooks and does the actual CPU Cairo drawing onto a persistent image-surface
+canvas, forwarding window/present calls across the FFI declared in
 wlshm_ffi.h.
 
 This header is the backend's TERM_HEADER: it is #included broadly across the
 generic C core, so it must fully define struct wlshm_output, struct
 wlshm_display_info, and the FRAME_* accessor macros the shared code expects.
 It mirrors the generic skeleton of pgtkterm.h but with backend-neutral types
-(no Gdk/Gtk/cairo) since the wlshm backend talks raw Wayland.
-
-M0/M1: scaffold; GUI fields are placeholders until the matching milestone.  */
+(no Gdk/Gtk/cairo) since the wlshm backend talks raw Wayland.  */
 
 #ifndef WLSHMTERM_H
 #define WLSHMTERM_H
@@ -28,7 +27,7 @@ M0/M1: scaffold; GUI fields are placeholders until the matching milestone.  */
 /* Generated from the Rust crate by cbindgen (see Makefile rule).  */
 #include "wlshm_ffi.h"
 
-/* Bitmap record, used by image.c bitmap handling.  M1+: real contents.  */
+/* Bitmap record, used by image.c bitmap handling.  */
 struct wlshm_bitmap_record
 {
   char *file;
@@ -119,7 +118,7 @@ struct wlshm_output
   unsigned long border_pixel;
 
   /* Scroll-bar colors (-1 = use the face/default).  Consumed by the
-     Emacs-drawn scroll bars (M2).  */
+     Emacs-drawn scroll bars.  */
   unsigned long scroll_bar_foreground_pixel;
   unsigned long scroll_bar_background_pixel;
 
@@ -168,11 +167,12 @@ struct wlshm_output
   /* The display this frame is on.  */
   struct wlshm_display_info *display_info;
 
-  /* Opaque handle (u64, cast) to the Rust-side window for this frame.  */
-  void *wlshm_frame;
+  /* Handle to the Rust-side window for this frame (0 if none yet).  The
+     Rust FFI uses uint64_t handles, so store it in its natural type.  */
+  uint64_t wlshm_frame;
 
-  /* Per-frame persistent Cairo software canvas (M3 multi-window): Emacs draws
-     here incrementally; frame_up_to_date copies it into a wl_shm buffer.  */
+  /* Per-frame persistent Cairo software canvas: Emacs draws here
+     incrementally; frame_up_to_date copies it into a wl_shm buffer.  */
   cairo_surface_t *canvas;
   cairo_t *cr;
   int canvas_w, canvas_h;
@@ -229,10 +229,15 @@ struct wlshm_output
 #define FRAME_TOOLBAR_WIDTH(f) \
   (FRAME_TOOLBAR_LEFT_WIDTH (f) + FRAME_TOOLBAR_RIGHT_WIDTH (f))
 
-/* Native window / display handles.  Opaque at this milestone.  */
+/* Native window handle.  Generic Emacs core never uses FRAME_X_WINDOW for
+   wlshm frames (all such uses live in X-only files: xterm.c, xmenu.c,
+   xselect.c, gtkutil.c, xwidget.c -- none compiled for this backend); the
+   only wlshm uses test it as an opaque boolean.  Generic code that needs a
+   window handle goes through FRAME_NATIVE_WINDOW (window_desc) instead.  So
+   define FRAME_X_WINDOW as the uint64_t handle field directly, no cast.  */
 #define FRAME_X_WINDOW(f)         (FRAME_X_OUTPUT (f)->wlshm_frame)
 /* The u64 Rust window handle for this frame (0 if none yet).  */
-#define WLSHM_FRAME_HANDLE(f)     ((uint64_t) (uintptr_t) FRAME_X_OUTPUT (f)->wlshm_frame)
+#define WLSHM_FRAME_HANDLE(f)     (FRAME_X_OUTPUT (f)->wlshm_frame)
 #define FRAME_NATIVE_WINDOW(f)    (FRAME_X_OUTPUT (f)->window_desc)
 #define FRAME_X_DISPLAY(f)        (FRAME_DISPLAY_INFO (f)->display)
 
@@ -314,7 +319,7 @@ extern void wlshm_delete_terminal (struct terminal *terminal);
 extern void syms_of_wlshmterm (void);
 extern void syms_of_wlshmfns (void);
 
-/* Cairo drawing onto the persistent software canvas (single-window model).
+/* Cairo drawing onto frame F's persistent software canvas.
    ftcrfont.c drives these to render glyphs; the RIF uses them for fills.  */
 extern cairo_t *wlshm_begin_cr_clip (struct frame *f);
 extern void wlshm_end_cr_clip (struct frame *f);

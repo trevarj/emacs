@@ -150,10 +150,21 @@ typedef struct ns_bitmap_record Bitmap_Record;
 typedef struct pgtk_bitmap_record Bitmap_Record;
 #endif /* HAVE_PGTK */
 
+/* The wlshm backend relies on Cairo for all image handling: the USE_CAIRO
+   code paths below (pixel containers, surface creation, cross-out drawing)
+   are what actually get compiled for wlshm.  Make that dependency explicit
+   so a misconfigured build fails loudly instead of silently degrading.  */
+#if defined HAVE_WLSHM && !defined USE_CAIRO
+# error "The wlshm backend requires Cairo (USE_CAIRO); image rendering depends on it."
+#endif
+
 #ifdef HAVE_WLSHM
 /* The wlshm backend keeps images as plain in-memory pixel containers (the
    same minimal struct USE_CAIRO uses), which it uploads to GPU textures at
-   draw time.  Pixel access is therefore pure buffer math.  */
+   draw time.  Pixel access is therefore pure buffer math.  The GET_PIXEL /
+   PUT_PIXEL / NO_PIXMAP / PIX_MASK_* / *_FROM_ULONG macros below are also
+   provided by the USE_CAIRO blocks above (with identical values); only the
+   Bitmap_Record typedef is unique to wlshm.  */
 typedef struct wlshm_bitmap_record Bitmap_Record;
 #define GET_PIXEL image_pix_context_get_pixel
 #define PUT_PIXEL image_pix_container_put_pixel
@@ -250,7 +261,7 @@ static HBITMAP w32_create_pixmap_from_bitmap_data (int, int, char *);
 static void anim_prune_animation_cache (Lisp_Object);
 #endif
 
-#if defined (USE_CAIRO) || defined (HAVE_WLSHM)
+#ifdef USE_CAIRO
 
 static Emacs_Pix_Container
 image_create_pix_container (unsigned int width, unsigned int height,
@@ -262,14 +273,10 @@ image_create_pix_container (unsigned int width, unsigned int height,
   pimg->width = width;
   pimg->height = height;
   pimg->bits_per_pixel = depth == 1 ? 8 : 32;
-#ifdef USE_CAIRO
   pimg->bytes_per_line = cairo_format_stride_for_width ((depth == 1
 							 ? CAIRO_FORMAT_A8
 							 : CAIRO_FORMAT_RGB24),
 							width);
-#else /* HAVE_WLSHM: 4-byte aligned rows (A8 padded, or 32bpp).  */
-  pimg->bytes_per_line = (depth == 1 ? ((width + 3) & ~3) : width * 4);
-#endif
   pimg->data = xmalloc (pimg->bytes_per_line * height);
 
   return pimg;
@@ -378,7 +385,7 @@ cr_put_image_to_cr_data (struct image *img)
 }
 #endif	/* USE_CAIRO */
 
-#endif	/* USE_CAIRO || HAVE_WLSHM */
+#endif	/* USE_CAIRO (wlshm builds always define USE_CAIRO) */
 
 #ifdef HAVE_NS
 /* Use with images created by ns_image_for_XPM.  */
@@ -1101,6 +1108,15 @@ image_create_bitmap_from_file (struct frame *f, Lisp_Object file)
 
   return id;
 #endif
+#endif
+
+#ifdef HAVE_WLSHM
+  /* The wlshm backend has no XBM-stipple bitmap loader: images are handled
+     through the Cairo pixel-container path, not via mono bitmap files.
+     Report failure (the documented -1 return) so callers fall back
+     gracefully.  */
+  ((void) dpyinfo);
+  return -1;
 #endif
 }
 
@@ -7290,11 +7306,6 @@ image_pixmap_draw_cross (struct frame *f, Emacs_Pixmap pixmap,
 #else
   emacs_abort ();
 #endif
-#elif defined HAVE_WLSHM
-  /* M1 stub: disabled-image cross-out is cosmetic; the wlshm glyph/image
-     drawing path lands in a later milestone.  */
-  (void) f; (void) pixmap; (void) x; (void) y;
-  (void) width; (void) height; (void) color;
 #endif
 }
 

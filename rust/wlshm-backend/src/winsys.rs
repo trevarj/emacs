@@ -1,8 +1,8 @@
 //! FFI-driven Wayland windows for Emacs (single-threaded, multi-window).
 //!
 //! Emacs owns the main loop; this exposes Wayland windows it drives explicitly.
-//! There is ONE Wayland connection multiplexing N surfaces (toplevels, and —
-//! from M4/M5 — popups/tooltips).  Connection-global state (seat, keyboard,
+//! There is ONE Wayland connection multiplexing N surfaces (toplevels and
+//! popups/tooltips).  Connection-global state (seat, keyboard,
 //! clipboard, cursor, key-repeat timer, the event queue) lives in `AppState`;
 //! per-surface state (the xdg `Window`, its `SlotPool`, size, scale) lives in a
 //! `WlWindow` keyed by an opaque `u64` handle the C side stores in
@@ -106,57 +106,6 @@ use crate::event::{WlshmEvent, WLSHM_MOD_ALT, WLSHM_MOD_CTRL, WLSHM_MOD_LOGO, WL
 // destroy for transient popups/tooltips while the connection is alive).
 thread_local! {
     static BACKEND: RefCell<Option<ManuallyDrop<Backend>>> = const { RefCell::new(None) };
-}
-
-/// Debug logging: enabled by the WLSHM_DEBUG env var, appended to
-/// /tmp/wlshm-debug.log (shared with the C side), flushed per line.
-#[allow(dead_code)]
-fn wlshm_dbg_on() -> bool {
-    thread_local! { static ON: std::cell::Cell<i8> = const { std::cell::Cell::new(-1) }; }
-    ON.with(|c| {
-        let v = c.get();
-        if v < 0 {
-            let on = std::env::var_os("WLSHM_DEBUG").is_some();
-            c.set(on as i8);
-            on
-        } else {
-            v == 1
-        }
-    })
-}
-
-#[allow(dead_code)]
-fn dbg_write(args: std::fmt::Arguments) {
-    if !wlshm_dbg_on() {
-        return;
-    }
-    use std::io::Write;
-    use std::time::{SystemTime, UNIX_EPOCH};
-    thread_local! {
-        static LOG: RefCell<Option<std::fs::File>> = const { RefCell::new(None) };
-    }
-    LOG.with(|cell| {
-        let mut slot = cell.borrow_mut();
-        if slot.is_none() {
-            *slot = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open("/tmp/wlshm-debug.log")
-                .ok();
-        }
-        if let Some(f) = slot.as_mut() {
-            let ts = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| format!("{}.{:03}", d.as_secs(), d.subsec_millis()))
-                .unwrap_or_else(|_| "0.000".into());
-            let _ = writeln!(f, "[{} rust] {}", ts, args);
-        }
-    });
-}
-
-#[allow(unused_macros)]
-macro_rules! dlog {
-    ($($a:tt)*) => { dbg_write(format_args!($($a)*)) };
 }
 
 /// MIME types we offer/accept for the text clipboard, in preference order.
@@ -563,10 +512,10 @@ impl Backend {
         };
         let id = self.state.next_id;
         self.state.next_id += 1;
-        // Popups/tooltips render at logical scale (scale120 == 120): they are
-        // small, fixed-size surfaces presented in logical pixels, so we don't
-        // attach a fractional-scale/viewport to them.  Toplevels (Emacs frames)
-        // get the HiDPI treatment below.
+        // Provisional scale until the surface is configured.  Popups/tooltips
+        // inherit their parent's scale and get a wp_viewport when promoted to an
+        // xdg_popup (see make_popup); toplevels (Emacs frames) get the HiDPI
+        // treatment below.
         let scale120 = 120;
 
         if (kind == 1 || kind == 2) && parent != 0 {
@@ -1844,7 +1793,7 @@ pub extern "C" fn wlshm_window_close(win: u64) {
     with_backend(|b| b.close_window(win), ());
 }
 
-// --- M6 stubs (signatures wired now to avoid a second FFI churn) -----------
+// --- Window geometry / positioning ----------------------------------------
 
 /// Set `win`'s geometry AND position.  For a Pending popup/tooltip this CREATES
 /// the xdg_popup anchored at (x,y) in the parent's geometry with content size

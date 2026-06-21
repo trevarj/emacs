@@ -1,11 +1,9 @@
-/* Definitions and headers for the wlshm (Wayland + GPU) backend.
+/* Definitions and headers for the wlshm (Wayland + wl_shm) backend.
 
 This file is part of a personal-fork experiment (see wlshm-backend-plan.md).
 It mirrors pgtkgui.h: it supplies the X-flavored type/aliases the generic
 display code still expects, but with backend-neutral handle types since the
-wlshm backend talks raw Wayland (no Gdk/Xlib).
-
-M0: scaffold.  */
+wlshm backend talks raw Wayland (no Gdk/Xlib).  */
 
 #ifndef __WLSHMGUI_H__
 #define __WLSHMGUI_H__

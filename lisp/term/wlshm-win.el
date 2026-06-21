@@ -19,8 +19,9 @@
 
 ;;; Commentary:
 
-;; Window-system glue for the experimental "wlshm" backend (raw Wayland +
-;; GPU rendering via Rust/FFI).  Mirrors term/pgtk-win.el: it registers the
+;; Window-system glue for the experimental "wlshm" backend (raw Wayland with
+;; CPU Cairo rendering presented via wl_shm; window/event plumbing in Rust over
+;; FFI).  Mirrors term/pgtk-win.el: it registers the
 ;; `wlshm' window system's initialization, argument handling and frame
 ;; creation.  See wlshm-backend-plan.md.
 
@@ -252,7 +253,8 @@ Scalable icons render at this size so the tool bar stays uniform; the
 device scale rasterizes them crisply."
   :type 'natnum
   :group 'wlshm
-  :version "31.1")
+  :version "31.1"
+  :set (lambda (sym val) (set-default sym val) (wlshm--icon-clear-caches)))
 
 (defconst wlshm--icon-name-map
   '(("new" . "document-new") ("open" . "document-open")
@@ -289,25 +291,35 @@ device scale rasterizes them crisply."
                 (when (file-directory-p h) (push h dirs)))
               (delete-dups (nreverse dirs))))))
 
+(defun wlshm--icon-theme-file (theme relpaths)
+  "Return the first readable <base>/THEME/REL file across the icon base-dirs.
+RELPATHS is a relative path string, or a list of them tried in order.
+For each base directory (in priority order) every relpath is tried before
+moving on to the next base, so base-dir priority dominates RELPATHS order."
+  (let ((rels (if (listp relpaths) relpaths (list relpaths))))
+    (catch 'hit
+      (dolist (base (wlshm--icon-base-dirs))
+        (dolist (rel rels)
+          (let ((path (expand-file-name (format "%s/%s" theme rel) base)))
+            (when (file-readable-p path) (throw 'hit path)))))
+      nil)))
+
 (defun wlshm--icon-theme-info (theme)
   "Return (SUBDIRS . INHERITS) parsed from THEME's index.theme, cached."
   (or (gethash theme wlshm--icon-theme-info)
       (puthash
        theme
-       (let (subdirs inherits)
-         (catch 'done
-           (dolist (base (wlshm--icon-base-dirs))
-             (let ((idx (expand-file-name (format "%s/index.theme" theme) base)))
-               (when (file-readable-p idx)
-                 (with-temp-buffer
-                   (insert-file-contents idx)
-                   (goto-char (point-min))
-                   (when (re-search-forward "^Directories=\\(.*\\)$" nil t)
-                     (setq subdirs (split-string (match-string 1) "," t)))
-                   (goto-char (point-min))
-                   (when (re-search-forward "^Inherits=\\(.*\\)$" nil t)
-                     (setq inherits (split-string (match-string 1) "," t))))
-                 (throw 'done nil)))))
+       (let ((idx (wlshm--icon-theme-file theme "index.theme"))
+             subdirs inherits)
+         (when idx
+           (with-temp-buffer
+             (insert-file-contents idx)
+             (goto-char (point-min))
+             (when (re-search-forward "^Directories=\\(.*\\)$" nil t)
+               (setq subdirs (split-string (match-string 1) "," t)))
+             (goto-char (point-min))
+             (when (re-search-forward "^Inherits=\\(.*\\)$" nil t)
+               (setq inherits (split-string (match-string 1) "," t)))))
          (cons subdirs inherits))
        wlshm--icon-theme-info)))
 
@@ -321,17 +333,21 @@ SEEN guards against inheritance cycles."
            (inherits (cdr info)))
       (or
        ;; Prefer symbolic (monochrome, uniform) SVGs, then scalable color ones;
-       ;; within each, prefer the NAME-symbolic spelling.
+       ;; within each, prefer the NAME-symbolic spelling.  The candidate order
+       ;; (preserved exactly) is, for each WANT then matching SUBDIR:
+       ;;   base0/NAME-symbolic.svg, base0/NAME.svg,
+       ;;   base1/NAME-symbolic.svg, base1/NAME.svg, ...
+       ;; i.e. base-dir priority dominates, suffix spelling tie-breaks.
        (catch 'hit
          (dolist (want '("symbolic" "scalable"))
            (dolist (subdir subdirs)
              (when (string-search want subdir)
-               (dolist (base (wlshm--icon-base-dirs))
-                 (dolist (cand
-                          (list (format "%s/%s/%s/%s-symbolic.svg"
-                                        base theme subdir name)
-                                (format "%s/%s/%s/%s.svg" base theme subdir name)))
-                   (when (file-readable-p cand) (throw 'hit cand)))))))
+               (let ((path (wlshm--icon-theme-file
+                            theme
+                            (mapcar (lambda (suffix)
+                                      (format "%s/%s%s" subdir name suffix))
+                                    '("-symbolic.svg" ".svg")))))
+                 (when path (throw 'hit path))))))
          nil)
        (catch 'hit
          (dolist (parent inherits)

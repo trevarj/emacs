@@ -1,10 +1,10 @@
 /* Wayland + wlshm terminal backend for Emacs -- terminal/redisplay shim.
 
 This wires the Emacs redisplay interface (RIF) and terminal hooks to the Rust
-backend over FFI (wlshm_ffi.h): RIF draw hooks record fills/glyphs via the
-frame-command API, and frame_up_to_date presents.  Single-threaded model
-(keyboard input is M3); structurally mirrors pgtkterm.c but holds no drawing
-logic of its own.  See wlshm-backend-plan.md.  */
+backend over FFI (wlshm_ffi.h): RIF draw hooks paint fills/glyphs with CPU
+Cairo onto a persistent image-surface canvas, and frame_up_to_date presents
+that canvas via wl_shm.  Single-threaded model; structurally mirrors
+pgtkterm.c.  See wlshm-backend-plan.md.  */
 
 #include <config.h>
 
@@ -75,7 +75,7 @@ wlshm_log (const char *fmt, ...)
    survives GC.  PIXEL is 0xRRGGBB, matching our pixel encoding.  */
 static Lisp_Object wlshm_color_map;
 
-/* Human-readable keysym name.  M3 stub (no keyboard yet).  */
+/* Human-readable keysym name.  Returns the keysym's decimal value.  */
 char *
 get_keysym_name (int keysym)
 {
@@ -100,7 +100,7 @@ wlshm_unpack_pixel (unsigned long pixel, float *r, float *g, float *b)
 /* frame_up_to_date copies it into a wl_shm buffer (wlshm_window_present).*/
 /* CAIRO_FORMAT_RGB24 == XRGB8888 (native-endian), which is exactly the  */
 /* wl_shm format we present, so the copy is a straight memcpy in Rust.   */
-/* Multi-window model (M3): the canvas/cr live per-frame in struct wlshm_output.
+/* Multi-window model: the canvas/cr live per-frame in struct wlshm_output.
    `wlshm_cur' names the frame currently being drawn; it is set at every RIF
    entry point (and by wlshm_begin_cr_clip).  The file-static wlshm_canvas /
    wlshm_cr below are convenience ALIASES that wlshm_ensure_canvas refreshes to
@@ -288,6 +288,15 @@ wlshm_window_rect (float x, float y, float w, float h,
 static unsigned long wlshm_blend_pixel (unsigned long a, unsigned long b,
 					double t);
 
+/* Solid rectangle fill in a packed pixel (defined later; used widely above its
+   definition).  */
+static void wlshm_fill_rect_pixel (int x, int y, int w, int h,
+				   unsigned long pixel);
+
+/* 1px-thick rectangle outline in a packed pixel (defined below).  */
+static void wlshm_draw_box_outline (unsigned long color, int x, int y,
+				    int w, int h);
+
 /* Strength of the mouse-face hover tint: how far the background is blended
    toward the foreground.  */
 #define WLSHM_HOVER_BLEND 0.18
@@ -303,11 +312,11 @@ wlshm_draw_mouse_face_bg (struct glyph_string *s, unsigned long bg,
 {
   int box_line = max (s->face->box_horizontal_line_width, 0);
   unsigned long tint = wlshm_blend_pixel (bg, fg, WLSHM_HOVER_BLEND);
-  float tr, tg, tb;
-  wlshm_unpack_pixel (tint, &tr, &tg, &tb);
-  wlshm_window_rect ((float) s->x, (float) (s->y + box_line),
-		     (float) s->background_width,
-		     (float) (s->height - 2 * box_line), tr, tg, tb, 1.0f);
+  /* A user box wider than half the line height makes height go negative; clamp
+     so we don't paint an inverted/oversized tint.  */
+  int fill_h = max (s->height - 2 * box_line, 0);
+  wlshm_fill_rect_pixel (s->x, s->y + box_line, s->background_width, fill_h,
+			 tint);
 }
 
 /* Cairo clip/source helpers used by ftcrfont.c for glyph drawing.  */
@@ -480,6 +489,21 @@ wlshm_relief_color (unsigned long p, double factor, int delta)
 	  | (unsigned long) (nb >> 8));
 }
 
+/* Draw a 1px-thick rectangle outline in COLOR as four edge rects: the top and
+   bottom edges span width W (at Y and Y+H), the left and right edges span
+   height H (at X and X+W).  Matches the open-coded outline idiom used for the
+   glyphless/composite "no font" boxes.  */
+static void
+wlshm_draw_box_outline (unsigned long color, int x, int y, int w, int h)
+{
+  float r, g, b;
+  wlshm_unpack_pixel (color, &r, &g, &b);
+  wlshm_window_rect ((float) x, (float) y, (float) w, 1.0f, r, g, b, 1.0f);
+  wlshm_window_rect ((float) x, (float) (y + h), (float) w, 1.0f, r, g, b, 1.0f);
+  wlshm_window_rect ((float) x, (float) y, 1.0f, (float) h, r, g, b, 1.0f);
+  wlshm_window_rect ((float) (x + w), (float) y, 1.0f, (float) h, r, g, b, 1.0f);
+}
+
 /* Draw the face box around glyph string S: a flat box for FACE_SIMPLE_BOX, or
    a 3D raised/sunken relief (light top/left, dark bottom/right, swapped when
    sunken) otherwise.  */
@@ -566,13 +590,8 @@ wlshm_draw_composite_glyph_string_foreground (struct glyph_string *s)
       /* Outline box for an unloadable composition.  */
       if (s->cmp_from == 0)
 	{
-	  float r, g, b;
-	  wlshm_unpack_pixel (s->face->foreground, &r, &g, &b);
 	  int w = s->width - 1, h = s->height - 1;
-	  wlshm_window_rect ((float) x, (float) s->y, (float) w, 1.0f, r, g, b, 1.0f);
-	  wlshm_window_rect ((float) x, (float) (s->y + h), (float) w, 1.0f, r, g, b, 1.0f);
-	  wlshm_window_rect ((float) x, (float) s->y, 1.0f, (float) h, r, g, b, 1.0f);
-	  wlshm_window_rect ((float) (x + w), (float) s->y, 1.0f, (float) h, r, g, b, 1.0f);
+	  wlshm_draw_box_outline (s->face->foreground, x, s->y, w, h);
 	}
     }
   else if (!s->first_glyph->u.cmp.automatic)
@@ -701,9 +720,6 @@ wlshm_draw_glyphless_glyph_string_foreground (struct glyph_string *s)
 
   s->char2b = char2b;
 
-  float fr, fg_, fb;
-  wlshm_unpack_pixel (s->face->foreground, &fr, &fg_, &fb);
-
   for (i = 0; i < s->nchars; i++, glyph++)
     {
 #ifdef GCC_LINT
@@ -761,10 +777,7 @@ wlshm_draw_glyphless_glyph_string_foreground (struct glyph_string *s)
 	  /* Outline box.  */
 	  int bx = x, by = s->ybase - glyph->ascent;
 	  int bw = glyph->pixel_width - 1, bh = glyph->ascent + glyph->descent - 1;
-	  wlshm_window_rect ((float) bx, (float) by, (float) bw, 1.0f, fr, fg_, fb, 1.0f);
-	  wlshm_window_rect ((float) bx, (float) (by + bh), (float) bw, 1.0f, fr, fg_, fb, 1.0f);
-	  wlshm_window_rect ((float) bx, (float) by, 1.0f, (float) bh, fr, fg_, fb, 1.0f);
-	  wlshm_window_rect ((float) (bx + bw), (float) by, 1.0f, (float) bh, fr, fg_, fb, 1.0f);
+	  wlshm_draw_box_outline (s->face->foreground, bx, by, bw, bh);
 	}
       x += glyph->pixel_width;
     }
@@ -1006,11 +1019,7 @@ wlshm_draw_image_glyph_string (struct glyph_string *s)
 		  ? WLSHM_HOVER_BLEND * 2.0 : WLSHM_HOVER_BLEND);
       unsigned long tint = wlshm_blend_pixel (s->face->background,
 					      s->face->foreground, t);
-      float r, g, b;
-      wlshm_unpack_pixel (tint, &r, &g, &b);
-      wlshm_window_rect ((float) s->x, (float) s->y,
-			 (float) s->background_width, (float) s->height,
-			 r, g, b, 1.0f);
+      wlshm_fill_rect_pixel (s->x, s->y, s->background_width, s->height, tint);
       s->background_filled_p = true;
     }
 
@@ -1028,10 +1037,7 @@ wlshm_draw_image_glyph_string (struct glyph_string *s)
       if (s->slice.y == 0)
 	y += box_line_vwidth;
 
-      float r, g, b;
-      wlshm_unpack_pixel (s->xgcv.background, &r, &g, &b);
-      wlshm_window_rect ((float) x, (float) y, (float) width, (float) height,
-			 r, g, b, 1.0f);
+      wlshm_fill_rect_pixel (x, y, width, height, s->xgcv.background);
       s->background_filled_p = true;
     }
 
@@ -1072,15 +1078,17 @@ wlshm_draw_glyph_string (struct glyph_string *s)
 	if (!s->background_filled_p && !s->for_overlaps)
 	  {
 	    int box_line = max (s->face->box_horizontal_line_width, 0);
-	    float r, g, b;
-	    wlshm_unpack_pixel (bg, &r, &g, &b);
 	    block_input ();
 	    if (s->hl == DRAW_MOUSE_FACE)
 	      wlshm_draw_mouse_face_bg (s, bg, fg);
 	    else
-	      wlshm_window_rect ((float) s->x, (float) (s->y + box_line),
-				(float) s->background_width,
-				(float) (s->height - 2 * box_line), r, g, b, 1.0f);
+	      {
+		/* Clamp: a box wider than half the line makes height negative,
+		   painting an inverted/oversized fill.  */
+		int fill_h = max (s->height - 2 * box_line, 0);
+		wlshm_fill_rect_pixel (s->x, s->y + box_line,
+				       s->background_width, fill_h, bg);
+	      }
 	    unblock_input ();
 	    s->background_filled_p = true;
 	  }
@@ -1112,11 +1120,8 @@ wlshm_draw_glyph_string (struct glyph_string *s)
 	  {
 	    unsigned long oc = (s->face->overline_color_defaulted_p
 				? fg : s->face->overline_color);
-	    float r, g, b;
-	    wlshm_unpack_pixel (oc, &r, &g, &b);
 	    block_input ();
-	    wlshm_window_rect ((float) s->x, (float) s->y, (float) s->width,
-			      1.0f, r, g, b, 1.0f);
+	    wlshm_fill_rect_pixel (s->x, s->y, s->width, 1, oc);
 	    unblock_input ();
 	  }
 
@@ -1128,11 +1133,8 @@ wlshm_draw_glyph_string (struct glyph_string *s)
 	    int dy = (glyph_h - 1) / 2;
 	    unsigned long sc = (s->face->strike_through_color_defaulted_p
 				? fg : s->face->strike_through_color);
-	    float r, g, b;
-	    wlshm_unpack_pixel (sc, &r, &g, &b);
 	    block_input ();
-	    wlshm_window_rect ((float) s->x, (float) (glyph_y + dy),
-			      (float) s->width, 1.0f, r, g, b, 1.0f);
+	    wlshm_fill_rect_pixel (s->x, glyph_y + dy, s->width, 1, sc);
 	    unblock_input ();
 	  }
       }
@@ -1146,15 +1148,17 @@ wlshm_draw_glyph_string (struct glyph_string *s)
 	   instead of leaving a gap in the outline.  Mirrors the CHAR_GLYPH
 	   path and pgtk_draw_stretch_glyph_string.  */
 	int box_line = max (s->face->box_horizontal_line_width, 0);
-	float r, g, b;
-	wlshm_unpack_pixel (bg, &r, &g, &b);
 	block_input ();
 	if (s->hl == DRAW_MOUSE_FACE)
 	  wlshm_draw_mouse_face_bg (s, bg, fg);
 	else
-	  wlshm_window_rect ((float) s->x, (float) (s->y + box_line),
-			    (float) s->background_width,
-			    (float) (s->height - 2 * box_line), r, g, b, 1.0f);
+	  {
+	    /* Clamp: a box wider than half the line makes height negative,
+	       painting an inverted/oversized fill.  */
+	    int fill_h = max (s->height - 2 * box_line, 0);
+	    wlshm_fill_rect_pixel (s->x, s->y + box_line,
+				   s->background_width, fill_h, bg);
+	  }
 	unblock_input ();
 	if (!s->for_overlaps && s->hl != DRAW_MOUSE_FACE)
 	  wlshm_draw_glyph_string_box (s);
@@ -1166,12 +1170,8 @@ wlshm_draw_glyph_string (struct glyph_string *s)
 	/* Background, then the box + hex/acronym.  */
 	if (!s->background_filled_p && !s->for_overlaps)
 	  {
-	    float r, g, b;
-	    wlshm_unpack_pixel (bg, &r, &g, &b);
 	    block_input ();
-	    wlshm_window_rect ((float) s->x, (float) s->y,
-			      (float) s->background_width, (float) s->height,
-			      r, g, b, 1.0f);
+	    wlshm_fill_rect_pixel (s->x, s->y, s->background_width, s->height, bg);
 	    unblock_input ();
 	    s->background_filled_p = true;
 	  }
@@ -1199,11 +1199,8 @@ static void
 wlshm_clear_frame_area (struct frame *f, int x, int y, int width, int height)
 {
   wlshm_cur = f;
-  float r, g, b;
-  wlshm_unpack_pixel (FRAME_BACKGROUND_PIXEL (f), &r, &g, &b);
   block_input ();
-  wlshm_window_rect ((float) x, (float) y, (float) width, (float) height,
-		    r, g, b, 1.0f);
+  wlshm_fill_rect_pixel (x, y, width, height, FRAME_BACKGROUND_PIXEL (f));
   unblock_input ();
 }
 
@@ -1260,13 +1257,13 @@ wlshm_draw_window_cursor (struct window *w, struct glyph_row *glyph_row,
 	else if (cursor_type == BAR_CURSOR)
 	  {
 	    int bw = cursor_width > 0 ? cursor_width : 2;
-	    wlshm_window_rect ((float) gx, (float) gy, (float) bw, (float) gh, r, g, b, 1.0f);
+	    wlshm_fill_rect_pixel (gx, gy, bw, gh, FRAME_CURSOR_COLOR (f));
 	  }
 	else /* HBAR_CURSOR */
 	  {
 	    int bh = cursor_width > 0 ? cursor_width : 2;
-	    wlshm_window_rect ((float) gx, (float) (gy + gh - bh), (float) wd,
-			      (float) bh, r, g, b, 1.0f);
+	    wlshm_fill_rect_pixel (gx, gy + gh - bh, wd, bh,
+				   FRAME_CURSOR_COLOR (f));
 	  }
 	unblock_input ();
       }
@@ -1277,9 +1274,10 @@ wlshm_draw_window_cursor (struct window *w, struct glyph_row *glyph_row,
     }
 }
 
-/* Shift an already-rendered region of the window up/down on the GPU's
-   persistent texture, so redisplay only has to repaint the newly-exposed
-   lines.  Mirrors pgtk_scroll_run (sans xwidgets).  */
+/* Shift an already-rendered region of the window up/down on the persistent
+   Cairo canvas (a CPU memmove of the image-surface pixels), so redisplay only
+   has to repaint the newly-exposed lines.  Mirrors pgtk_scroll_run (sans
+   xwidgets).  */
 static void
 wlshm_scroll_run (struct window *w, struct run *run)
 {
@@ -1412,8 +1410,8 @@ static void wlshm_flush_display (struct frame *f) {}
 
 /* Fringe bitmaps (continuation/truncation arrows, empty-line and buffer
    boundary indicators).  We keep the raw bits (copied at define time, since
-   define may run before the window/atlas exists) and lazily rasterize them
-   into the glyph atlas on first draw.  */
+   define may run before the window exists) and lazily rasterize them onto the
+   canvas with Cairo on first draw.  */
 struct wlshm_fringe_bmp
 {
   unsigned short *bits;
@@ -1486,10 +1484,7 @@ wlshm_draw_fringe_bitmap (struct window *w, struct glyph_row *row,
   if (p->bx >= 0 && !p->overlay_p && p->nx > 0 && p->ny > 0)
     {
       unsigned long bg = face ? face->background : FRAME_BACKGROUND_PIXEL (f);
-      float r, g, b;
-      wlshm_unpack_pixel (bg, &r, &g, &b);
-      wlshm_window_rect ((float) p->bx, (float) p->by, (float) p->nx,
-			(float) p->ny, r, g, b, 1.0f);
+      wlshm_fill_rect_pixel (p->bx, p->by, p->nx, p->ny, bg);
     }
 
   /* The bitmap itself: build a 1-bit cairo mask from the row words and
@@ -1668,11 +1663,11 @@ wlshm_hide_hourglass (struct frame *f)
 }
 
 /* ------------------------------------------------------------------ */
-/* Frame lifecycle hooks (M6).                                        */
+/* Frame lifecycle hooks.                                             */
 /* ------------------------------------------------------------------ */
 
 /* delete_frame_hook: destroy F's Wayland surface and Cairo canvas.  Without
-   this the surface leaks until process exit (M3 left it deferred).  */
+   this the surface leaks until process exit.  */
 static void
 wlshm_destroy_window (struct frame *f)
 {
@@ -1716,7 +1711,7 @@ wlshm_destroy_window (struct frame *f)
       uint64_t h = WLSHM_FRAME_HANDLE (f);
       if (h)
 	wlshm_window_close (h);
-      o->wlshm_frame = NULL;
+      o->wlshm_frame = 0;
     }
 
   unblock_input ();
@@ -2062,24 +2057,38 @@ wlshm_set_internal_border_width (struct frame *f, Lisp_Object arg,
     }
 }
 
-/* Frame parameter: scroll-bar-foreground.  Store the pixel (used by the
-   Emacs-drawn scroll bars in M2); nil = use the default.  */
+/* Shared handler for the scroll-bar-foreground/-background frame parameters:
+   resolve NEW_VALUE into *PIXEL (-1 for nil = use the default) and refresh the
+   face named by PARM.  ERRNAME names the parameter for the "Invalid ..." error.
+   */
 static void
-wlshm_set_scroll_bar_foreground (struct frame *f, Lisp_Object new_value,
-				 Lisp_Object old_value)
+wlshm_set_scroll_bar_color (struct frame *f, Lisp_Object new_value,
+			    unsigned long *pixel, Lisp_Object parm,
+			    const char *errname)
 {
   if (NILP (new_value))
-    FRAME_X_OUTPUT (f)->scroll_bar_foreground_pixel = -1;
+    *pixel = -1;
   else if (STRINGP (new_value))
     {
       Emacs_Color color;
       if (!wlshm_defined_color (f, SSDATA (new_value), &color, true, false))
 	error ("Unknown color");
-      FRAME_X_OUTPUT (f)->scroll_bar_foreground_pixel = color.pixel;
+      *pixel = color.pixel;
     }
   else
-    error ("Invalid scroll-bar-foreground");
-  update_face_from_frame_parameter (f, Qscroll_bar_foreground, new_value);
+    error ("Invalid %s", errname);
+  update_face_from_frame_parameter (f, parm, new_value);
+}
+
+/* Frame parameter: scroll-bar-foreground.  Store the pixel (used by the
+   Emacs-drawn scroll bars); nil = use the default.  */
+static void
+wlshm_set_scroll_bar_foreground (struct frame *f, Lisp_Object new_value,
+				 Lisp_Object old_value)
+{
+  wlshm_set_scroll_bar_color (f, new_value,
+			      &FRAME_X_OUTPUT (f)->scroll_bar_foreground_pixel,
+			      Qscroll_bar_foreground, "scroll-bar-foreground");
 }
 
 /* Frame parameter: scroll-bar-background.  As above for the trough.  */
@@ -2087,18 +2096,9 @@ static void
 wlshm_set_scroll_bar_background (struct frame *f, Lisp_Object new_value,
 				 Lisp_Object old_value)
 {
-  if (NILP (new_value))
-    FRAME_X_OUTPUT (f)->scroll_bar_background_pixel = -1;
-  else if (STRINGP (new_value))
-    {
-      Emacs_Color color;
-      if (!wlshm_defined_color (f, SSDATA (new_value), &color, true, false))
-	error ("Unknown color");
-      FRAME_X_OUTPUT (f)->scroll_bar_background_pixel = color.pixel;
-    }
-  else
-    error ("Invalid scroll-bar-background");
-  update_face_from_frame_parameter (f, Qscroll_bar_background, new_value);
+  wlshm_set_scroll_bar_color (f, new_value,
+			      &FRAME_X_OUTPUT (f)->scroll_bar_background_pixel,
+			      Qscroll_bar_background, "scroll-bar-background");
 }
 
 /* Frame parameter: undecorated.  Drop/add server-side window decorations.  */
@@ -2401,17 +2401,15 @@ static void
 wlshm_clear_frame (struct frame *f)
 {
   wlshm_cur = f;
-  float r, g, b;
-  wlshm_unpack_pixel (FRAME_BACKGROUND_PIXEL (f), &r, &g, &b);
   /* Clear at least the whole surface: the frame is sized to fill it exactly,
      but if a configure has been received and the frame not yet resized the
      surface could momentarily be larger -- cover it so no stale pixels show.  */
   uint32_t sw = 0, sh = 0;
   wlshm_window_size (WLSHM_FRAME_HANDLE (f), &sw, &sh);
-  float w = (float) max ((int) sw, FRAME_PIXEL_WIDTH (f));
-  float h = (float) max ((int) sh, FRAME_PIXEL_HEIGHT (f));
+  int w = max ((int) sw, FRAME_PIXEL_WIDTH (f));
+  int h = max ((int) sh, FRAME_PIXEL_HEIGHT (f));
   block_input ();
-  wlshm_window_rect (0.0f, 0.0f, w, h, r, g, b, 1.0f);
+  wlshm_fill_rect_pixel (0, 0, w, h, FRAME_BACKGROUND_PIXEL (f));
   unblock_input ();
 }
 
@@ -2456,9 +2454,7 @@ wlshm_frame_up_to_date (struct frame *f)
   unblock_input ();
 }
 
-/* Drain Wayland events.  M2: only window lifecycle (configure/close); keyboard
-   input is M3.  */
-/* Find a live wlshm frame on TERMINAL (M2: there is a single one).  */
+/* Find a live wlshm frame on TERMINAL.  */
 static struct frame *
 wlshm_any_frame (struct terminal *terminal)
 {
@@ -2734,32 +2730,53 @@ wlshm_scroll_bar_remove (struct scroll_bar *bar)
   unblock_input ();
 }
 
+/* Shared implementation of the vertical/horizontal scroll-bar hooks.  The two
+   axes differ only in: the window_box query, which scroll-bar area macros give
+   the strip geometry, the per-axis *_RANGE macro, the bar's existing-bar slot
+   (vertical_scroll_bar vs horizontal_scroll_bar), and the wset accessor.  */
 static void
-wlshm_set_vertical_scroll_bar (struct window *w, int portion, int whole,
-			       int position)
+wlshm_set_scroll_bar (struct window *w, int portion, int whole, int position,
+		      bool horizontal)
 {
   struct frame *f = XFRAME (w->frame);
   Lisp_Object barobj;
   struct scroll_bar *bar;
-  int top, height, left, width, window_y, window_height;
+  int top, height, left, width;
 
-  window_box (w, ANY_AREA, 0, &window_y, 0, &window_height);
-  top = window_y;
-  height = window_height;
-  left = WINDOW_SCROLL_BAR_AREA_X (w);
-  width = WINDOW_SCROLL_BAR_AREA_WIDTH (w);
+  if (horizontal)
+    {
+      int window_x, window_width;
+      window_box (w, ANY_AREA, &window_x, 0, &window_width, 0);
+      left = window_x;
+      width = window_width;
+      top = WINDOW_SCROLL_BAR_AREA_Y (w);
+      height = WINDOW_SCROLL_BAR_AREA_HEIGHT (w);
+    }
+  else
+    {
+      int window_y, window_height;
+      window_box (w, ANY_AREA, 0, &window_y, 0, &window_height);
+      top = window_y;
+      height = window_height;
+      left = WINDOW_SCROLL_BAR_AREA_X (w);
+      width = WINDOW_SCROLL_BAR_AREA_WIDTH (w);
+    }
 
-  if (NILP (w->vertical_scroll_bar))
+  Lisp_Object existing
+    = horizontal ? w->horizontal_scroll_bar : w->vertical_scroll_bar;
+  if (NILP (existing))
     {
       if (width > 0 && height > 0)
 	wlshm_fill_rect_pixel (left, top, width, height,
 			       FRAME_BACKGROUND_PIXEL (f));
-      bar = wlshm_scroll_bar_create (w, top, left, width, max (height, 1),
-				     false);
+      /* The vertical bar clamps its allocated height to at least 1.  */
+      bar = wlshm_scroll_bar_create (w, top, left, width,
+				     horizontal ? height : max (height, 1),
+				     horizontal);
     }
   else
     {
-      bar = XSCROLL_BAR (w->vertical_scroll_bar);
+      bar = XSCROLL_BAR (existing);
       if (left != bar->left || top != bar->top
 	  || width != bar->width || height != bar->height)
 	{
@@ -2774,13 +2791,15 @@ wlshm_set_vertical_scroll_bar (struct window *w, int portion, int whole,
 
   if (bar->dragging == -1)
     {
-      int top_range = VERTICAL_SCROLL_BAR_TOP_RANGE (f, height);
+      int range = (horizontal
+		   ? HORIZONTAL_SCROLL_BAR_LEFT_RANGE (f, width)
+		   : VERTICAL_SCROLL_BAR_TOP_RANGE (f, height));
       if (whole == 0)
-	wlshm_scroll_bar_set_handle (bar, 0, top_range, true);
+	wlshm_scroll_bar_set_handle (bar, 0, range, true);
       else
 	{
-	  int start = ((double) position * top_range) / whole;
-	  int end = ((double) (position + portion) * top_range) / whole;
+	  int start = ((double) position * range) / whole;
+	  int end = ((double) (position + portion) * range) / whole;
 	  wlshm_scroll_bar_set_handle (bar, start, end, true);
 	}
     }
@@ -2788,63 +2807,24 @@ wlshm_set_vertical_scroll_bar (struct window *w, int portion, int whole,
     wlshm_scroll_bar_redraw (bar);
 
   XSETVECTOR (barobj, bar);
-  wset_vertical_scroll_bar (w, barobj);
+  if (horizontal)
+    wset_horizontal_scroll_bar (w, barobj);
+  else
+    wset_vertical_scroll_bar (w, barobj);
+}
+
+static void
+wlshm_set_vertical_scroll_bar (struct window *w, int portion, int whole,
+			       int position)
+{
+  wlshm_set_scroll_bar (w, portion, whole, position, false);
 }
 
 static void
 wlshm_set_horizontal_scroll_bar (struct window *w, int portion, int whole,
 				 int position)
 {
-  struct frame *f = XFRAME (w->frame);
-  Lisp_Object barobj;
-  struct scroll_bar *bar;
-  int top, height, left, width, window_x, window_width;
-
-  window_box (w, ANY_AREA, &window_x, 0, &window_width, 0);
-  left = window_x;
-  width = window_width;
-  top = WINDOW_SCROLL_BAR_AREA_Y (w);
-  height = WINDOW_SCROLL_BAR_AREA_HEIGHT (w);
-
-  if (NILP (w->horizontal_scroll_bar))
-    {
-      if (width > 0 && height > 0)
-	wlshm_fill_rect_pixel (left, top, width, height,
-			       FRAME_BACKGROUND_PIXEL (f));
-      bar = wlshm_scroll_bar_create (w, top, left, width, height, true);
-    }
-  else
-    {
-      bar = XSCROLL_BAR (w->horizontal_scroll_bar);
-      if (left != bar->left || top != bar->top
-	  || width != bar->width || height != bar->height)
-	{
-	  wlshm_fill_rect_pixel (bar->left, bar->top, bar->width, bar->height,
-				 FRAME_BACKGROUND_PIXEL (f));
-	  bar->left = left;
-	  bar->top = top;
-	  bar->width = width;
-	  bar->height = height;
-	}
-    }
-
-  if (bar->dragging == -1)
-    {
-      int left_range = HORIZONTAL_SCROLL_BAR_LEFT_RANGE (f, width);
-      if (whole == 0)
-	wlshm_scroll_bar_set_handle (bar, 0, left_range, true);
-      else
-	{
-	  int start = ((double) position * left_range) / whole;
-	  int end = ((double) (position + portion) * left_range) / whole;
-	  wlshm_scroll_bar_set_handle (bar, start, end, true);
-	}
-    }
-  else
-    wlshm_scroll_bar_redraw (bar);
-
-  XSETVECTOR (barobj, bar);
-  wset_horizontal_scroll_bar (w, barobj);
+  wlshm_set_scroll_bar (w, portion, whole, position, true);
 }
 
 /* Condemn all of FRAME's scroll bars (port of XTcondemn_scroll_bars).  */
@@ -2988,15 +2968,62 @@ wlshm_scroll_bar_at (struct frame *f, int x, int y)
   return NULL;
 }
 
+/* Classify the pointer at frame-relative (PX,PY) against BAR's handle.  Stores
+   the axis-local position (clamped to [0, range]) in *POS_OUT and the axis range
+   in *RANGE_OUT, and returns the scroll-bar part under the pointer.  The active
+   axis (and therefore which coordinate, border and part names are used) follows
+   BAR->horizontal.  */
+static enum scroll_bar_part
+wlshm_scroll_bar_part_at (struct scroll_bar *bar, int px, int py,
+			  int *pos_out, int *range_out)
+{
+  struct frame *f = XFRAME (WINDOW_FRAME (XWINDOW (bar->window)));
+  (void) f;			/* only consumed by macros that ignore it */
+  int range, pos;
+  enum scroll_bar_part part;
+
+  if (bar->horizontal)
+    {
+      range = HORIZONTAL_SCROLL_BAR_LEFT_RANGE (f, bar->width);
+      pos = px - bar->left - HORIZONTAL_SCROLL_BAR_LEFT_BORDER;
+      if (pos < 0)
+	pos = 0;
+      if (pos > range)
+	pos = range;
+      if (pos < bar->start)
+	part = scroll_bar_before_handle;
+      else if (pos < bar->end + HORIZONTAL_SCROLL_BAR_MIN_HANDLE)
+	part = scroll_bar_horizontal_handle;
+      else
+	part = scroll_bar_after_handle;
+    }
+  else
+    {
+      range = VERTICAL_SCROLL_BAR_TOP_RANGE (f, bar->height);
+      pos = py - bar->top - VERTICAL_SCROLL_BAR_TOP_BORDER;
+      if (pos < 0)
+	pos = 0;
+      if (pos > range)
+	pos = range;
+      if (pos < bar->start)
+	part = scroll_bar_above_handle;
+      else if (pos < bar->end + VERTICAL_SCROLL_BAR_MIN_HANDLE)
+	part = scroll_bar_handle;
+      else
+	part = scroll_bar_below_handle;
+    }
+
+  *pos_out = pos;
+  *range_out = range;
+  return part;
+}
+
 /* Fill IE for a click on BAR (port of x_scroll_bar_handle_click).  */
 static void
 wlshm_scroll_bar_handle_click (struct scroll_bar *bar, int button, int mods,
 			       int px, int py, bool press,
 			       struct input_event *ie)
 {
-  struct frame *f = XFRAME (WINDOW_FRAME (XWINDOW (bar->window)));
-  (void) f;			/* only consumed by macros that ignore it */
-
   EVENT_INIT (*ie);
   ie->kind = (bar->horizontal
 	      ? HORIZONTAL_SCROLL_BAR_CLICK_EVENT
@@ -3006,20 +3033,11 @@ wlshm_scroll_bar_handle_click (struct scroll_bar *bar, int button, int mods,
   ie->frame_or_window = bar->window;
   ie->arg = Qnil;
 
+  int pos, range;
+  ie->part = wlshm_scroll_bar_part_at (bar, px, py, &pos, &range);
+
   if (bar->horizontal)
     {
-      int left_range = HORIZONTAL_SCROLL_BAR_LEFT_RANGE (f, bar->width);
-      int x = px - bar->left - HORIZONTAL_SCROLL_BAR_LEFT_BORDER;
-      if (x < 0)
-	x = 0;
-      if (x > left_range)
-	x = left_range;
-      if (x < bar->start)
-	ie->part = scroll_bar_before_handle;
-      else if (x < bar->end + HORIZONTAL_SCROLL_BAR_MIN_HANDLE)
-	ie->part = scroll_bar_horizontal_handle;
-      else
-	ie->part = scroll_bar_after_handle;
       if (!press && bar->dragging != -1)
 	{
 	  int new_start = -bar->dragging;
@@ -3027,32 +3045,20 @@ wlshm_scroll_bar_handle_click (struct scroll_bar *bar, int button, int mods,
 	  wlshm_scroll_bar_set_handle (bar, new_start, new_end, false);
 	  bar->dragging = -1;
 	}
-      XSETINT (ie->x, left_range);
-      XSETINT (ie->y, x);
+      XSETINT (ie->x, range);
+      XSETINT (ie->y, pos);
     }
   else
     {
-      int top_range = VERTICAL_SCROLL_BAR_TOP_RANGE (f, bar->height);
-      int y = py - bar->top - VERTICAL_SCROLL_BAR_TOP_BORDER;
-      if (y < 0)
-	y = 0;
-      if (y > top_range)
-	y = top_range;
-      if (y < bar->start)
-	ie->part = scroll_bar_above_handle;
-      else if (y < bar->end + VERTICAL_SCROLL_BAR_MIN_HANDLE)
-	ie->part = scroll_bar_handle;
-      else
-	ie->part = scroll_bar_below_handle;
       if (!press && bar->dragging != -1)
 	{
-	  int new_start = y - bar->dragging;
+	  int new_start = pos - bar->dragging;
 	  int new_end = new_start + bar->end - bar->start;
 	  wlshm_scroll_bar_set_handle (bar, new_start, new_end, false);
 	  bar->dragging = -1;
 	}
-      XSETINT (ie->x, y);
-      XSETINT (ie->y, top_range);
+      XSETINT (ie->x, pos);
+      XSETINT (ie->y, range);
     }
 }
 
@@ -3099,40 +3105,10 @@ wlshm_scroll_bar_report_motion (struct frame **fp, Lisp_Object *bar_window,
   *fp = f;
   *bar_window = bar->window;
 
-  if (bar->horizontal)
-    {
-      int left_range = HORIZONTAL_SCROLL_BAR_LEFT_RANGE (f, bar->width);
-      int pos = px - bar->left - HORIZONTAL_SCROLL_BAR_LEFT_BORDER;
-      if (pos < 0)
-	pos = 0;
-      if (pos > left_range)
-	pos = left_range;
-      if (pos < bar->start)
-	*part = scroll_bar_before_handle;
-      else if (pos < bar->end + HORIZONTAL_SCROLL_BAR_MIN_HANDLE)
-	*part = scroll_bar_horizontal_handle;
-      else
-	*part = scroll_bar_after_handle;
-      XSETINT (*x, pos);
-      XSETINT (*y, left_range);
-    }
-  else
-    {
-      int top_range = VERTICAL_SCROLL_BAR_TOP_RANGE (f, bar->height);
-      int pos = py - bar->top - VERTICAL_SCROLL_BAR_TOP_BORDER;
-      if (pos < 0)
-	pos = 0;
-      if (pos > top_range)
-	pos = top_range;
-      if (pos < bar->start)
-	*part = scroll_bar_above_handle;
-      else if (pos < bar->end + VERTICAL_SCROLL_BAR_MIN_HANDLE)
-	*part = scroll_bar_handle;
-      else
-	*part = scroll_bar_below_handle;
-      XSETINT (*x, pos);
-      XSETINT (*y, top_range);
-    }
+  int pos, range;
+  *part = wlshm_scroll_bar_part_at (bar, px, py, &pos, &range);
+  XSETINT (*x, pos);
+  XSETINT (*y, range);
 
   *timestamp = dpyinfo->last_mouse_movement_time;
   f0->mouse_moved = false;
@@ -3155,8 +3131,8 @@ wlshm_read_socket (struct terminal *terminal, struct input_event *hold_quit)
 
   for (int i = 0; f && i < nev; i++)
     {
-      /* Route this event to the frame whose window it belongs to (M3
-	 multi-window); fall back to any frame for window-less events.  */
+      /* Route this event to the frame whose window it belongs to;
+	 fall back to any frame for window-less events.  */
       struct frame *ef = wlshm_frame_for_handle (terminal, evs[i].window);
       /* If the event names a window with no live Emacs frame -- a menu/tooltip
 	 popup (Rust-only surface) or a frame deleted since the event was
@@ -3561,7 +3537,7 @@ wlshm_get_focus_frame (struct frame *f)
   return lisp_focus;
 }
 
-/* Warp the pointer.  M3 stub (no pointer warping yet).  */
+/* Warp the pointer.  Not implemented (no pointer warping).  */
 void
 frame_set_mouse_pixel_position (struct frame *f, int pix_x, int pix_y)
 {
@@ -3657,7 +3633,7 @@ wlshm_new_font (struct frame *f, Lisp_Object font_object, int fontset)
 }
 
 /* ------------------------------------------------------------------ */
-/* M4: popup menus and dialogs.                                       */
+/* Popup menus and dialogs.                                           */
 /*                                                                    */
 /* No toolkit: a menu/dialog is drawn directly onto a dedicated popup */
 /* Wayland window's Cairo surface (using the parent frame's scaled    */
@@ -4250,7 +4226,7 @@ wlshm_create_terminal (struct wlshm_display_info *dpyinfo)
      empty-line and buffer-boundary indicators).  */
   gui_init_fringe (terminal->rif);
 
-  /* Frame lifecycle (M6).  */
+  /* Frame lifecycle.  */
   terminal->delete_frame_hook = wlshm_destroy_window;
   terminal->frame_visible_invisible_hook = wlshm_make_frame_visible_invisible;
   terminal->iconify_frame_hook = wlshm_iconify_frame;
