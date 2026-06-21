@@ -834,7 +834,10 @@ impl Backend {
         dmg_h: i32,
     ) {
         let Some(id) = self.resolve(win) else { return };
-        let w = self.state.windows.get_mut(&id).unwrap();
+        // The window may have been torn down between resolve() and this lookup
+        // (a close racing a present, e.g. via the menu modal loop or tooltip
+        // force-present paths), so guard instead of unwrapping.
+        let Some(w) = self.state.windows.get_mut(&id) else { return };
         if !w.configured || src.is_null() {
             return;
         }
