@@ -47,7 +47,6 @@ DEFUN ("x-create-frame", Fx_create_frame, Sx_create_frame, 1, 1, 0,
 {
   struct frame *f;
   Lisp_Object frame, tem, name;
-  bool minibuffer_only = false;
   Lisp_Object display;
   struct wlshm_display_info *dpyinfo;
   struct kboard *kb;
@@ -78,10 +77,7 @@ DEFUN ("x-create-frame", Fx_create_frame, Sx_create_frame, 1, 1, 0,
   if (EQ (tem, Qnone) || NILP (tem))
     f = make_frame_without_minibuffer (Qnil, kb, display);
   else if (EQ (tem, Qonly))
-    {
-      f = make_minibuffer_frame ();
-      minibuffer_only = true;
-    }
+    f = make_minibuffer_frame ();
   else if (WINDOWP (tem))
     f = make_frame_without_minibuffer (tem, kb, display);
   else
@@ -197,7 +193,7 @@ DEFUN ("x-create-frame", Fx_create_frame, Sx_create_frame, 1, 1, 0,
     uint64_t win = wlshm_window_open (NULL, 0, 0);
     if (win == 0)
       error ("wlshm: cannot open a Wayland window (is WAYLAND_DISPLAY set?)");
-    FRAME_X_OUTPUT (f)->wlshm_frame = (void *) (uintptr_t) win;
+    FRAME_X_OUTPUT (f)->wlshm_frame = (void *) win;
   }
 
   /* Pick an initial size; the compositor's configure (delivered via
@@ -583,7 +579,7 @@ wlshm_create_tip_frame (struct wlshm_display_info *dpyinfo, Lisp_Object parms,
 	delete_frame (frame, Qnoelisp);
 	error ("wlshm: cannot open a tooltip window");
       }
-    FRAME_X_OUTPUT (f)->wlshm_frame = (void *) (uintptr_t) win;
+    FRAME_X_OUTPUT (f)->wlshm_frame = (void *) win;
   }
 
   FRAME_DISPLAY_INFO (f)->reference_count++;
