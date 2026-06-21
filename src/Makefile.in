@@ -325,8 +325,8 @@ W32_LIBS=@W32_LIBS@
 PGTK_OBJ=@PGTK_OBJ@
 PGTK_LIBS=@PGTK_LIBS@
 
-## wlshm (Rust Wayland + GPU) backend: C shim objects, the Rust staticlib, and
-## its link line.  All empty unless configured --with-wlshm.
+## wlshm (Rust Wayland + CPU Cairo-on-wl_shm) backend: C shim objects, the Rust
+## staticlib, and its link line.  All empty unless configured --with-wlshm.
 WLSHM_OBJ=@WLSHM_OBJ@
 WLSHM_LIBS=@WLSHM_LIBS@
 WLSHM_STATICLIB=@WLSHM_STATICLIB@
@@ -711,14 +711,7 @@ endif
 ## existence when setting Vinstallation_directory (FIXME?).
 ## This goes on to affect various things, and the emacs binary fails
 ## to start if Vinstallation_directory has the wrong value.
-## Build the Rust wlshm backend staticlib (rust/wlshm-backend) before linking.
-## Inert unless configured --with-wlshm (WLSHM_STATICLIB empty otherwise).
-ifneq ($(WLSHM_STATICLIB),)
-$(WLSHM_STATICLIB): FORCE
-	$(CARGO) build --release --manifest-path $(WLSHM_CARGO_DIR)/Cargo.toml
-endif
-
-temacs$(EXEEXT): $(LIBXMENU) $(ALLOBJS) $(WLSHM_STATICLIB) $(LIBEGNU_ARCHIVE) $(EMACSRES) \
+temacs$(EXEEXT): $(LIBXMENU) $(ALLOBJS) $(LIBEGNU_ARCHIVE) $(EMACSRES) \
   $(charsets) $(charscript) ${emoji-zwj} $(MAKE_PDUMPER_FINGERPRINT)
 ifeq ($(HAVE_BE_APP),yes)
 	$(AM_V_CXXLD)$(CXX) -o $@.tmp \
@@ -996,3 +989,25 @@ endif
 check-syntax:
 	$(AM_V_CC)$(CC) -c $(CPPFLAGS) $(ALL_CFLAGS) ${CHK_SOURCES} || true
 .PHONY: check-syntax
+
+### wlshm backend: Rust staticlib build + link ordering.
+##
+## Kept in a separate trailing stanza (rather than edited into the upstream
+## temacs recipe) so rebases onto upstream do not conflict on that hot line.
+##
+## Everything here is inert unless configured --with-wlshm: WLSHM_STATICLIB is
+## empty otherwise, the ifneq guard drops the build rule, and an empty
+## order-only prerequisite list is a no-op.
+ifneq ($(WLSHM_STATICLIB),)
+
+## Cargo tracks its own incremental rebuilds, so force the rule every time and
+## let cargo decide whether a relink-worthy artifact actually changed.
+$(WLSHM_STATICLIB): FORCE
+	$(CARGO) build --release --manifest-path $(WLSHM_CARGO_DIR)/Cargo.toml
+
+## Order-only (|): guarantee the staticlib exists before temacs is linked
+## (LIBES references it via WLSHM_LIBS), without forcing a temacs relink merely
+## because cargo touched the archive's mtime.
+temacs$(EXEEXT): | $(WLSHM_STATICLIB)
+
+endif
