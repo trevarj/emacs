@@ -179,6 +179,13 @@ wlshm_ensure_canvas (void)
 	 the identity, leaving the scale-1 output byte-identical.  */
       cairo_surface_set_device_scale (o->canvas, scale, scale);
       o->cr = cairo_create (o->canvas);
+      /* Sharp (non-antialiased) shape rasterization for fills/clips/rects.
+	 With a fractional device scale, AA'd rect/clip edges land on half
+	 physical pixels and bleed into faint outlines around glyph-cell
+	 backgrounds and the cursor.  Glyphs use cairo_show_glyphs (the scaled
+	 font's own AA), so text stays smooth.  At scale 1.0 (integer coords)
+	 this is byte-identical to the AA default.  */
+      cairo_set_antialias (o->cr, CAIRO_ANTIALIAS_NONE);
       o->canvas_w = pw;
       o->canvas_h = ph;
     }
