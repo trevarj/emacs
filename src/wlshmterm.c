@@ -3659,9 +3659,24 @@ wlshm_render_menu (struct frame *f, struct wlshm_mrow *rows, int n, int hi,
   wlshm_unpack_pixel (FRAME_BACKGROUND_PIXEL (f), &bgr, &bgg, &bgb);
   wlshm_unpack_pixel (FRAME_FOREGROUND_PIXEL (f), &fgr, &fgg, &fgb);
 
+  /* HiDPI: the popup inherits its parent frame's scale (set in make_popup).
+     Render onto a PHYSICAL-pixel surface with a matching device scale so the
+     drawing below stays in logical coordinates; the popup's wp_viewport maps
+     this physical buffer back down to the logical menu_w x menu_h geometry.
+     Byte-identical at scale 1.0.  */
+  uint32_t scale120 = wlshm_window_scale120 (WLSHM_FRAME_HANDLE (f));
+  if (scale120 < 120)
+    scale120 = 120;
+  double scale = (double) scale120 / 120.0;
+  int phys_w = (int) lround (menu_w * scale);
+  int phys_h = (int) lround (menu_h * scale);
   cairo_surface_t *s
-    = cairo_image_surface_create (CAIRO_FORMAT_RGB24, menu_w, menu_h);
+    = cairo_image_surface_create (CAIRO_FORMAT_RGB24, phys_w, phys_h);
+  cairo_surface_set_device_scale (s, scale, scale);
   cairo_t *cr = cairo_create (s);
+  /* Snap fills/clips/strokes to physical pixels (sharp at fractional scale);
+     text uses cairo_show_text, which keeps the font's own AA.  */
+  cairo_set_antialias (cr, CAIRO_ANTIALIAS_NONE);
   /* Background + border.  */
   cairo_set_source_rgb (cr, bgr, bgg, bgb);
   cairo_paint (cr);

@@ -680,6 +680,9 @@ impl Backend {
         popup.reposition(&positioner, self.state.reposition_token);
         if let Some(wl) = self.state.windows.get_mut(&id) {
             wl.size = (w.max(1) as u32, h.max(1) as u32);
+            if let Some(vp) = wl.viewport.as_ref() {
+                vp.set_destination(w.max(1), h.max(1));
+            }
         }
         // Pump the reposition/configure round-trip so the new geometry is in
         // effect before the C side presents the next buffer.
@@ -722,9 +725,25 @@ impl Backend {
         }
         let sid = popup.wl_surface().id();
         self.state.surface_to_id.insert(sid, id);
+        // HiDPI: a popup lives on the same output as its parent, so it shares the
+        // parent's scale.  Inherit it directly (the parent's scale has already
+        // settled) and give the popup a wp_viewport that maps its physical-pixel
+        // buffer down to the LOGICAL geometry the positioner uses.  The C side
+        // reads wlshm_window_scale120(pw) and renders the menu / tip canvas at
+        // physical resolution; without this the compositor upscales a logical
+        // buffer and popups look soft at fractional scale.
+        let parent_scale = self.state.windows.get(&parent_id)
+            .map(|p| p.scale120).unwrap_or(120).max(120);
+        let popup_vp = self.state.viewporter.as_ref()
+            .map(|vp| vp.get_viewport(popup.wl_surface(), &self.qh, ()));
+        if let Some(vp) = popup_vp.as_ref() {
+            vp.set_destination(w.max(1), h.max(1));
+        }
         if let Some(wl) = self.state.windows.get_mut(&id) {
             wl.role = Role::Popup(popup);
             wl.size = (w.max(1) as u32, h.max(1) as u32);
+            wl.scale120 = parent_scale;
+            wl.viewport = popup_vp;
             wl.configured = false;
         }
         // Pump the initial popup configure so the surface is configured before
@@ -1045,6 +1064,12 @@ impl PopupHandler for AppState {
         if let Some(w) = self.windows.get_mut(&id) {
             if config.width > 0 && config.height > 0 {
                 w.size = (config.width as u32, config.height as u32);
+            }
+            // Keep the viewport mapping the physical buffer down to the LOGICAL
+            // geometry the compositor just assigned (HiDPI; no-op at scale 1).
+            if let Some(vp) = w.viewport.as_ref() {
+                let (lw, lh) = w.size;
+                vp.set_destination(lw.max(1) as i32, lh.max(1) as i32);
             }
             w.configured = true;
         }
