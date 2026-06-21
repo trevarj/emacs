@@ -2739,6 +2739,14 @@ be available."
   (or (eq (framep-on-display display) 'android)
       (display-mouse-p display)))
 
+(defun frame--graphical-display-type-p (frame-type)
+  "Return non-nil if FRAME-TYPE is a graphical window-system frame type.
+FRAME-TYPE is a value as returned by `framep' or `framep-on-display'.
+This is the single canonical membership set for the various
+`display-*' predicates below that dispatch the same way for every
+graphical window system; keep new graphical backends listed here only."
+  (and (memq frame-type '(x w32 ns haiku pgtk android wlshm)) t))
+
 (defun display-graphic-p (&optional display)
   "Return non-nil if DISPLAY is a graphic display.
 Graphical displays are those which are capable of displaying several
@@ -2746,8 +2754,8 @@ frames and several different fonts at once.  This is true for displays
 that use a window system such as X, and false for text-only terminals.
 DISPLAY can be a display name, a frame, or nil (meaning the selected
 frame's display)."
-  (not (null (memq (framep-on-display display) '(x w32 ns pgtk haiku
-                                                   android wlshm)))))
+  ;; Membership lives in `frame--graphical-display-type-p'.
+  (frame--graphical-display-type-p (framep-on-display display)))
 
 (defun display-images-p (&optional display)
   "Return non-nil if DISPLAY can display images.
@@ -2812,7 +2820,8 @@ DISPLAY should be either a frame or a display name (a string).
 If DISPLAY is omitted or nil, it defaults to the selected frame's display."
   (let ((frame-type (framep-on-display display)))
     (cond
-     ((memq frame-type '(x w32 ns haiku pgtk android wlshm))
+     ;; Membership lives in `frame--graphical-display-type-p'.
+     ((frame--graphical-display-type-p frame-type)
       (x-display-screens display))
      (t
       1))))
@@ -2833,7 +2842,8 @@ with DISPLAY.  To get information for each physical monitor, use
 `display-monitor-attributes-list'."
   (let ((frame-type (framep-on-display display)))
     (cond
-     ((memq frame-type '(x w32 ns haiku pgtk android wlshm))
+     ;; Membership lives in `frame--graphical-display-type-p'.
+     ((frame--graphical-display-type-p frame-type)
       (x-display-pixel-height display))
      (t
       (tty-display-pixel-height display)))))
@@ -2854,7 +2864,8 @@ with DISPLAY.  To get information for each physical monitor, use
 `display-monitor-attributes-list'."
   (let ((frame-type (framep-on-display display)))
     (cond
-     ((memq frame-type '(x w32 ns haiku pgtk android wlshm))
+     ;; Membership lives in `frame--graphical-display-type-p'.
+     ((frame--graphical-display-type-p frame-type)
       (x-display-pixel-width display))
      (t
       (tty-display-pixel-width display)))))
@@ -2892,7 +2903,8 @@ For graphical terminals, note that on \"multi-monitor\" setups this
 refers to the height in millimeters for all physical monitors
 associated with DISPLAY.  To get information for each physical
 monitor, use `display-monitor-attributes-list'."
-  (and (memq (framep-on-display display) '(x w32 ns haiku pgtk android wlshm))
+  ;; Membership lives in `frame--graphical-display-type-p'.
+  (and (frame--graphical-display-type-p (framep-on-display display))
        (or (cddr (assoc (or display (frame-parameter nil 'display))
 			display-mm-dimensions-alist))
 	   (cddr (assoc t display-mm-dimensions-alist))
@@ -2913,7 +2925,8 @@ For graphical terminals, note that on \"multi-monitor\" setups this
 refers to the width in millimeters for all physical monitors
 associated with DISPLAY.  To get information for each physical
 monitor, use `display-monitor-attributes-list'."
-  (and (memq (framep-on-display display) '(x w32 ns haiku pgtk android wlshm))
+  ;; Membership lives in `frame--graphical-display-type-p'.
+  (and (frame--graphical-display-type-p (framep-on-display display))
        (or (cadr (assoc (or display (frame-parameter nil 'display))
 			display-mm-dimensions-alist))
 	   (cadr (assoc t display-mm-dimensions-alist))
@@ -2931,7 +2944,8 @@ DISPLAY can be a display name or a frame.
 If DISPLAY is omitted or nil, it defaults to the selected frame's display."
   (let ((frame-type (framep-on-display display)))
     (cond
-     ((memq frame-type '(x w32 ns haiku pgtk android wlshm))
+     ;; Membership lives in `frame--graphical-display-type-p'.
+     ((frame--graphical-display-type-p frame-type)
       (x-display-backing-store display))
      (t
       'not-useful))))
@@ -2944,7 +2958,8 @@ DISPLAY can be a display name or a frame.
 If DISPLAY is omitted or nil, it defaults to the selected frame's display."
   (let ((frame-type (framep-on-display display)))
     (cond
-     ((memq frame-type '(x w32 ns haiku pgtk android wlshm))
+     ;; Membership lives in `frame--graphical-display-type-p'.
+     ((frame--graphical-display-type-p frame-type)
       (x-display-save-under display))
      (t
       'not-useful))))
@@ -2957,7 +2972,8 @@ DISPLAY can be a display name or a frame.
 If DISPLAY is omitted or nil, it defaults to the selected frame's display."
   (let ((frame-type (framep-on-display display)))
     (cond
-     ((memq frame-type '(x w32 ns haiku pgtk android wlshm))
+     ;; Membership lives in `frame--graphical-display-type-p'.
+     ((frame--graphical-display-type-p frame-type)
       (x-display-planes display))
      ((eq frame-type 'pc)
       4)
@@ -2972,7 +2988,8 @@ DISPLAY can be a display name or a frame.
 If DISPLAY is omitted or nil, it defaults to the selected frame's display."
   (let ((frame-type (framep-on-display display)))
     (cond
-     ((memq frame-type '(x w32 ns haiku pgtk android wlshm))
+     ;; Membership lives in `frame--graphical-display-type-p'.
+     ((frame--graphical-display-type-p frame-type)
       (x-display-color-cells display))
      ((eq frame-type 'pc)
       16)
@@ -2989,7 +3006,8 @@ DISPLAY can be a display name or a frame.
 If DISPLAY is omitted or nil, it defaults to the selected frame's display."
   (let ((frame-type (framep-on-display display)))
     (cond
-     ((memq frame-type '(x w32 ns haiku pgtk android wlshm))
+     ;; Membership lives in `frame--graphical-display-type-p'.
+     ((frame--graphical-display-type-p frame-type)
       (x-display-visual-class display))
      ((and (memq frame-type '(pc t))
 	   (tty-display-color-p display))

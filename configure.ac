@@ -2689,6 +2689,18 @@ if test "${ANDROID}" != "yes"; then
   fi
 fi
 
+dnl Single point of truth for "the wlshm backend wants the GUI image/font
+dnl libraries" (PNG, JPEG, TIFF, GIF, cairo, freetype, fontconfig, harfbuzz,
+dnl rsvg, ...).  wlshm renders CPU Cairo on wl_shm and thus pulls in the same
+dnl image/text stack as the other graphical backends.  Gate the library checks
+dnl below on this one variable so the intent lives in exactly one place and is
+dnl not re-appended to every detection chain (a recurring rebase-conflict
+dnl source).  Set it now that ${window_system} is finalized.
+wlshm_gui=no
+if test "${window_system}" = "wlshm"; then
+  wlshm_gui=yes
+fi
+
 LD_SWITCH_X_SITE_RPATH=
 if test "${x_libraries}" != NONE; then
   if test -n "${x_libraries}"; then
@@ -3555,7 +3567,7 @@ HAVE_RSVG=no
 if test "${HAVE_X11}" = "yes" || test "${HAVE_NS}" = "yes" \
    || test "${opsys}" = "mingw32" || test "${HAVE_BE_APP}" = "yes" \
    || test "${window_system}" = "pgtk" \
-   || test "${window_system}" = "wlshm" \
+   || test "${wlshm_gui}" = "yes" \
    || test "${REALLY_ANDROID}" = "yes"; then
   if test "${with_rsvg}" != "no"; then
     RSVG_REQUIRED=2.14.0
@@ -4514,7 +4526,7 @@ if test "$with_xwidgets" != "no"; then
 fi
 AC_SUBST([XWIDGETS_OBJ])
 
-if test "$window_system" = "pgtk" || test "$window_system" = "wlshm"; then
+if test "$window_system" = "pgtk" || test "${wlshm_gui}" = "yes"; then
   CAIRO_REQUIRED=1.12.0
   CAIRO_MODULE="cairo >= $CAIRO_REQUIRED"
   EMACS_CHECK_MODULES([CAIRO], [$CAIRO_MODULE])
@@ -4684,7 +4696,7 @@ if test "${HAVE_X11}" = "yes"; then
     fi
   fi
 else # "${HAVE_X11}" != "yes"
-  if test $window_system = pgtk || test $window_system = wlshm; then
+  if test $window_system = pgtk || test "${wlshm_gui}" = yes; then
     EMACS_CHECK_MODULES([FONTCONFIG], [fontconfig >= 2.2.0])
     EMACS_CHECK_MODULES([FREETYPE], [freetype2])
     if test "$HAVE_FONTCONFIG" != yes -o "$HAVE_FREETYPE" != yes; then
@@ -4724,7 +4736,7 @@ else
 fi
 if test "${HAVE_X11}" = "yes" && test "${HAVE_FREETYPE}" = "yes" \
         || test "$window_system" = "pgtk" \
-        || test "$window_system" = "wlshm" \
+        || test "${wlshm_gui}" = "yes" \
         || test "${HAVE_W32}" = "yes" \
 	|| test "$REALLY_ANDROID" = "yes"; then
   if test "${with_harfbuzz}" != "no"; then
@@ -4928,7 +4940,7 @@ JPEG_CFLAGS=
 if test "${HAVE_X11}" = "yes" || test "${HAVE_W32}" = "yes" \
    || test "${HAVE_NS}" = "yes" || test "${HAVE_BE_APP}" = "yes" \
    || test "$window_system" = "pgtk" \
-   || test "$window_system" = "wlshm" \
+   || test "${wlshm_gui}" = "yes" \
    || test "${REALLY_ANDROID}" = "yes"; then
   if test "${with_jpeg}" != "no"; then
     if test "${REALLY_ANDROID}" = "yes"; then
@@ -5350,7 +5362,7 @@ if test "${with_png}" != no; then
   elif test "${HAVE_X11}" = "yes" || test "${HAVE_W32}" = "yes" \
        || test "${HAVE_NS}" = "yes" || test "${HAVE_BE_APP}" = "yes" \
        || test "$window_system" = "pgtk" \
-       || test "$window_system" = "wlshm" \
+       || test "${wlshm_gui}" = "yes" \
        || test "${REALLY_ANDROID}" = "yes"; then
     EMACS_CHECK_MODULES([PNG], [libpng >= 1.0.0])
     if test $HAVE_PNG = yes; then
@@ -5430,7 +5442,7 @@ if test "${opsys}" = "mingw32"; then
 elif test "${HAVE_X11}" = "yes" || test "${HAVE_W32}" = "yes" \
      || test "${HAVE_NS}" = "yes" || test "${HAVE_BE_APP}" = "yes" \
      || test "$window_system" = "pgtk" \
-     || test "$window_system" = "wlshm" \
+     || test "${wlshm_gui}" = "yes" \
      || test "${REALLY_ANDROID}" = "yes"; then
   if test "${with_tiff}" != "no"; then
     if test "${REALLY_ANDROID}" != "yes"; then
@@ -5478,7 +5490,7 @@ if test "${opsys}" = "mingw32"; then
 elif test "${HAVE_X11}" = "yes" && test "${with_gif}" != "no" \
         || test "${HAVE_W32}" = "yes" || test "${HAVE_NS}" = "yes" \
 	|| test "${HAVE_BE_APP}" = "yes" || test "$window_system" = "pgtk" \
-	|| test "$window_system" = "wlshm" \
+	|| test "${wlshm_gui}" = "yes" \
 	|| test "${REALLY_ANDROID}" = "yes" \
 	&& test "${with_gif}" != "no"; then
   AC_CHECK_HEADER([gif_lib.h],
