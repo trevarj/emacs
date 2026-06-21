@@ -1,8 +1,7 @@
 /* Wayland + wlshm terminal backend for Emacs -- frame/Lisp glue.
 
-M0 scaffold.  This will hold x-create-frame and friends for the wlshm backend,
-plus the test/validation primitive `wlshm-dump-frame'.  At M0 only the symbol
-table init and the dump-frame stub exist.
+This holds x-create-frame and friends for the wlshm backend, plus the
+test/validation primitive `wlshm-dump-frame'.
 
 See wlshm-backend-plan.md.  */
 
@@ -23,7 +22,7 @@ See wlshm-backend-plan.md.  */
 
 /* Return the wlshm display info for OBJECT (a frame, terminal, display name,
    or nil for the default).  Signals if there is no wlshm display.
-   M1 stub: only the default display is supported.  */
+   Only the default display is supported.  */
 struct wlshm_display_info *
 check_x_display_info (Lisp_Object object)
 {
@@ -188,12 +187,12 @@ DEFUN ("x-create-frame", Fx_create_frame, Sx_create_frame, 1, 1, 0,
   gui_default_parameter (f, parms, Qtitle, Qnil, "title", "Title",
 			 RES_TYPE_STRING);
 
-  /* Open this frame's Wayland window (M3 multi-window) and store its handle.  */
+  /* Open this frame's Wayland window and store its handle.  */
   {
     uint64_t win = wlshm_window_open (NULL, 0, 0);
     if (win == 0)
       error ("wlshm: cannot open a Wayland window (is WAYLAND_DISPLAY set?)");
-    FRAME_X_OUTPUT (f)->wlshm_frame = (void *) win;
+    FRAME_X_OUTPUT (f)->wlshm_frame = win;
   }
 
   /* Pick an initial size; the compositor's configure (delivered via
@@ -202,10 +201,10 @@ DEFUN ("x-create-frame", Fx_create_frame, Sx_create_frame, 1, 1, 0,
   gui_figure_window_size (f, parms, true, true);
 
   /* Size the frame to the actual Wayland surface up front, so its pixel
-     dimensions match the GPU surface/persistent texture from the first paint.
+     dimensions match the persistent Cairo canvas from the first paint.
      Otherwise the default 80x36 frame is drawn first and then resized, which
      leaves stale pixels (e.g. buffer text where the mode line lands) in the
-     persistent texture.  */
+     persistent canvas.  */
   {
     uint32_t sw = 0, sh = 0;
     wlshm_window_size (WLSHM_FRAME_HANDLE (f), &sw, &sh);
@@ -291,7 +290,7 @@ DEFUN ("x-server-max-request-size", Fx_server_max_request_size,
 
 DEFUN ("xw-display-color-p", Fxw_display_color_p, Sxw_display_color_p, 0, 1, 0,
        doc: /* Return t if the display supports color.
-M1 stub: the wlshm backend always reports a color display.  */)
+The wlshm backend always reports a color display.  */)
   (Lisp_Object terminal)
 {
   return Qt;
@@ -299,8 +298,7 @@ M1 stub: the wlshm backend always reports a color display.  */)
 
 DEFUN ("x-display-grayscale-p", Fx_display_grayscale_p, Sx_display_grayscale_p,
        0, 1, 0,
-       doc: /* Return t if the display supports shades of gray.
-M1 stub.  */)
+       doc: /* Return t if the display supports shades of gray.  */)
   (Lisp_Object terminal)
 {
   return Qnil;
@@ -334,7 +332,7 @@ DEFUN ("xw-color-defined-p", Fxw_color_defined_p, Sxw_color_defined_p, 1, 2, 0,
 
 DEFUN ("x-display-planes", Fx_display_planes, Sx_display_planes, 0, 1, 0,
        doc: /* Return the number of bit planes of the wlshm display.
-The wlshm backend renders to a 24-bit (true color) RGBA target.  */)
+The wlshm backend renders to a 24-bit (true color) RGB24/XRGB target.  */)
   (Lisp_Object terminal)
 {
   return make_fixnum (24);
@@ -579,7 +577,7 @@ wlshm_create_tip_frame (struct wlshm_display_info *dpyinfo, Lisp_Object parms,
 	delete_frame (frame, Qnoelisp);
 	error ("wlshm: cannot open a tooltip window");
       }
-    FRAME_X_OUTPUT (f)->wlshm_frame = (void *) win;
+    FRAME_X_OUTPUT (f)->wlshm_frame = win;
   }
 
   FRAME_DISPLAY_INFO (f)->reference_count++;
@@ -679,7 +677,7 @@ wlshm_hide_tip (bool delete)
 		  /* Keep the frame for reuse but make it invisible
 		     (unmap its surface by closing the window handle).  */
 		  wlshm_window_close (WLSHM_FRAME_HANDLE (f));
-		  FRAME_X_OUTPUT (f)->wlshm_frame = NULL;
+		  FRAME_X_OUTPUT (f)->wlshm_frame = 0;
 		  SET_FRAME_VISIBLE (f, false);
 		}
 	      was_open = Qt;
