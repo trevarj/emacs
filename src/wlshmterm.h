@@ -319,6 +319,8 @@ extern void syms_of_wlshmfns (void);
    ftcrfont.c drives these to render glyphs; the RIF uses them for fills.  */
 extern cairo_t *wlshm_begin_cr_clip (struct frame *f);
 extern void wlshm_end_cr_clip (struct frame *f);
+/* Device (HiDPI) scale of F; used by FRAME_SCALE_FACTOR (frame.h).  */
+extern double wlshm_frame_scale_factor (struct frame *f);
 extern void wlshm_set_cr_source_with_color (struct frame *f, unsigned long color,
 					   bool respects_alpha_background);
 /* Write the current frame canvas to a PNG (golden/visual test harness).  */
