@@ -192,6 +192,182 @@ EVENT is a `preedit-text' event whose payload is a list of parts
 
 (define-key special-event-map [preedit-text] #'wlshm-preedit-text)
 
+;;; Themed tool-bar icons (freedesktop icon themes, e.g. Adwaita).
+;; The internal (no-toolkit) tool bar otherwise draws Emacs's built-in
+;; etc/images bitmaps.  When a freedesktop icon theme is installed we resolve
+;; each tool-bar item to its scalable SVG and let `find-image' use that; SVGs
+;; rasterize crisply at the device scale (see FRAME_SCALE_FACTOR).  Resolution
+;; falls back to the built-in bitmaps when no themed icon is found, so
+;; `emacs -Q' still works with no theme present.
+
+(defgroup wlshm nil
+  "Raw-Wayland (wlshm) backend."
+  :group 'environment)
+
+(defvar wlshm--icon-base-dirs nil
+  "Cached list of <data-dir>/icons base directories.")
+(defvar wlshm--icon-theme-info (make-hash-table :test 'equal)
+  "Cache mapping a theme name to (SUBDIRS . INHERITS) from its index.theme.")
+(defvar wlshm--icon-file-cache (make-hash-table :test 'equal)
+  "Cache mapping a freedesktop icon name to its SVG path, or the symbol `none'.")
+
+(defun wlshm--icon-clear-caches (&rest _)
+  "Flush themed-icon caches and the tool-bar keymap cache."
+  (setq wlshm--icon-base-dirs nil)
+  (clrhash wlshm--icon-theme-info)
+  (clrhash wlshm--icon-file-cache)
+  ;; The image / tool-bar caches only exist once a GUI frame does; skip them
+  ;; at load/dump time (and tolerate their absence).
+  (when (display-graphic-p)
+    (when (fboundp 'tool-bar--flush-cache) (tool-bar--flush-cache))
+    (ignore-errors (clear-image-cache))))
+
+(defcustom wlshm-tool-bar-use-system-icons t
+  "If non-nil, draw tool-bar icons from a freedesktop icon theme.
+See `wlshm-icon-theme'.  Falls back to Emacs's built-in icons when a
+themed icon cannot be found."
+  :type 'boolean
+  :group 'wlshm
+  :version "31.1"
+  :set (lambda (sym val) (set-default sym val) (wlshm--icon-clear-caches)))
+
+(defcustom wlshm-icon-theme "Adwaita"
+  "Name of the freedesktop icon theme used for tool-bar icons."
+  :type 'string
+  :group 'wlshm
+  :version "31.1"
+  :set (lambda (sym val) (set-default sym val) (wlshm--icon-clear-caches)))
+
+(defcustom wlshm-tool-bar-icon-size 24
+  "Logical pixel size for themed tool-bar icons.
+Scalable icons render at this size so the tool bar stays uniform; the
+device scale rasterizes them crisply."
+  :type 'natnum
+  :group 'wlshm
+  :version "31.1")
+
+(defconst wlshm--icon-name-map
+  '(("new" . "document-new") ("open" . "document-open")
+    ("diropen" . "folder-open") ("close" . "window-close")
+    ("save" . "document-save") ("saveas" . "document-save-as")
+    ("undo" . "edit-undo") ("redo" . "edit-redo")
+    ("cut" . "edit-cut") ("copy" . "edit-copy") ("paste" . "edit-paste")
+    ("search" . "edit-find") ("search-replace" . "edit-find-replace")
+    ("print" . "document-print") ("preferences" . "preferences-system")
+    ("help" . "help-browser") ("left-arrow" . "go-previous")
+    ("right-arrow" . "go-next") ("home" . "go-home") ("jump-to" . "go-jump")
+    ("exit" . "application-exit") ("info" . "dialog-information")
+    ("delete" . "edit-delete") ("refresh" . "view-refresh")
+    ("spell" . "tools-check-spelling") ("describe" . "document-properties")
+    ("attach" . "mail-attachment") ("connect" . "network-connect")
+    ("sort-ascending" . "view-sort-ascending")
+    ("sort-descending" . "view-sort-descending")
+    ("bookmark_add" . "bookmark-new") ("cancel" . "process-stop"))
+  "Map Emacs tool-bar icon base names to freedesktop icon names.")
+
+(defun wlshm--icon-base-dirs ()
+  "Return the freedesktop icon search directories, in priority order."
+  (or wlshm--icon-base-dirs
+      (setq wlshm--icon-base-dirs
+            (let (dirs)
+              (dolist (d (append
+                          (list (or (getenv "XDG_DATA_HOME")
+                                    (expand-file-name "~/.local/share")))
+                          (split-string (or (getenv "XDG_DATA_DIRS") "") ":" t)
+                          (list "/usr/share" "/usr/local/share")))
+                (let ((id (expand-file-name "icons" d)))
+                  (when (file-directory-p id) (push id dirs))))
+              (let ((h (expand-file-name "~/.icons")))
+                (when (file-directory-p h) (push h dirs)))
+              (delete-dups (nreverse dirs))))))
+
+(defun wlshm--icon-theme-info (theme)
+  "Return (SUBDIRS . INHERITS) parsed from THEME's index.theme, cached."
+  (or (gethash theme wlshm--icon-theme-info)
+      (puthash
+       theme
+       (let (subdirs inherits)
+         (catch 'done
+           (dolist (base (wlshm--icon-base-dirs))
+             (let ((idx (expand-file-name (format "%s/index.theme" theme) base)))
+               (when (file-readable-p idx)
+                 (with-temp-buffer
+                   (insert-file-contents idx)
+                   (goto-char (point-min))
+                   (when (re-search-forward "^Directories=\\(.*\\)$" nil t)
+                     (setq subdirs (split-string (match-string 1) "," t)))
+                   (goto-char (point-min))
+                   (when (re-search-forward "^Inherits=\\(.*\\)$" nil t)
+                     (setq inherits (split-string (match-string 1) "," t))))
+                 (throw 'done nil)))))
+         (cons subdirs inherits))
+       wlshm--icon-theme-info)))
+
+(defun wlshm--find-themed-icon-1 (name theme seen)
+  "Search THEME (and its inherited themes) for SVG icon NAME.
+SEEN guards against inheritance cycles."
+  (unless (member theme seen)
+    (push theme seen)
+    (let* ((info (wlshm--icon-theme-info theme))
+           (subdirs (car info))
+           (inherits (cdr info)))
+      (or
+       ;; Prefer symbolic (monochrome, uniform) SVGs, then scalable color ones;
+       ;; within each, prefer the NAME-symbolic spelling.
+       (catch 'hit
+         (dolist (want '("symbolic" "scalable"))
+           (dolist (subdir subdirs)
+             (when (string-search want subdir)
+               (dolist (base (wlshm--icon-base-dirs))
+                 (dolist (cand
+                          (list (format "%s/%s/%s/%s-symbolic.svg"
+                                        base theme subdir name)
+                                (format "%s/%s/%s/%s.svg" base theme subdir name)))
+                   (when (file-readable-p cand) (throw 'hit cand)))))))
+         nil)
+       (catch 'hit
+         (dolist (parent inherits)
+           (let ((r (wlshm--find-themed-icon-1 name parent seen)))
+             (when r (throw 'hit r))))
+         nil)))))
+
+(defun wlshm--find-themed-icon (name)
+  "Resolve freedesktop icon NAME to an SVG file path (cached), or nil."
+  (let ((hit (gethash name wlshm--icon-file-cache 'miss)))
+    (if (not (eq hit 'miss))
+        (and (stringp hit) hit)
+      (let ((path (or (wlshm--find-themed-icon-1 name wlshm-icon-theme nil)
+                      (wlshm--find-themed-icon-1 name "hicolor" nil))))
+        (puthash name (or path 'none) wlshm--icon-file-cache)
+        path))))
+
+(defun wlshm--icon-svg-spec (path)
+  "Build an SVG image spec for the themed icon at PATH.
+The `tool-bar' face foreground recolors symbolic (monochrome) icons."
+  (let ((fg (face-attribute 'tool-bar :foreground nil 'default)))
+    (append (list :type 'svg :file path
+                  :width wlshm-tool-bar-icon-size
+                  :height wlshm-tool-bar-icon-size)
+            (unless (eq fg 'unspecified) (list :foreground fg)))))
+
+(defun wlshm--find-image-advice (orig specs &optional cache)
+  "Around `find-image': prefer a themed SVG for known tool-bar icons.
+Only active on wlshm frames with SVG support; otherwise a no-op.  The
+themed spec is prepended, so a load failure falls back to SPECS."
+  (let ((svg (and wlshm-tool-bar-use-system-icons
+                  (eq (window-system) 'wlshm)
+                  (image-type-available-p 'svg)
+                  (consp specs)
+                  (ignore-errors
+                    (let* ((file (plist-get (car specs) :file))
+                           (base (and (stringp file) (file-name-base file)))
+                           (fd (and base (cdr (assoc base wlshm--icon-name-map)))))
+                      (and fd (wlshm--find-themed-icon fd)))))))
+    (funcall orig (if svg (cons (wlshm--icon-svg-spec svg) specs) specs)
+             cache)))
+
+(advice-add 'find-image :around #'wlshm--find-image-advice)
+
 ;; Any display name maps to the wlshm backend.
 (add-to-list 'display-format-alist '(".*" . wlshm))
 
