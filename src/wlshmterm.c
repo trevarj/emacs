@@ -124,6 +124,16 @@ wlshm_canvas_frame (void)
   return NULL;
 }
 
+/* Device (HiDPI) scale of frame F as a double (1.0 == no scaling).  Mirrors
+   pgtk_frame_scale_factor: FRAME_SCALE_FACTOR uses it so SVG images rasterize
+   at the physical resolution and stay crisp on the device-scaled canvas.  */
+double
+wlshm_frame_scale_factor (struct frame *f)
+{
+  uint32_t scale120 = wlshm_window_scale120 (WLSHM_FRAME_HANDLE (f));
+  return scale120 < 120 ? 1.0 : (double) scale120 / 120.0;
+}
+
 /* Ensure wlshm_cur's per-frame canvas matches its Wayland surface size, and
    point the wlshm_canvas/wlshm_cr aliases at it.  */
 static void
