@@ -60,7 +60,7 @@ use smithay_client_toolkit::{
         },
         WaylandSurface,
     },
-    shm::{slot::SlotPool, Shm, ShmHandler},
+    shm::{slot::{Buffer, SlotPool}, Shm, ShmHandler},
     delegate_seat, delegate_keyboard, delegate_pointer,
 };
 use smithay_client_toolkit::reexports::protocols::xdg::shell::client::xdg_positioner::{
@@ -186,6 +186,16 @@ struct WlWindow {
     /// New size the compositor asked for, pending delivery to Emacs.
     pending_resize: Option<(u32, u32)>,
     configured: bool,
+    /// A wl_surface.frame callback is outstanding: the compositor has not yet
+    /// signalled it is ready for the next buffer.  While true, present() coalesces
+    /// into `pending` instead of committing, so a fast redisplay loop (e.g.
+    /// nonstop scrolling) throttles to the compositor's frame rate and cannot
+    /// flood it with buffer commits.
+    frame_pending: bool,
+    /// Latest prepared-but-uncommitted frame (buffer + damage rect), committed
+    /// when the next frame callback fires.  Replacing it drops the previous
+    /// buffer, freeing its pool slot, so at most ~2 buffers are ever in flight.
+    pending: Option<(Buffer, i32, i32, i32, i32)>,
 }
 
 impl WlWindow {
@@ -197,6 +207,23 @@ impl WlWindow {
             Role::Pending { .. } => None,
         }
     }
+}
+
+/// Attach BUFFER to SURFACE, damage it, request a wl_surface.frame callback (so
+/// the next present throttles to the compositor's pace), and commit.  Returns
+/// false if the attach failed (the caller then leaves frame_pending clear so the
+/// next present retries).  Shared by present() (Backend) and the frame callback
+/// (AppState), both of which hold a QueueHandle<AppState>.
+fn commit_buffer(qh: &QueueHandle<AppState>, surface: &wl_surface::WlSurface,
+                 buffer: &Buffer, dx: i32, dy: i32, dw: i32, dh: i32) -> bool {
+    if buffer.attach_to(surface).is_err() {
+        return false;
+    }
+    surface.damage_buffer(dx, dy, dw, dh);
+    // Arm the next frame callback BEFORE commit so it is part of this commit.
+    surface.frame(qh, surface.clone());
+    surface.commit();
+    true
 }
 
 /// Connection-global sctk delegate target + all per-seat state.
@@ -529,6 +556,8 @@ impl Backend {
                 viewport: None,
                 pending_resize: None,
                 configured: false,
+                frame_pending: false,
+                pending: None,
             });
             return id;
         }
@@ -583,6 +612,8 @@ impl Backend {
             viewport,
             pending_resize: None,
             configured: false,
+            frame_pending: false,
+            pending: None,
         });
 
         // Roundtrip so the compositor sends the initial configure (sizes us).
@@ -846,17 +877,27 @@ impl Backend {
             let s = std::slice::from_raw_parts(src.add(y * src_stride), row_bytes);
             canvas[y * dst_stride..y * dst_stride + row_bytes].copy_from_slice(s);
         }
-        let Some(surface) = w.wl_surface() else { return };
-        if let Err(e) = buffer.attach_to(surface) {
-            eprintln!("wlshm: buffer attach: {e}");
+        // Resolve damage to a concrete rect (full buffer when none was given).
+        let (dx, dy, dw, dh) = if dmg_w > 0 && dmg_h > 0 {
+            (dmg_x, dmg_y, dmg_w, dmg_h)
+        } else {
+            (0, 0, pw as i32, ph as i32)
+        };
+        // Flow control: at most one buffer in flight per frame callback.  If a
+        // frame callback is still outstanding, stash this as the pending frame
+        // (dropping any previous pending buffer, which frees its pool slot) and
+        // return -- it is committed when the callback fires.  Otherwise commit
+        // now and arm the next callback.  This throttles a fast redisplay loop
+        // (nonstop scroll) to the compositor's frame rate so we never flood it
+        // with buffer commits.
+        if w.frame_pending {
+            w.pending = Some((buffer, dx, dy, dw, dh));
             return;
         }
-        if dmg_w > 0 && dmg_h > 0 {
-            surface.damage_buffer(dmg_x, dmg_y, dmg_w, dmg_h);
-        } else {
-            surface.damage_buffer(0, 0, pw as i32, ph as i32);
+        let Some(surface) = w.wl_surface().cloned() else { return };
+        if commit_buffer(&self.qh, &surface, &buffer, dx, dy, dw, dh) {
+            w.frame_pending = true;
         }
-        surface.commit();
         let _ = self.conn.flush();
     }
 
@@ -1003,7 +1044,28 @@ impl CompositorHandler for AppState {
         self.push(WlshmEvent::configure(lw as i32, lh as i32).on(id));
     }
     fn transform_changed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: wl_output::Transform) {}
-    fn frame(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: u32) {}
+    fn frame(&mut self, conn: &Connection, qh: &QueueHandle<Self>, surface: &wl_surface::WlSurface, _: u32) {
+        // The compositor is ready for the next buffer.  Clear the throttle and,
+        // if a present was coalesced while we waited, commit the latest now.
+        let id = self.id_for_surface(surface);
+        let pending = match self.windows.get_mut(&id) {
+            Some(w) => {
+                w.frame_pending = false;
+                w.pending.take()
+            }
+            None => return,
+        };
+        if let Some((buffer, dx, dy, dw, dh)) = pending {
+            if let Some(surf) = self.windows.get(&id).and_then(|w| w.wl_surface().cloned()) {
+                if commit_buffer(qh, &surf, &buffer, dx, dy, dw, dh) {
+                    if let Some(w) = self.windows.get_mut(&id) {
+                        w.frame_pending = true;
+                    }
+                    let _ = conn.flush();
+                }
+            }
+        }
+    }
     fn surface_enter(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: &wl_output::WlOutput) {}
     fn surface_leave(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: &wl_output::WlOutput) {}
 }
@@ -1026,6 +1088,11 @@ impl WindowHandler for AppState {
                 w.size = (cw.get(), ch.get());
             }
             w.configured = true;
+            // A fresh configure invites a new buffer; clear any stuck throttle
+            // (e.g. left over from an unmap that got no frame callback) so the
+            // next present commits immediately.
+            w.frame_pending = false;
+            w.pending = None;
             w.pending_resize = Some(w.size);
             let (sw, sh) = w.size;
             // Fractional path: the viewport maps the physical-pixel buffer down
@@ -1053,6 +1120,8 @@ impl PopupHandler for AppState {
                 vp.set_destination(lw.max(1) as i32, lh.max(1) as i32);
             }
             w.configured = true;
+            w.frame_pending = false;
+            w.pending = None;
         }
     }
     fn done(&mut self, _: &Connection, _: &QueueHandle<Self>, popup: &Popup) {
