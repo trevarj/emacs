@@ -290,6 +290,30 @@ wlshm_window_rect (float x, float y, float w, float h,
   cairo_restore (wlshm_cr);
 }
 
+/* Fill a rectangle given in PHYSICAL pixels (expressed back in logical coords so
+   the canvas device scale reproduces the exact integer physical rect).  Used to
+   fill a LOGICAL-coordinate rectangle with antialiasing enabled.  The canvas cr
+   is globally CAIRO_ANTIALIAS_NONE for crisp text and solid fills, but box/relief
+   edges must be drawn with AA: a 1px-logical edge at a fractional device scale
+   would otherwise quantize to 1 OR 2 physical px by sub-pixel phase, so a box's
+   top would differ in thickness from its bottom.  With AA on, every edge gets the
+   same soft partial-coverage rendering and they match, identical to pgtk.  At
+   integer device scale this is visually indistinguishable from a hard fill.  */
+static void
+wlshm_fill_aa (int x, int y, int w, int h, float r, float g, float b)
+{
+  wlshm_ensure_canvas ();
+  if (!wlshm_cr || w <= 0 || h <= 0)
+    return;
+  cairo_save (wlshm_cr);
+  cairo_set_antialias (wlshm_cr, CAIRO_ANTIALIAS_GRAY);
+  cairo_set_operator (wlshm_cr, CAIRO_OPERATOR_OVER);
+  cairo_set_source_rgb (wlshm_cr, r, g, b);
+  cairo_rectangle (wlshm_cr, x, y, w, h);
+  cairo_fill (wlshm_cr);
+  cairo_restore (wlshm_cr);
+}
+
 /* Blend two packed pixels (defined later; also used by the scroll bar).  */
 static unsigned long wlshm_blend_pixel (unsigned long a, unsigned long b,
 					double t);
@@ -534,8 +558,12 @@ wlshm_draw_glyph_string_box (struct glyph_string *s)
   bool left_p = (s->first_glyph->left_box_line_p
 		 || (s->hl == DRAW_MOUSE_FACE
 		     && (s->prev == NULL || s->prev->hl != s->hl)));
-  bool right_p = ((s->nchars > 0
-		   && s->first_glyph[s->nchars - 1].right_box_line_p)
+  /* For a composite/image glyph string the right box flag lives on first_glyph,
+     not first_glyph[nchars-1] (mirrors pgtk's last_glyph selection).  */
+  struct glyph *last_glyph = ((s->cmp || s->img)
+			      ? s->first_glyph
+			      : s->first_glyph + s->nchars - 1);
+  bool right_p = ((s->nchars > 0 && last_glyph->right_box_line_p)
 		  || (s->hl == DRAW_MOUSE_FACE
 		      && (s->next == NULL || s->next->hl != s->hl)));
 
@@ -562,17 +590,30 @@ wlshm_draw_glyph_string_box (struct glyph_string *s)
   wlshm_unpack_pixel (top_left, &tr, &tg, &tb);
   wlshm_unpack_pixel (bottom_right, &br, &bg2, &bb);
   block_input ();
-  /* Top (light/box) and bottom (dark/box).  */
-  wlshm_window_rect ((float) left, (float) top, (float) width, (float) hwidth,
-		    tr, tg, tb, 1.0f);
-  wlshm_window_rect ((float) left, (float) (top + height - hwidth),
-		    (float) width, (float) hwidth, br, bg2, bb, 1.0f);
-  if (left_p)
-    wlshm_window_rect ((float) left, (float) top, (float) vwidth,
-		      (float) height, tr, tg, tb, 1.0f);
-  if (right_p)
-    wlshm_window_rect ((float) (left + width - vwidth), (float) top,
-		      (float) vwidth, (float) height, br, bg2, bb, 1.0f);
+  /* Draw the four edges exactly as pgtk_draw_box_rect does: integer logical
+     coordinates with the inclusive (right_x = left+width-1) convention, and
+     ANTIALIASING ENABLED.  The canvas cr is globally CAIRO_ANTIALIAS_NONE for
+     crisp text/fills, but a 1px-logical edge at a fractional device scale must
+     be drawn with AA -- otherwise AA-NONE quantizes each edge to 1 or 2 physical
+     px by sub-pixel phase, so the top comes out a different thickness from the
+     bottom (and left from right).  With AA on, every edge gets the same soft
+     partial-coverage rendering and they all match, identical to pgtk.  */
+  int left_x = left;
+  int top_y = top;
+  int right_x = left + width - 1;
+  int bottom_y = top + height - 1;
+  if (hwidth > 0)
+    {
+      /* Top, then bottom.  */
+      wlshm_fill_aa (left_x, top_y, right_x - left_x + 1, hwidth, tr, tg, tb);
+      wlshm_fill_aa (left_x, bottom_y - hwidth + 1, right_x - left_x + 1, hwidth,
+		     br, bg2, bb);
+    }
+  if (left_p && vwidth > 0)
+    wlshm_fill_aa (left_x, top_y, vwidth, bottom_y - top_y + 1, tr, tg, tb);
+  if (right_p && vwidth > 0)
+    wlshm_fill_aa (right_x - vwidth + 1, top_y, vwidth, bottom_y - top_y + 1,
+		   br, bg2, bb);
   unblock_input ();
 }
 
