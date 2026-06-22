@@ -3409,6 +3409,22 @@ wlshm_read_socket (struct terminal *terminal, struct input_event *hold_quit)
 						      press, mods);
 	      }
 
+	    /* A click in the tool bar activates the button: handle_tool_bar_click
+	       highlights it on press and runs its command on release.  Mirrors
+	       xterm/pgtk; without this the Emacs-drawn tool bar was inert.  */
+	    bool tool_bar_p = false;
+	    if (WINDOWP (f->tool_bar_window)
+		&& WINDOW_TOTAL_LINES (XWINDOW (f->tool_bar_window)))
+	      {
+		Lisp_Object window
+		  = window_from_coordinates (f, evs[i].x, evs[i].y, 0,
+					     true, true, true);
+		tool_bar_p = (EQ (window, f->tool_bar_window)
+			      && (press || f->last_tool_bar_item != -1));
+		if (tool_bar_p)
+		  handle_tool_bar_click (f, evs[i].x, evs[i].y, press, mods);
+	      }
+
 	    if (press)
 	      {
 		dpyinfo->grabbed |= (1 << evs[i].button);
@@ -3425,10 +3441,11 @@ wlshm_read_socket (struct terminal *terminal, struct input_event *hold_quit)
 	    else
 	      dpyinfo->grabbed &= ~(1 << evs[i].button);
 
-	    /* Suppress the generic click only for a tab-bar press that has not
-	       yet resolved to a tab; otherwise emit it, carrying the tab-bar
-	       arg when present so the tab-bar keymap runs.  */
-	    if (!(tab_bar_p && NILP (tab_bar_arg)))
+	    /* Suppress the generic click for a tab-bar press not yet resolved to
+	       a tab, and for any tool-bar click (handled above); otherwise emit
+	       it, carrying the tab-bar arg when present so the tab-bar keymap
+	       runs.  */
+	    if (!(tab_bar_p && NILP (tab_bar_arg)) && !tool_bar_p)
 	      {
 		struct input_event ie;
 		EVENT_INIT (ie);
@@ -3444,6 +3461,10 @@ wlshm_read_socket (struct terminal *terminal, struct input_event *hold_quit)
 		kbd_buffer_store_event_hold (&ie, hold_quit);
 		count++;
 	      }
+	    /* Forget any pressed tool-bar item once the click is not on the tool
+	       bar (mirrors xterm), so a release elsewhere doesn't re-fire it.  */
+	    if (!tool_bar_p)
+	      f->last_tool_bar_item = -1;
 	    wlshm_log ("button stored");
 	  }
 	  break;
