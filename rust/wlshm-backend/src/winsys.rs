@@ -76,7 +76,8 @@ use wayland_client::{
     protocol::{
         wl_data_device::WlDataDevice, wl_data_device_manager::DndAction,
         wl_data_source::WlDataSource, wl_keyboard::WlKeyboard, wl_output,
-        wl_pointer::WlPointer, wl_seat::WlSeat, wl_shm, wl_surface,
+        wl_pointer::WlPointer, wl_seat::WlSeat, wl_shm,
+        wl_subcompositor::WlSubcompositor, wl_subsurface::WlSubsurface, wl_surface,
     },
     Connection, Dispatch, EventQueue, Proxy, QueueHandle,
 };
@@ -163,6 +164,16 @@ fn is_modifier_keysym(ks: u32) -> bool {
 enum Role {
     Toplevel(Window),
     Popup(Popup),
+    /// A child frame (parent-frame): a wl_subsurface floating over its parent,
+    /// positioned by the client, with no WM decoration -- so it is NOT a
+    /// separate window the WM tiles.  Holds its own wl_surface plus the
+    /// wl_subsurface, and the parent's surface (committed when the child moves,
+    /// since subsurface placement applies on the PARENT's commit).
+    Subsurface {
+        surface: wl_surface::WlSurface,
+        subsurface: WlSubsurface,
+        parent_surface: wl_surface::WlSurface,
+    },
     /// Awaiting set_geometry to become a Popup.  `grab` = take a keyboard grab
     /// (menus do; tooltips don't).
     Pending { parent: u64, grab: bool },
@@ -204,6 +215,7 @@ impl WlWindow {
         match &self.role {
             Role::Toplevel(w) => Some(w.wl_surface()),
             Role::Popup(p) => Some(p.wl_surface()),
+            Role::Subsurface { surface, .. } => Some(surface),
             Role::Pending { .. } => None,
         }
     }
@@ -321,6 +333,10 @@ struct AppState {
     /// HiDPI fractional scaling globals (absent -> integer fallback path).
     fractional_mgr: Option<WpFractionalScaleManagerV1>,
     viewporter: Option<WpViewporter>,
+    /// wl_subcompositor: makes a child frame (parent-frame) a wl_subsurface that
+    /// floats over its parent instead of a separate toplevel the WM tiles.
+    /// Absent on the (rare) compositor without it -> child frames stay toplevels.
+    subcompositor: Option<WlSubcompositor>,
 }
 
 impl AppState {
@@ -451,6 +467,7 @@ impl Backend {
             .bind::<WpFractionalScaleManagerV1, _, _>(&qh, 1..=1, ())
             .ok();
         let viewporter = globals.bind::<WpViewporter, _, _>(&qh, 1..=1, ()).ok();
+        let subcompositor = globals.bind::<WlSubcompositor, _, _>(&qh, 1..=1, ()).ok();
 
         let mut state = AppState {
             registry_state: RegistryState::new(&globals),
@@ -502,6 +519,7 @@ impl Backend {
             default_scale120: 120,
             fractional_mgr,
             viewporter,
+            subcompositor,
         };
 
         // Roundtrip so seats/outputs are known.
@@ -580,8 +598,51 @@ impl Backend {
             return id;
         }
 
+        // Child frame (parent-frame): a wl_subsurface floating over its parent
+        // instead of a separate toplevel the WM tiles.
+        if kind == 3 && parent != 0 {
+            let parent_scale = self.state.windows.get(&parent).map(|p| p.scale120).unwrap_or(120);
+            let parent_surface = self.state.windows.get(&parent)
+                .and_then(|p| p.wl_surface().cloned());
+            if let (Some(subc), Some(parent_surface)) =
+                (self.state.subcompositor.clone(), parent_surface)
+            {
+                let surface = self.state.compositor.create_surface(&self.qh);
+                let subsurface = subc.get_subsurface(&surface, &parent_surface, &self.qh, ());
+                // Desync: the child's own buffer commits apply immediately,
+                // independent of the parent's commit cycle.
+                subsurface.set_desync();
+                // HiDPI: same fractional-scale + viewport treatment as a toplevel
+                // so the child renders crisp at the parent's scale.
+                let fractional = self.state.fractional_mgr.as_ref()
+                    .map(|mgr| mgr.get_fractional_scale(&surface, &self.qh, id));
+                let viewport = self.state.viewporter.as_ref()
+                    .map(|vp| vp.get_viewport(&surface, &self.qh, ()));
+                if fractional.is_none() {
+                    surface.set_buffer_scale((parent_scale / 120) as i32);
+                }
+                self.state.surface_to_id.insert(surface.id(), id);
+                self.state.windows.insert(id, WlWindow {
+                    role: Role::Subsurface { surface, subsurface, parent_surface },
+                    pool,
+                    size: (1, 1),
+                    scale120: parent_scale,
+                    fractional,
+                    viewport,
+                    pending_resize: None,
+                    // Subsurfaces get no xdg configure; ready to present at the
+                    // size Emacs assigns via wlshm_window_set_size.
+                    configured: true,
+                    frame_pending: false,
+                    pending: None,
+                });
+                return id;
+            }
+            eprintln!("wlshm: no wl_subcompositor; child frame falls back to a toplevel");
+        }
+
         // Toplevel (or a parentless popup falling back to one).
-        if kind != 0 {
+        if kind != 0 && kind != 3 {
             eprintln!("wlshm: popup kind {kind} has no parent; using a toplevel");
         }
         let surface = self.state.compositor.create_surface(&self.qh);
@@ -759,6 +820,16 @@ impl Backend {
             if self.state.focused_window == Some(win) {
                 self.state.focused_window = None;
             }
+            // A subsurface and its plain wl_surface have no Drop destructor
+            // (unlike sctk's Window/Popup), so destroy them explicitly and
+            // commit the parent to unmap the child; otherwise it leaks and stays
+            // visible after delete-frame.
+            if let Role::Subsurface { surface, subsurface, parent_surface } = &w.role {
+                subsurface.destroy();
+                surface.destroy();
+                parent_surface.commit();
+                let _ = self.conn.flush();
+            }
             // w drops here: destroys the xdg surface (safe while connected).
         }
     }
@@ -913,8 +984,18 @@ impl Backend {
             return;
         }
         let Some(surface) = w.wl_surface().cloned() else { return };
+        let parent_surface = if let Role::Subsurface { parent_surface, .. } = &w.role {
+            Some(parent_surface.clone())
+        } else {
+            None
+        };
         if commit_buffer(&self.qh, &surface, &buffer, dx, dy, dw, dh) {
             w.frame_pending = true;
+            // A subsurface's placement/mapping is applied on the PARENT's
+            // commit, so nudge the parent after committing the child's buffer.
+            if let Some(ps) = parent_surface {
+                ps.commit();
+            }
         }
         let _ = self.conn.flush();
     }
@@ -1398,6 +1479,32 @@ impl Dispatch<WpViewport, ()> for AppState {
         _qh: &QueueHandle<Self>,
     ) {
         // wp_viewport has no events.
+    }
+}
+
+impl Dispatch<WlSubcompositor, ()> for AppState {
+    fn event(
+        _state: &mut Self,
+        _proxy: &WlSubcompositor,
+        _event: <WlSubcompositor as Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        // wl_subcompositor has no events.
+    }
+}
+
+impl Dispatch<WlSubsurface, ()> for AppState {
+    fn event(
+        _state: &mut Self,
+        _proxy: &WlSubsurface,
+        _event: <WlSubsurface as Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        // wl_subsurface has no events.
     }
 }
 
@@ -1968,6 +2075,35 @@ pub extern "C" fn wlshm_window_set_size(win: u64, w: c_int, h: c_int) {
                 // commit a buffer to an unconfigured surface (xdg_surface
                 // error 3, e.g. a child frame hidden and re-shown).
                 wl.size = (w as u32, h as u32);
+                // A subsurface has no xdg configure to re-arm its viewport, so
+                // map its (now known) logical size to the physical buffer here.
+                if matches!(wl.role, Role::Subsurface { .. }) {
+                    wl.update_viewport();
+                }
+            }
+        },
+        (),
+    );
+}
+
+/// Position child subsurface `win` at (x, y) LOGICAL pixels relative to its
+/// parent frame.  No-op for non-subsurface windows (Wayland forbids a client
+/// positioning its own toplevel).  Placement applies on the parent's commit.
+#[no_mangle]
+pub extern "C" fn wlshm_window_set_subsurface_pos(win: u64, x: c_int, y: c_int) {
+    with_backend(
+        |b| {
+            let Some(id) = b.resolve(win) else { return };
+            let parent_surface = match b.state.windows.get(&id).map(|w| &w.role) {
+                Some(Role::Subsurface { subsurface, parent_surface, .. }) => {
+                    subsurface.set_position(x, y);
+                    Some(parent_surface.clone())
+                }
+                _ => None,
+            };
+            if let Some(ps) = parent_surface {
+                ps.commit();
+                let _ = b.conn.flush();
             }
         },
         (),

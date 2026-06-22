@@ -93,6 +93,23 @@ DEFUN ("x-create-frame", Fx_create_frame, Sx_create_frame, 1, 1, 0,
   FRAME_X_OUTPUT (f)->scroll_bar_background_pixel = -1;
   FRAME_DISPLAY_INFO (f) = dpyinfo;
 
+  /* Read parent-frame from the parameters now (like pgtk) so the window can be
+     opened as a child -- a wl_subsurface that floats over its parent -- instead
+     of a separate toplevel the WM would tile.  */
+  {
+    Lisp_Object parent_frame
+      = gui_display_get_arg (dpyinfo, parms, Qparent_frame, NULL, NULL,
+			     RES_TYPE_SYMBOL);
+    if (BASE_EQ (parent_frame, Qunbound)
+	|| NILP (parent_frame)
+	|| !FRAMEP (parent_frame)
+	|| !FRAME_LIVE_P (XFRAME (parent_frame))
+	|| !FRAME_WLSHM_P (XFRAME (parent_frame)))
+      parent_frame = Qnil;
+    fset_parent_frame (f, parent_frame);
+    store_frame_param (f, Qparent_frame, parent_frame);
+  }
+
   /* Sensible defaults; the color parameters below refine them.  */
   FRAME_FOREGROUND_PIXEL (f) = 0x000000;
   FRAME_BACKGROUND_PIXEL (f) = 0xffffff;
@@ -187,9 +204,14 @@ DEFUN ("x-create-frame", Fx_create_frame, Sx_create_frame, 1, 1, 0,
   gui_default_parameter (f, parms, Qtitle, Qnil, "title", "Title",
 			 RES_TYPE_STRING);
 
-  /* Open this frame's Wayland window and store its handle.  */
+  /* Open this frame's Wayland window and store its handle.  A child frame
+     (parent-frame set) opens as a wl_subsurface (kind 3) of its parent so it
+     floats over it; a normal frame opens as a toplevel (kind 0).  */
   {
-    uint64_t win = wlshm_window_open (NULL, 0, 0);
+    struct frame *pf = FRAME_PARENT_FRAME (f);
+    uint64_t parent_handle = pf ? WLSHM_FRAME_HANDLE (pf) : 0;
+    uint32_t kind = pf ? 3 : 0;
+    uint64_t win = wlshm_window_open (NULL, parent_handle, kind);
     if (win == 0)
       error ("wlshm: cannot open a Wayland window (is WAYLAND_DISPLAY set?)");
     FRAME_X_OUTPUT (f)->wlshm_frame = win;

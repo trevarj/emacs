@@ -1887,7 +1887,15 @@ wlshm_frame_raise_lower (struct frame *f, bool raise_flag)
 static void
 wlshm_set_frame_offset (struct frame *f, int xoff, int yoff, int change_gravity)
 {
-  /* Wayland forbids a client from positioning its own toplevel.  No-op.  */
+  /* A plain toplevel cannot position itself on Wayland (no-op).  But a child
+     frame is a wl_subsurface, which CAN be placed relative to its parent --
+     position it so posframe/child-frame packages float at the right spot.  */
+  if (FRAME_PARENT_FRAME (f) && WLSHM_FRAME_HANDLE (f))
+    {
+      block_input ();
+      wlshm_window_set_subsurface_pos (WLSHM_FRAME_HANDLE (f), xoff, yoff);
+      unblock_input ();
+    }
 }
 
 static bool

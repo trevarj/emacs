@@ -279,6 +279,13 @@ void wlshm_window_set_geometry(uint64_t win, int x, int y, int w, int h);
 void wlshm_window_set_size(uint64_t win, int w, int h);
 
 /**
+ * Position child subsurface `win` at (x, y) LOGICAL pixels relative to its
+ * parent frame.  No-op for non-subsurface windows (Wayland forbids a client
+ * positioning its own toplevel).  Placement applies on the parent's commit.
+ */
+void wlshm_window_set_subsurface_pos(uint64_t win, int x, int y);
+
+/**
  * Reparent `win` to `parent` (xdg_toplevel.set_parent).  `parent` 0 clears it.
  */
 void wlshm_window_set_parent(uint64_t win, uint64_t parent);
