@@ -1569,9 +1569,13 @@ wlshm_draw_fringe_bitmap (struct window *w, struct glyph_row *row,
 	      cairo_surface_mark_dirty (mask);
 
 	      cairo_save (wlshm_cr);
-	      /* Clip to the row's visible band so partial rows don't overflow.  */
-	      int clip_h = p->ny > 0 ? p->ny : fb->h;
-	      cairo_rectangle (wlshm_cr, p->x, p->y, fb->wd, clip_h);
+	      /* Clip to the bitmap's VISIBLE extent (p->wd x p->h).  p->h is the
+		 fringe.c-adjusted height: clamped to the row and reduced by the
+		 p->dh phase offset, exactly what pgtk_cr_draw_image clips to.
+		 Using fb->h / p->ny here drew the wrong rows of periodic bitmaps
+		 (the empty-line ~ indicator), mispositioned custom bitmaps, and
+		 let a tall bitmap bleed past the row down over the mode line.  */
+	      cairo_rectangle (wlshm_cr, p->x, p->y, p->wd, p->h);
 	      cairo_clip (wlshm_cr);
 	      cairo_set_source_rgb (wlshm_cr, r, g, b);
 	      /* Offset by -dh so visible rows [dh, dh+h) land at p->y (partial
