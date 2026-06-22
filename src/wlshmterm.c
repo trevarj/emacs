@@ -3521,7 +3521,9 @@ wlshm_read_socket (struct terminal *terminal, struct input_event *hold_quit)
 					     true, true, true);
 		tool_bar_p = (EQ (window, f->tool_bar_window)
 			      && (press || f->last_tool_bar_item != -1));
-		if (tool_bar_p)
+		/* Only the primary buttons (left/middle/right) activate tool-bar
+		   items; side buttons don't (mirrors xterm's button < 4).  */
+		if (tool_bar_p && evs[i].button < 3)
 		  handle_tool_bar_click (f, evs[i].x, evs[i].y, press, mods);
 	      }
 
