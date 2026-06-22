@@ -1335,10 +1335,24 @@ wlshm_draw_window_cursor (struct window *w, struct glyph_row *glyph_row,
 	struct glyph *cursor_glyph = get_phys_cursor_glyph (w);
 	if (!cursor_glyph)
 	  break;
+	/* A bar/hbar over an image: draw the glyph inverted instead (mirrors
+	   pgtk), since a thin bar over an image is invisible/wrong.  */
+	if (cursor_type != HOLLOW_BOX_CURSOR
+	    && (cursor_glyph->type == IMAGE_GLYPH
+		|| cursor_glyph->type == XWIDGET_GLYPH))
+	  {
+	    draw_phys_cursor_glyph (w, glyph_row, DRAW_CURSOR);
+	    break;
+	  }
+	/* If the glyph's own background equals the cursor color the cursor would
+	   be invisible; use the glyph foreground then (mirrors pgtk).  */
+	struct face *cface = FACE_FROM_ID (f, cursor_glyph->face_id);
+	unsigned long ccol = ((cface && cface->background == FRAME_CURSOR_COLOR (f))
+			      ? cface->foreground : FRAME_CURSOR_COLOR (f));
 	int gx, gy, gh, wd = cursor_glyph->pixel_width;
 	get_phys_cursor_geometry (w, glyph_row, cursor_glyph, &gx, &gy, &gh);
 	float r, g, b;
-	wlshm_unpack_pixel (FRAME_CURSOR_COLOR (f), &r, &g, &b);
+	wlshm_unpack_pixel (ccol, &r, &g, &b);
 	block_input ();
 	if (cursor_type == HOLLOW_BOX_CURSOR)
 	  {
@@ -1350,14 +1364,16 @@ wlshm_draw_window_cursor (struct window *w, struct glyph_row *glyph_row,
 	  }
 	else if (cursor_type == BAR_CURSOR)
 	  {
-	    int bw = cursor_width > 0 ? cursor_width : 2;
-	    wlshm_fill_rect_pixel (gx, gy, bw, gh, FRAME_CURSOR_COLOR (f));
+	    /* Clamp the bar to the glyph width (a wide cursor-width must not
+	       overshoot a narrow glyph), and record it for IM/erase geometry.  */
+	    int bw = min (wd, cursor_width > 0 ? cursor_width : 2);
+	    w->phys_cursor_width = bw;
+	    wlshm_fill_rect_pixel (gx, gy, bw, gh, ccol);
 	  }
 	else /* HBAR_CURSOR */
 	  {
 	    int bh = cursor_width > 0 ? cursor_width : 2;
-	    wlshm_fill_rect_pixel (gx, gy + gh - bh, wd, bh,
-				   FRAME_CURSOR_COLOR (f));
+	    wlshm_fill_rect_pixel (gx, gy + gh - bh, wd, bh, ccol);
 	  }
 	unblock_input ();
       }
