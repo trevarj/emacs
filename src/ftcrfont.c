@@ -130,6 +130,73 @@ ftcrfont_match (struct frame *f, Lisp_Object spec)
   return ftfont_match2 (f, spec, Qftcr);
 }
 
+#ifdef HAVE_WLSHM
+/* Translate the resolved fontconfig pattern MATCH (already run through
+   FcConfigSubstitute/FcDefaultSubstitute) into cairo font options, so wlshm
+   honors the user's fontconfig rendering preferences -- antialias mode,
+   subpixel order, hint style -- instead of hardcoding GRAY/SLIGHT.  This makes
+   wlshm text match every other cairo/fontconfig app on the system.  Hint
+   metrics stay ON because Emacs's glyph layout assumes integer advances.  */
+static cairo_font_options_t *
+wlshm_font_options_from_pattern (FcPattern *match)
+{
+  cairo_font_options_t *options = cairo_font_options_create ();
+  FcBool b;
+  int i;
+
+  /* Antialiasing + subpixel order.  */
+  bool antialias = true;
+  if (FcPatternGetBool (match, FC_ANTIALIAS, 0, &b) == FcResultMatch)
+    antialias = b;
+  int rgba = FC_RGBA_UNKNOWN;
+  if (FcPatternGetInteger (match, FC_RGBA, 0, &rgba) != FcResultMatch)
+    rgba = FC_RGBA_UNKNOWN;
+  if (!antialias)
+    cairo_font_options_set_antialias (options, CAIRO_ANTIALIAS_NONE);
+  else if (rgba == FC_RGBA_RGB || rgba == FC_RGBA_BGR
+	   || rgba == FC_RGBA_VRGB || rgba == FC_RGBA_VBGR)
+    {
+      cairo_subpixel_order_t spo = CAIRO_SUBPIXEL_ORDER_DEFAULT;
+      switch (rgba)
+	{
+	case FC_RGBA_RGB:  spo = CAIRO_SUBPIXEL_ORDER_RGB;  break;
+	case FC_RGBA_BGR:  spo = CAIRO_SUBPIXEL_ORDER_BGR;  break;
+	case FC_RGBA_VRGB: spo = CAIRO_SUBPIXEL_ORDER_VRGB; break;
+	case FC_RGBA_VBGR: spo = CAIRO_SUBPIXEL_ORDER_VBGR; break;
+	}
+      cairo_font_options_set_antialias (options, CAIRO_ANTIALIAS_SUBPIXEL);
+      cairo_font_options_set_subpixel_order (options, spo);
+    }
+  else
+    cairo_font_options_set_antialias (options, CAIRO_ANTIALIAS_GRAY);
+
+  /* Hinting.  */
+  bool hinting = true;
+  if (FcPatternGetBool (match, FC_HINTING, 0, &b) == FcResultMatch)
+    hinting = b;
+  if (!hinting)
+    cairo_font_options_set_hint_style (options, CAIRO_HINT_STYLE_NONE);
+  else if (FcPatternGetInteger (match, FC_HINT_STYLE, 0, &i) == FcResultMatch)
+    {
+      cairo_hint_style_t hs = CAIRO_HINT_STYLE_SLIGHT;
+      switch (i)
+	{
+	case FC_HINT_NONE:   hs = CAIRO_HINT_STYLE_NONE;   break;
+	case FC_HINT_SLIGHT: hs = CAIRO_HINT_STYLE_SLIGHT; break;
+	case FC_HINT_MEDIUM: hs = CAIRO_HINT_STYLE_MEDIUM; break;
+	case FC_HINT_FULL:   hs = CAIRO_HINT_STYLE_FULL;   break;
+	}
+      cairo_font_options_set_hint_style (options, hs);
+    }
+  else
+    cairo_font_options_set_hint_style (options, CAIRO_HINT_STYLE_SLIGHT);
+
+  /* Emacs's glyph layout assumes integer glyph advances.  */
+  cairo_font_options_set_hint_metrics (options, CAIRO_HINT_METRICS_ON);
+  return options;
+}
+#endif
+
 static Lisp_Object
 ftcrfont_open (struct frame *f, Lisp_Object entity, int pixel_size)
 {
@@ -176,15 +243,11 @@ ftcrfont_open (struct frame *f, Lisp_Object entity, int pixel_size)
 
 #ifdef HAVE_PGTK
   cairo_font_options_t *options = xsettings_get_font_options ();
+#elif defined HAVE_WLSHM
+  /* Honor the user's fontconfig rendering preferences (no xsettings/GTK).  */
+  cairo_font_options_t *options = wlshm_font_options_from_pattern (match);
 #else
   cairo_font_options_t *options = cairo_font_options_create ();
-#ifdef HAVE_WLSHM
-  /* No xsettings/GTK to consult; pick sane defaults so text is antialiased
-     and lightly hinted.  */
-  cairo_font_options_set_antialias (options, CAIRO_ANTIALIAS_GRAY);
-  cairo_font_options_set_hint_style (options, CAIRO_HINT_STYLE_SLIGHT);
-  cairo_font_options_set_hint_metrics (options, CAIRO_HINT_METRICS_ON);
-#endif
 #endif
 #ifdef USE_BE_CAIRO
   if (be_use_subpixel_antialiasing ())

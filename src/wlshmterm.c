@@ -649,9 +649,61 @@ wlshm_draw_composite_glyph_string_foreground (struct glyph_string *s)
     }
 }
 
+/* Draw a smooth wavy line in COLOR, mirroring pgtk_draw_horizontal_wave: a
+   single antialiased stroked zigzag path rather than a staircase of 1px rects,
+   so it stays smooth (not pixelated) at a fractional device scale.  */
+static void
+wlshm_draw_horizontal_wave (struct frame *f, unsigned long color, int x, int y,
+			    int width, int height, int wave_length)
+{
+  cairo_t *cr = wlshm_begin_cr_clip (f);
+  if (!cr)
+    return;
+  double dx = wave_length, dy = height - 1;
+  int xoffset, n;
+  float r, g, b;
+
+  /* The canvas defaults to CAIRO_ANTIALIAS_NONE so axis-aligned rect fills stay
+     sharp at fractional scale; the wave is a diagonal stroke and needs
+     antialiasing to look smooth.  The enclosing cr_clip save restores it.  */
+  cairo_set_antialias (cr, CAIRO_ANTIALIAS_DEFAULT);
+  wlshm_unpack_pixel (color, &r, &g, &b);
+  cairo_set_source_rgb (cr, r, g, b);
+  cairo_rectangle (cr, x, y, width, height);
+  cairo_clip (cr);
+
+  if (x >= 0)
+    {
+      xoffset = x % (wave_length * 2);
+      if (xoffset == 0)
+	xoffset = wave_length * 2;
+    }
+  else
+    xoffset = x % (wave_length * 2) + wave_length * 2;
+  n = (width + xoffset) / wave_length + 1;
+  if (xoffset > wave_length)
+    {
+      xoffset -= wave_length;
+      --n;
+      y += height - 1;
+      dy = -dy;
+    }
+
+  cairo_move_to (cr, x - xoffset + 0.5, y + 0.5);
+  while (--n >= 0)
+    {
+      cairo_rel_line_to (cr, dx, dy);
+      dy = -dy;
+    }
+  cairo_set_line_width (cr, 1);
+  cairo_stroke (cr);
+  wlshm_end_cr_clip (f);
+}
+
 /* Draw the underline for glyph string S in COLOR, honoring the face's
-   underline style (single/double/wave/dots/dashes).  Wave and dotted/dashed
-   styles are approximated with small rects.  */
+   underline style (single/double/wave/dots/dashes).  Dotted/dashed styles are
+   axis-aligned rects (sharp under the canvas's ANTIALIAS_NONE); the wave is a
+   smooth antialiased stroke via wlshm_draw_horizontal_wave.  */
 static void
 wlshm_draw_underline (struct glyph_string *s, unsigned long color)
 {
@@ -671,15 +723,10 @@ wlshm_draw_underline (struct glyph_string *s, unsigned long color)
       break;
     case FACE_UNDERLINE_WAVE:
       {
-	/* Triangle-wave zigzag, amplitude 2px, period 4px.  */
-	const int amp = 2;
-	for (int dx = 0; dx < w; dx++)
-	  {
-	    int phase = dx % (2 * amp);
-	    int dy = phase <= amp ? phase : (2 * amp - phase);
-	    wlshm_window_rect ((float) (x0 + dx), (float) (pos + dy), 1.0f, 1.0f,
-			      r, g, b, 1.0f);
-	  }
+	/* Smooth antialiased zigzag (matches pgtk): height 3, period 4.  */
+	int wave_height = 3, wave_length = 2;
+	wlshm_draw_horizontal_wave (s->f, color, x0, s->ybase - wave_height + 3,
+				    w, wave_height, wave_length);
       }
       break;
     case FACE_UNDERLINE_DOTS:
