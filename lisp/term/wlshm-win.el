@@ -395,6 +395,18 @@ themed spec is prepended, so a load failure falls back to SPECS."
 ;; Any display name maps to the wlshm backend.
 (add-to-list 'display-format-alist '(".*" . wlshm))
 
+;; Modern scroll-bar UX: left-button drags the thumb.  wlshm draws its own bar
+;; using the no-toolkit (xterm) event model, whose default bindings put
+;; thumb-drag on the MIDDLE button and bind left drag-mouse-1 to
+;; `scroll-bar-scroll-up' -- so dragging the thumb with the left button jumps
+;; erratically to the release point instead of tracking.  Rebind the left
+;; button to the drag-tracking commands so the bar behaves like a modern
+;; toolkit scroll bar (press-and-drag the thumb; click off the thumb scrolls
+;; there).  `scroll-bar-drag' already does the track-mouse loop and wlshm
+;; reports the handle position via its mouse-position hook.
+(global-set-key [vertical-scroll-bar down-mouse-1] 'scroll-bar-drag)
+(global-set-key [horizontal-scroll-bar down-mouse-1] 'scroll-bar-horizontal-drag)
+
 (provide 'wlshm-win)
 (provide 'term/wlshm-win)
 ;;; wlshm-win.el ends here
