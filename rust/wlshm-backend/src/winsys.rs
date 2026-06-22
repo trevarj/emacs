@@ -979,7 +979,12 @@ impl Backend {
         // now and arm the next callback.  This throttles a fast redisplay loop
         // (nonstop scroll) to the compositor's frame rate so we never flood it
         // with buffer commits.
-        if w.frame_pending {
+        // Subsurfaces (child frames) bypass the frame-callback throttle: they
+        // don't rapid-update, and an unmapped subsurface may never get a frame
+        // callback -- which would stick frame_pending and freeze the child at
+        // its provisional size (it would never re-present at its real size).
+        let is_sub = matches!(w.role, Role::Subsurface { .. });
+        if w.frame_pending && !is_sub {
             w.pending = Some((buffer, dx, dy, dw, dh));
             return;
         }
@@ -990,7 +995,9 @@ impl Backend {
             None
         };
         if commit_buffer(&self.qh, &surface, &buffer, dx, dy, dw, dh) {
-            w.frame_pending = true;
+            if !is_sub {
+                w.frame_pending = true;
+            }
             // A subsurface's placement/mapping is applied on the PARENT's
             // commit, so nudge the parent after committing the child's buffer.
             if let Some(ps) = parent_surface {
