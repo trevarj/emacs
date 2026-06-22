@@ -3227,13 +3227,56 @@ wlshm_scroll_bar_report_motion (struct frame **fp, Lisp_Object *bar_window,
   *fp = f;
   *bar_window = bar->window;
 
-  int pos, range;
-  *part = wlshm_scroll_bar_part_at (bar, px, py, &pos, &range);
-  XSETINT (*x, pos);
-  XSETINT (*y, range);
+  /* While dragging, report where the handle TOP would land (pointer minus the
+     grab offset) and force the handle part, mirroring x_scroll_bar_report_motion
+     -- scroll-bar.el feeds this position straight into set-window-start.  The
+     plain part_at returns the raw pointer position, which made a drag jump the
+     grabbed point to window-start on every motion (the wrong-feeling drag).  */
+  int range, pos;
+  if (bar->horizontal)
+    {
+      range = HORIZONTAL_SCROLL_BAR_LEFT_RANGE (f, bar->width);
+      pos = px - bar->left - HORIZONTAL_SCROLL_BAR_LEFT_BORDER;
+    }
+  else
+    {
+      range = VERTICAL_SCROLL_BAR_TOP_RANGE (f, bar->height);
+      pos = py - bar->top - VERTICAL_SCROLL_BAR_TOP_BORDER;
+    }
+  if (bar->dragging != -1)
+    pos -= bar->dragging;
+  if (pos < 0)
+    pos = 0;
+  if (pos > range)
+    pos = range;
+
+  if (bar->dragging != -1)
+    *part = bar->horizontal ? scroll_bar_horizontal_handle : scroll_bar_handle;
+  else if (pos < bar->start)
+    *part = bar->horizontal ? scroll_bar_before_handle : scroll_bar_above_handle;
+  else if (pos < bar->end + (bar->horizontal
+			     ? HORIZONTAL_SCROLL_BAR_MIN_HANDLE
+			     : VERTICAL_SCROLL_BAR_MIN_HANDLE))
+    *part = bar->horizontal ? scroll_bar_horizontal_handle : scroll_bar_handle;
+  else
+    *part = bar->horizontal ? scroll_bar_after_handle : scroll_bar_below_handle;
+
+  if (bar->horizontal)
+    {
+      XSETINT (*x, range);
+      XSETINT (*y, pos);
+    }
+  else
+    {
+      XSETINT (*x, pos);
+      XSETINT (*y, range);
+    }
 
   *timestamp = dpyinfo->last_mouse_movement_time;
   f0->mouse_moved = false;
+  /* Clear so mouse-position stops taking the scroll-bar branch once the drag
+     ends (re-armed by note_movement on the next motion over the bar).  */
+  dpyinfo->last_mouse_scroll_bar = NULL;
 }
 
 static int
