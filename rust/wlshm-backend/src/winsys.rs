@@ -220,21 +220,15 @@ impl WlWindow {
         }
     }
 
-    /// Configure the wp_viewport so the physical buffer maps 1:1 to the output
-    /// (no whole-surface resampling -> crisp text/images at fractional scale).
-    /// destination = the LOGICAL surface size; on the fractional path the source
-    /// is the EXACT fractional logical*scale rect, which crops the <=1px slack
-    /// of the ceil'd buffer (wlshm_ensure_canvas) so the source maps pixel-exact
-    /// to the dst*output_scale output region.  The integer fallback relies on
-    /// set_buffer_scale instead, so it only needs the destination.
+    /// Set the wp_viewport DESTINATION = the LOGICAL surface size.  The SOURCE
+    /// (the crisp 1:1 crop) is set in present(), clamped to the actual buffer,
+    /// so it can never exceed the content area (a wp_viewport `out_of_buffer`
+    /// protocol error -- which a subsurface hit when its size/scale and buffer
+    /// briefly diverged, with no xdg configure to resync them).
     fn update_viewport(&self) {
         if let Some(vp) = self.viewport.as_ref() {
             let (lw, lh) = self.size;
             vp.set_destination(lw.max(1) as i32, lh.max(1) as i32);
-            if self.fractional.is_some() {
-                let s = self.scale120 as f64 / 120.0;
-                vp.set_source(0.0, 0.0, (lw as f64 * s).max(1.0), (lh as f64 * s).max(1.0));
-            }
         }
     }
 }
@@ -965,6 +959,18 @@ impl Backend {
         for y in 0..ph as usize {
             let s = std::slice::from_raw_parts(src.add(y * src_stride), row_bytes);
             canvas[y * dst_stride..y * dst_stride + row_bytes].copy_from_slice(s);
+        }
+        // Set the viewport SOURCE to the crisp logical*scale crop, CLAMPED to
+        // this buffer (pw x ph) so it can never exceed the content area (a
+        // wp_viewport out_of_buffer protocol error).  Applied on the commit
+        // below, so source and buffer always agree.
+        if w.fractional.is_some() {
+            if let Some(vp) = w.viewport.as_ref() {
+                let s = w.scale120 as f64 / 120.0;
+                let sw = (w.size.0 as f64 * s).min(pw as f64).max(1.0);
+                let sh = (w.size.1 as f64 * s).min(ph as f64).max(1.0);
+                vp.set_source(0.0, 0.0, sw, sh);
+            }
         }
         // Resolve damage to a concrete rect (full buffer when none was given).
         let (dx, dy, dw, dh) = if dmg_w > 0 && dmg_h > 0 {
