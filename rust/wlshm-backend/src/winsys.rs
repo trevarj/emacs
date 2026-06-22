@@ -207,6 +207,24 @@ impl WlWindow {
             Role::Pending { .. } => None,
         }
     }
+
+    /// Configure the wp_viewport so the physical buffer maps 1:1 to the output
+    /// (no whole-surface resampling -> crisp text/images at fractional scale).
+    /// destination = the LOGICAL surface size; on the fractional path the source
+    /// is the EXACT fractional logical*scale rect, which crops the <=1px slack
+    /// of the ceil'd buffer (wlshm_ensure_canvas) so the source maps pixel-exact
+    /// to the dst*output_scale output region.  The integer fallback relies on
+    /// set_buffer_scale instead, so it only needs the destination.
+    fn update_viewport(&self) {
+        if let Some(vp) = self.viewport.as_ref() {
+            let (lw, lh) = self.size;
+            vp.set_destination(lw.max(1) as i32, lh.max(1) as i32);
+            if self.fractional.is_some() {
+                let s = self.scale120 as f64 / 120.0;
+                vp.set_source(0.0, 0.0, (lw as f64 * s).max(1.0), (lh as f64 * s).max(1.0));
+            }
+        }
+    }
 }
 
 /// Attach BUFFER to SURFACE, damage it, request a wl_surface.frame callback (so
@@ -1095,12 +1113,9 @@ impl WindowHandler for AppState {
             w.pending = None;
             w.pending_resize = Some(w.size);
             let (sw, sh) = w.size;
-            // Fractional path: the viewport maps the physical-pixel buffer down
-            // to the LOGICAL surface size the compositor just told us.  (No-op
-            // when there is no viewport, i.e. the integer fallback.)
-            if let Some(vp) = w.viewport.as_ref() {
-                vp.set_destination(sw as i32, sh as i32);
-            }
+            // Map the physical buffer 1:1 to the output (source = logical*scale,
+            // destination = logical) so the compositor doesn't resample.
+            w.update_viewport();
             self.push(WlshmEvent::configure(sw as i32, sh as i32).on(id));
         }
     }
@@ -1113,12 +1128,9 @@ impl PopupHandler for AppState {
             if config.width > 0 && config.height > 0 {
                 w.size = (config.width as u32, config.height as u32);
             }
-            // Keep the viewport mapping the physical buffer down to the LOGICAL
+            // Keep the viewport mapping the physical buffer 1:1 to the LOGICAL
             // geometry the compositor just assigned (HiDPI; no-op at scale 1).
-            if let Some(vp) = w.viewport.as_ref() {
-                let (lw, lh) = w.size;
-                vp.set_destination(lw.max(1) as i32, lh.max(1) as i32);
-            }
+            w.update_viewport();
             w.configured = true;
             w.frame_pending = false;
             w.pending = None;
@@ -1412,9 +1424,9 @@ impl Dispatch<WpFractionalScaleV1, u64> for AppState {
             // change_frame_size + garbage + redisplay on the C side, and the C
             // wlshm_ensure_canvas re-queries the (now larger) physical size.
             let (lw, lh) = w.size;
-            if let Some(vp) = w.viewport.as_ref() {
-                vp.set_destination(lw as i32, lh as i32);
-            }
+            // Re-arm the viewport source for the NEW scale so the buffer maps
+            // 1:1 to the output (no resample) once the canvas is rebuilt.
+            w.update_viewport();
             state.push(WlshmEvent::configure(lw as i32, lh as i32).on(id));
         }
     }

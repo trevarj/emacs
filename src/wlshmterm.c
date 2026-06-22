@@ -170,8 +170,14 @@ wlshm_ensure_canvas (void)
   if (scale120 < 120)
     scale120 = 120;
   double scale = (double) scale120 / 120.0;
-  int pw = (int) lround ((double) w * scale);
-  int ph = (int) lround ((double) h * scale);
+  /* CEIL, not round: the wp_viewport SOURCE rect is the EXACT fractional
+     logical*scale (set on the Rust side) and must lie within the buffer, so
+     the buffer must be at least that big.  ceil also guarantees we never crop
+     painted content.  The <=1px slack column/row at the far edge is unpainted
+     frame background, excluded by the viewport source crop.  At scale 1.0 this
+     equals the logical size (byte-identical to the non-HiDPI path).  */
+  int pw = (int) ceil ((double) w * scale);
+  int ph = (int) ceil ((double) h * scale);
   if (pw < 1)
     pw = 1;
   if (ph < 1)
