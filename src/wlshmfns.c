@@ -223,12 +223,18 @@ DEFUN ("x-create-frame", Fx_create_frame, Sx_create_frame, 1, 1, 0,
   gui_figure_window_size (f, parms, true, true);
 
   /* A child frame is a wl_subsurface, which gets no compositor configure to
-     learn its size, so push the figured pixel size to the Rust side now.
-     Otherwise the surface stays at its provisional 1x1 and the child renders a
-     2x2 buffer -- effectively invisible.  */
+     learn its size, so push the figured pixel size to the Rust side now
+     (otherwise the surface stays at its provisional 1x1 and the child renders a
+     2x2 buffer -- invisible) and place it at its figured parent-relative
+     position (left/top); Fx_create_frame does not otherwise position it, so it
+     would sit at the parent's top-left.  */
   if (FRAME_PARENT_FRAME (f))
-    wlshm_window_set_size (WLSHM_FRAME_HANDLE (f),
-			   FRAME_PIXEL_WIDTH (f), FRAME_PIXEL_HEIGHT (f));
+    {
+      wlshm_window_set_size (WLSHM_FRAME_HANDLE (f),
+			     FRAME_PIXEL_WIDTH (f), FRAME_PIXEL_HEIGHT (f));
+      wlshm_window_set_subsurface_pos (WLSHM_FRAME_HANDLE (f),
+				       f->left_pos, f->top_pos);
+    }
 
   /* Size the frame to the actual Wayland surface up front, so its pixel
      dimensions match the persistent Cairo canvas from the first paint.
