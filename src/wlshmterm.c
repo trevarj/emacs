@@ -3378,15 +3378,23 @@ wlshm_read_socket (struct terminal *terminal, struct input_event *hold_quit)
 		break;
 	      }
 
-	    struct input_event ie;
-	    EVENT_INIT (ie);
-	    ie.kind = MOUSE_CLICK_EVENT;
-	    ie.code = evs[i].button;
-	    ie.timestamp = evs[i].time;
-	    ie.modifiers = mods | (press ? down_modifier : up_modifier);
-	    XSETINT (ie.x, evs[i].x);
-	    XSETINT (ie.y, evs[i].y);
-	    XSETFRAME (ie.frame_or_window, f);
+	    /* A click in the tab bar becomes a tab-bar event so tabs switch
+	       buffers (mirrors pgtk_handle_event's tab-bar path).  Hover
+	       highlight is already handled by note_mouse_highlight on motion.  */
+	    Lisp_Object tab_bar_arg = Qnil;
+	    bool tab_bar_p = false;
+	    if (WINDOWP (f->tab_bar_window)
+		&& WINDOW_TOTAL_LINES (XWINDOW (f->tab_bar_window)))
+	      {
+		Lisp_Object window
+		  = window_from_coordinates (f, evs[i].x, evs[i].y, 0,
+					     true, true, true);
+		tab_bar_p = EQ (window, f->tab_bar_window);
+		if (tab_bar_p)
+		  tab_bar_arg = handle_tab_bar_click (f, evs[i].x, evs[i].y,
+						      press, mods);
+	      }
+
 	    if (press)
 	      {
 		dpyinfo->grabbed |= (1 << evs[i].button);
@@ -3402,8 +3410,26 @@ wlshm_read_socket (struct terminal *terminal, struct input_event *hold_quit)
 	      }
 	    else
 	      dpyinfo->grabbed &= ~(1 << evs[i].button);
-	    kbd_buffer_store_event_hold (&ie, hold_quit);
-	    count++;
+
+	    /* Suppress the generic click only for a tab-bar press that has not
+	       yet resolved to a tab; otherwise emit it, carrying the tab-bar
+	       arg when present so the tab-bar keymap runs.  */
+	    if (!(tab_bar_p && NILP (tab_bar_arg)))
+	      {
+		struct input_event ie;
+		EVENT_INIT (ie);
+		ie.kind = MOUSE_CLICK_EVENT;
+		ie.code = evs[i].button;
+		ie.timestamp = evs[i].time;
+		ie.modifiers = mods | (press ? down_modifier : up_modifier);
+		XSETINT (ie.x, evs[i].x);
+		XSETINT (ie.y, evs[i].y);
+		XSETFRAME (ie.frame_or_window, f);
+		if (!NILP (tab_bar_arg))
+		  ie.arg = tab_bar_arg;
+		kbd_buffer_store_event_hold (&ie, hold_quit);
+		count++;
+	      }
 	    wlshm_log ("button stored");
 	  }
 	  break;
