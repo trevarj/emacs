@@ -20,6 +20,8 @@ See wlshm-backend-plan.md.  */
 #include "coding.h"
 #include "wlshmterm.h"
 
+static void do_unwind_create_frame (Lisp_Object frame);
+
 /* Return the wlshm display info for OBJECT (a frame, terminal, display name,
    or nil for the default).  Signals if there is no wlshm display.
    Only the default display is supported.  */
@@ -49,6 +51,7 @@ DEFUN ("x-create-frame", Fx_create_frame, Sx_create_frame, 1, 1, 0,
   Lisp_Object display;
   struct wlshm_display_info *dpyinfo;
   struct kboard *kb;
+  specpdl_ref count = SPECPDL_INDEX ();
 
   parms = Fcopy_alist (parms);
   Vx_resource_name = Vinvocation_name;
@@ -92,6 +95,13 @@ DEFUN ("x-create-frame", Fx_create_frame, Sx_create_frame, 1, 1, 0,
   FRAME_X_OUTPUT (f)->scroll_bar_foreground_pixel = -1;
   FRAME_X_OUTPUT (f)->scroll_bar_background_pixel = -1;
   FRAME_DISPLAY_INFO (f) = dpyinfo;
+
+  /* Now that the frame and its output are minimally set up, protect against a
+     signal during the rest of creation (color/font/face parameter parsing,
+     gui_figure_window_size, change_frame_size): do_unwind_create_frame closes
+     the Wayland window and tears down the half-built frame so it can't leak or
+     be left in Vframe_list.  Mirrors pgtk's do_unwind_create_frame.  */
+  record_unwind_protect (do_unwind_create_frame, frame);
 
   /* Read parent-frame from the parameters now (like pgtk) so the window can be
      opened as a child -- a wl_subsurface that floats over its parent -- instead
@@ -275,7 +285,7 @@ DEFUN ("x-create-frame", Fx_create_frame, Sx_create_frame, 1, 1, 0,
   store_frame_param (f, Qvisibility, Qt);
   SET_FRAME_GARBAGED (f);
 
-  return frame;
+  return unbind_to (count, frame);
 }
 
 DEFUN ("x-open-connection", Fx_open_connection, Sx_open_connection, 1, 3, 0,
@@ -495,6 +505,14 @@ unwind_create_frame (Lisp_Object frame)
     }
 
   return Qnil;
+}
+
+/* Void wrapper so unwind_create_frame can be a record_unwind_protect handler
+   (which discards the value the tip path uses).  Mirrors pgtk.  */
+static void
+do_unwind_create_frame (Lisp_Object frame)
+{
+  unwind_create_frame (frame);
 }
 
 static void
