@@ -2897,12 +2897,23 @@ wlshm_scroll_bar_redraw (struct scroll_bar *bar)
   struct wlshm_output *out = FRAME_X_OUTPUT (f);
   unsigned long frame_fg = FRAME_FOREGROUND_PIXEL (f);
   unsigned long frame_bg = FRAME_BACKGROUND_PIXEL (f);
+  /* Base the trough/handle on the `scroll-bar' face, not the frame background,
+     so a child frame's bar (e.g. a corfu popup) matches its themed scroll-bar
+     column instead of blitting the popup body color.  Honor face remapping and
+     fall back to the frame colors only when the face is unavailable.  An
+     explicit scroll-bar-{background,foreground} frame parameter still wins.  */
+  int sb_face_id = SCROLL_BAR_FACE_ID;
+  if (!NILP (Vface_remapping_alist))
+    sb_face_id = lookup_basic_face (XWINDOW (bar->window), f, SCROLL_BAR_FACE_ID);
+  struct face *sb_face = FACE_FROM_ID_OR_NULL (f, sb_face_id);
+  unsigned long sb_bg = sb_face ? sb_face->background : frame_bg;
+  unsigned long sb_fg = sb_face ? sb_face->foreground : frame_fg;
   unsigned long trough = (out->scroll_bar_background_pixel != (unsigned long) -1
 			  ? out->scroll_bar_background_pixel
-			  : wlshm_blend_pixel (frame_bg, frame_fg, 0.08));
+			  : sb_bg);
   unsigned long handle = (out->scroll_bar_foreground_pixel != (unsigned long) -1
 			  ? out->scroll_bar_foreground_pixel
-			  : wlshm_blend_pixel (frame_bg, frame_fg, 0.42));
+			  : wlshm_blend_pixel (sb_bg, sb_fg, 0.42));
   int left = bar->left, top = bar->top, width = bar->width, height = bar->height;
 
   if (width <= 0 || height <= 0)
