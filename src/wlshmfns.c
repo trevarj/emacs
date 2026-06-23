@@ -234,6 +234,14 @@ DEFUN ("x-create-frame", Fx_create_frame, Sx_create_frame, 1, 1, 0,
 			     FRAME_PIXEL_WIDTH (f), FRAME_PIXEL_HEIGHT (f));
       wlshm_window_set_subsurface_pos (WLSHM_FRAME_HANDLE (f),
 				       f->left_pos, f->top_pos);
+      /* A subsurface gets no compositor configure, so adjust_frame_size's
+	 `can_set_window_size' gate would never open and a later set-frame-size
+	 (e.g. corfu growing its popup as candidates change) would silently NOT
+	 call set_window_size_hook -- leaving wlshm's w.size and the Cairo canvas
+	 stuck at the creation size, so the popup renders into a too-small box.
+	 The child's size is Emacs-driven (not compositor-driven), so allow the
+	 hook now.  */
+      f->can_set_window_size = true;
     }
 
   /* Size the frame to the actual Wayland surface up front, so its pixel
