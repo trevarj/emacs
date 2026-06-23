@@ -648,6 +648,13 @@ ftcrfont_draw (struct glyph_string *s,
   cr = x_begin_cr_clip (f, s->gc);
 #elif defined HAVE_WLSHM
   cr = wlshm_begin_cr_clip (f);
+  /* The canvas allocation can fail (huge size / OOM), leaving cr NULL; bail
+     rather than dereferencing it below.  Mirrors the Haiku branch.  */
+  if (!cr)
+    {
+      unblock_input ();
+      return 0;
+    }
 #else
   cr = pgtk_begin_cr_clip (f);
 #endif

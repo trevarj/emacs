@@ -1003,6 +1003,8 @@ wlshm_cr_draw_image (struct frame *f, unsigned long fg, unsigned long bg,
 		     bool overlay_p)
 {
   cairo_t *cr = wlshm_begin_cr_clip (f);
+  if (!cr)
+    return;
   float r, g, b;
 
   if (overlay_p)
@@ -1057,6 +1059,8 @@ wlshm_draw_image_foreground (struct glyph_string *s)
   if (s->img->cr_data)
     {
       cairo_t *cr = wlshm_begin_cr_clip (s->f);
+      if (!cr)
+	return;
       wlshm_set_glyph_string_clipping (s, cr);
       wlshm_cr_draw_image (s->f, s->xgcv.foreground, s->xgcv.background,
 			   s->img->cr_data, s->slice.x, s->slice.y,
@@ -1202,6 +1206,12 @@ wlshm_draw_glyph_string (struct glyph_string *s)
      overhangs/neighbours don't smear (the inner wlshm_window_rect and
      ftcrfont begin/end cr-clip calls nest inside this save).  */
   cairo_t *cr = wlshm_begin_cr_clip (s->f);
+  /* The canvas allocation can fail (huge size / OOM), leaving wlshm_cr NULL;
+     bail rather than dereferencing it through the clipping/box/font-draw paths
+     (pgtk's context is always live, but wlshm's allocate-and-bail canvas is
+     not).  The next redisplay retries.  */
+  if (!cr)
+    return;
   wlshm_set_glyph_string_clipping (s, cr);
 
   switch (s->first_glyph->type)
