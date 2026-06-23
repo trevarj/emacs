@@ -2785,6 +2785,14 @@ wlshm_update_begin (struct frame *f)
   block_input ();
   wlshm_cur = f;
   wlshm_ensure_canvas ();
+  /* Repaint the internal border / top+bottom margin strips every update, as
+     pgtk_update_begin does.  These regions are outside every window's glyph
+     matrix, so incremental redisplay never repaints them; on wlshm's
+     persistent, fully-presented canvas any residue left there (a corfu
+     subsurface overlap, a resize that shrank content, mouse-face/relief
+     overhang, a tooltip) would otherwise ride along on every present until a
+     full garbage redraw -- the "dirty pixels at the frame edges" symptom.  */
+  wlshm_clear_under_internal_border (f);
   unblock_input ();
 }
 
