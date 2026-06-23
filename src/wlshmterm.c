@@ -2922,17 +2922,30 @@ wlshm_scroll_bar_redraw (struct scroll_bar *bar)
   struct wlshm_output *out = FRAME_X_OUTPUT (f);
   unsigned long frame_fg = FRAME_FOREGROUND_PIXEL (f);
   unsigned long frame_bg = FRAME_BACKGROUND_PIXEL (f);
-  /* Base the trough/handle on the `scroll-bar' face, not the frame background,
-     so a child frame's bar (e.g. a corfu popup) matches its themed scroll-bar
-     column instead of blitting the popup body color.  Honor face remapping and
-     fall back to the frame colors only when the face is unavailable.  An
-     explicit scroll-bar-{background,foreground} frame parameter still wins.  */
-  int sb_face_id = SCROLL_BAR_FACE_ID;
-  if (!NILP (Vface_remapping_alist))
-    sb_face_id = lookup_basic_face (XWINDOW (bar->window), f, SCROLL_BAR_FACE_ID);
-  struct face *sb_face = FACE_FROM_ID_OR_NULL (f, sb_face_id);
-  unsigned long sb_bg = sb_face ? sb_face->background : frame_bg;
-  unsigned long sb_fg = sb_face ? sb_face->foreground : frame_fg;
+  /* Pick the trough/handle base colors.  For a CHILD frame (e.g. a corfu
+     completion popup) use the PARENT frame's colors: the bar is chrome around
+     the popup body, and on pgtk -- which uses GTK toolkit scroll bars -- it is
+     painted by the surrounding theme (white), not the popup's own (cream)
+     background.  Using the parent's default background matches that.  For a
+     normal top-level frame use the `scroll-bar' face (honoring remapping),
+     falling back to the frame colors.  An explicit scroll-bar-{background,
+     foreground} frame parameter still wins below.  */
+  unsigned long sb_bg, sb_fg;
+  struct frame *pf = FRAME_PARENT_FRAME (f);
+  if (pf)
+    {
+      sb_bg = FRAME_BACKGROUND_PIXEL (pf);
+      sb_fg = FRAME_FOREGROUND_PIXEL (pf);
+    }
+  else
+    {
+      int sb_face_id = SCROLL_BAR_FACE_ID;
+      if (!NILP (Vface_remapping_alist))
+	sb_face_id = lookup_basic_face (XWINDOW (bar->window), f, SCROLL_BAR_FACE_ID);
+      struct face *sb_face = FACE_FROM_ID_OR_NULL (f, sb_face_id);
+      sb_bg = sb_face ? sb_face->background : frame_bg;
+      sb_fg = sb_face ? sb_face->foreground : frame_fg;
+    }
   unsigned long trough = (out->scroll_bar_background_pixel != (unsigned long) -1
 			  ? out->scroll_bar_background_pixel
 			  : sb_bg);
