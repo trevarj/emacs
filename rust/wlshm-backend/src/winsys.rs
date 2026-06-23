@@ -936,6 +936,18 @@ impl Backend {
         for id in ids {
             let pending = self.state.windows.get_mut(&id).and_then(|w| w.pending.take());
             let Some((buffer, dx, dy, dw, dh)) = pending else { continue };
+            // Skip an unconfigured xdg surface: it was unmapped/hidden after this
+            // buffer was coalesced, so attaching it now is xdg_surface error 3
+            // (unconfigured_buffer) and the compositor disconnects us.  A
+            // subsurface has no unconfigured state, so it is always eligible.
+            // Dropping the taken `pending` frees its pool slot; the next present
+            // re-attaches once a fresh configure lands.
+            let eligible = self.state.windows.get(&id).map_or(false, |w| {
+                w.configured || matches!(w.role, Role::Subsurface { .. })
+            });
+            if !eligible {
+                continue;
+            }
             let Some(surf) =
                 self.state.windows.get(&id).and_then(|w| w.wl_surface().cloned())
             else {
@@ -1295,6 +1307,19 @@ impl CompositorHandler for AppState {
             None => return,
         };
         if let Some((buffer, dx, dy, dw, dh)) = pending {
+            // Don't commit onto an unconfigured xdg surface: it was unmapped
+            // while this frame callback was still outstanding, and attaching a
+            // buffer to a surface in the initial unconfigured state is
+            // xdg_surface error 3 (the compositor disconnects us).  Subsurfaces
+            // have no unconfigured state, so they stay eligible.  The taken
+            // buffer is dropped (its pool slot freed); the next present
+            // re-attaches after a fresh configure.
+            let eligible = self.windows.get(&id).map_or(false, |w| {
+                w.configured || matches!(w.role, Role::Subsurface { .. })
+            });
+            if !eligible {
+                return;
+            }
             if let Some(surf) = self.windows.get(&id).and_then(|w| w.wl_surface().cloned()) {
                 if commit_buffer(qh, &surf, &buffer, dx, dy, dw, dh) {
                     if let Some(w) = self.windows.get_mut(&id) {
@@ -2387,6 +2412,13 @@ pub extern "C" fn wlshm_window_unmap(win: u64) {
                     if parent.is_none() {
                         w.configured = false;
                     }
+                    // Drop any buffer coalesced before this unmap and clear the
+                    // throttle.  Otherwise a stranded frame() callback or the
+                    // present-deadline flush could later commit that stale buffer
+                    // onto the now unmapped/unconfigured surface (xdg_surface
+                    // error 3).  The next present re-attaches a fresh buffer.
+                    w.pending = None;
+                    w.frame_pending = false;
                     // A subsurface's NULL-buffer unmap applies on the child commit
                     // (desync), but its PLACEMENT is parent-cached.  Commit the
                     // parent here so the hide is ordered atomically -- otherwise a
