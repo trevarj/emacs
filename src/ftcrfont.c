@@ -133,10 +133,10 @@ ftcrfont_match (struct frame *f, Lisp_Object spec)
 #ifdef HAVE_WLSHM
 /* Translate the resolved fontconfig pattern MATCH (already run through
    FcConfigSubstitute/FcDefaultSubstitute) into cairo font options, so wlshm
-   honors the user's fontconfig rendering preferences -- antialias mode,
-   subpixel order, hint style -- instead of hardcoding GRAY/SLIGHT.  This makes
-   wlshm text match every other cairo/fontconfig app on the system.  Hint
-   metrics stay ON because Emacs's glyph layout assumes integer advances.  */
+   honors the user's fontconfig rendering preferences -- antialias mode and
+   hint style -- instead of hardcoding GRAY/SLIGHT.  This makes wlshm text
+   match every other cairo/fontconfig app on the system.  Hint metrics stay ON
+   because Emacs's glyph layout assumes integer advances.  */
 static cairo_font_options_t *
 wlshm_font_options_from_pattern (FcPattern *match)
 {
@@ -144,31 +144,19 @@ wlshm_font_options_from_pattern (FcPattern *match)
   FcBool b;
   int i;
 
-  /* Antialiasing + subpixel order.  */
+  /* Antialiasing.  Deliberately NEVER use CAIRO_ANTIALIAS_SUBPIXEL even when
+     the user's fontconfig requests LCD/RGBA order: the glyphs are rasterized
+     into a wl_shm buffer that the compositor composites itself, and on the
+     fractional-scale path a wp_viewport RESAMPLES that buffer to the logical
+     size.  The physical panel's subpixel layout is unknown to us, and the
+     resample smears any subpixel triad into a coloured (red/blue/cyan) edge
+     fringe -- the "dirty pixels" / cyan-above-the-mode-line artifact.  Like
+     every Wayland toolkit (and pgtk), fall back to plain GRAY antialiasing.  */
   bool antialias = true;
   if (FcPatternGetBool (match, FC_ANTIALIAS, 0, &b) == FcResultMatch)
     antialias = b;
-  int rgba = FC_RGBA_UNKNOWN;
-  if (FcPatternGetInteger (match, FC_RGBA, 0, &rgba) != FcResultMatch)
-    rgba = FC_RGBA_UNKNOWN;
-  if (!antialias)
-    cairo_font_options_set_antialias (options, CAIRO_ANTIALIAS_NONE);
-  else if (rgba == FC_RGBA_RGB || rgba == FC_RGBA_BGR
-	   || rgba == FC_RGBA_VRGB || rgba == FC_RGBA_VBGR)
-    {
-      cairo_subpixel_order_t spo = CAIRO_SUBPIXEL_ORDER_DEFAULT;
-      switch (rgba)
-	{
-	case FC_RGBA_RGB:  spo = CAIRO_SUBPIXEL_ORDER_RGB;  break;
-	case FC_RGBA_BGR:  spo = CAIRO_SUBPIXEL_ORDER_BGR;  break;
-	case FC_RGBA_VRGB: spo = CAIRO_SUBPIXEL_ORDER_VRGB; break;
-	case FC_RGBA_VBGR: spo = CAIRO_SUBPIXEL_ORDER_VBGR; break;
-	}
-      cairo_font_options_set_antialias (options, CAIRO_ANTIALIAS_SUBPIXEL);
-      cairo_font_options_set_subpixel_order (options, spo);
-    }
-  else
-    cairo_font_options_set_antialias (options, CAIRO_ANTIALIAS_GRAY);
+  cairo_font_options_set_antialias (options, antialias ? CAIRO_ANTIALIAS_GRAY
+				    : CAIRO_ANTIALIAS_NONE);
 
   /* Hinting.  */
   bool hinting = true;
