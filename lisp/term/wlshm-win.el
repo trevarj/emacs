@@ -55,13 +55,11 @@
   (cl-assert (not wlshm-initialized))
   (create-default-fontset)
   (x-open-connection (or display "wayland") x-command-line-resources t)
-  ;; Pin a LOGICAL default pixel size (explicit pixelsize so the face system
-  ;; doesn't collapse the size), only if the user hasn't set a font.  HiDPI
-  ;; crispness is handled by the Cairo device scale on the canvas, so the font
-  ;; stays logical -- scaling it here too would double-scale the text.
-  (unless (or (assq 'font default-frame-alist)
-              (assq 'font initial-frame-alist))
-    (push (cons 'font "Monospace:pixelsize=14") default-frame-alist))
+  ;; The default font (12pt, derived from the display resolution to ~16px at
+  ;; 96 DPI, matching pgtk) is chosen in C by wlshm_default_font_parameter when
+  ;; the user hasn't set one -- so it tracks the resolution rather than being a
+  ;; fixed pixel count pinned here.  HiDPI crispness is handled by the Cairo
+  ;; device scale on the canvas; the font stays logical (no double-scaling).
   (setq wlshm-initialized t))
 
 ;;; Selection / clipboard.

@@ -2051,13 +2051,19 @@ wlshm_default_font_parameter (struct frame *f, Lisp_Object parms)
 
   if (!FONTP (font) && !STRINGP (font))
     {
-      /* Use an explicit LOGICAL pixel size (avoids the point-size /
-	 face-height path that can collapse to 1px).  HiDPI crispness comes
-	 entirely from the Cairo device scale on the canvas, so the font stays
-	 logical -- bumping it by the scale here would double-scale the text.  */
+      /* Default to a 12pt LOGICAL size, matching pgtk (which picks up the 12pt
+	 GNOME system font) so wlshm doesn't render smaller by default.  Derive
+	 the pixel size from the display resolution ourselves (12pt * resx/72 =
+	 16px at 96 DPI) rather than passing a point size to fontconfig, which
+	 converts with its own DPI and lands ~14px.  This tracks dpyinfo->resx
+	 yet reliably matches pgtk; HiDPI crispness still comes entirely from the
+	 Cairo device scale, so the font stays logical (no double-scaling).  */
+      int px = (int) lround (12.0 * FRAME_DISPLAY_INFO (f)->resx / 72.0);
+      if (px < 1)
+	px = 16;
       char sized[64];
-      snprintf (sized, sizeof sized, "Monospace:pixelsize=%d", 14);
-      const char *names[] = { sized, "monospace-10", "fixed", NULL };
+      snprintf (sized, sizeof sized, "Monospace:pixelsize=%d", px);
+      const char *names[] = { sized, "Monospace:pixelsize=16", "fixed", NULL };
       for (int i = 0; names[i]; i++)
 	{
 	  font = font_open_by_name (f, build_unibyte_string (names[i]));
