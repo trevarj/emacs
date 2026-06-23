@@ -5286,6 +5286,12 @@ scrolling_window (struct window *w, int tab_line_p)
   struct row_entry *entry;
   struct redisplay_interface *rif = FRAME_RIF (XFRAME (WINDOW_FRAME (w)));
 
+  /* On a fractional-scale wlshm frame, copying pixels misplaces glyph
+     rasterizations and leaves stale fringes; give up like the stipple case
+     below so the rows are redrawn fresh.  */
+  if (FRAME_SCROLL_COPY_UNSAFE (XFRAME (WINDOW_FRAME (w))))
+    return 0;
+
   /* Skip over rows equal at the start.  */
   for (i = tab_line_p; i < current_matrix->nrows - 1; ++i)
     {

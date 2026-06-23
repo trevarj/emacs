@@ -21761,6 +21761,11 @@ try_window_reusing_current_matrix (struct window *w)
   if (is_tty_root_frame_with_visible_child (f))
     return false;
 
+  /* Copy-based scrolling misplaces glyphs on a fractional-scale wlshm frame
+     (stale fringes that persist until a full redraw); redraw instead.  */
+  if (FRAME_SCROLL_COPY_UNSAFE (f))
+    return false;
+
   struct glyph_row *bottom_row;
   struct it it;
   struct run run;
@@ -22590,6 +22595,11 @@ try_window_id (struct window *w)
 #endif
 
   SET_TEXT_POS_FROM_MARKER (start, w->start);
+
+  /* Copy-based scrolling misplaces glyphs on a fractional-scale wlshm frame
+     (stale fringes that persist until a full redraw); redraw instead.  */
+  if (FRAME_SCROLL_COPY_UNSAFE (f))
+    GIVE_UP (30);
 
   /* Don't use this for mini-windows because these can show
      messages and mini-buffers, and we don't handle that here.  */

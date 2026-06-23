@@ -1072,6 +1072,19 @@ default_pixels_per_inch_y (void)
 # define FRAME_SCALE_FACTOR(f) 1
 #endif
 
+/* True if copy-based scroll optimizations must be avoided on F.  wlshm
+   rasterizes glyphs into a wl_shm buffer at a fractional device scale; moving
+   a block of those pixels by an integer offset (as scroll_run_hook does) lands
+   the glyph rasterizations at a sub-pixel phase a fresh render would never
+   produce, leaving faint stale fringes (a cyan line above the mode line, etc.)
+   until the next full redraw.  At an integer scale the copy is exact, so only
+   fractional scales are unsafe.  Redisplay gives up scrolling for such frames
+   and redraws the affected rows instead.  FRAME_WLSHM_P short-circuits to false
+   for every other backend (so FRAME_SCALE_FACTOR is not even evaluated).  */
+#define FRAME_SCROLL_COPY_UNSAFE(f)				\
+  (FRAME_WLSHM_P (f)						\
+   && FRAME_SCALE_FACTOR (f) != (double) (int) FRAME_SCALE_FACTOR (f))
+
 /* Native width and height of frame F, in pixels and frame
    columns/lines.  */
 #define FRAME_PIXEL_WIDTH(f) ((f)->pixel_width)
