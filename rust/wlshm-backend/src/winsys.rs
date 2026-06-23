@@ -903,11 +903,16 @@ impl Backend {
         // The window may have been torn down between resolve() and this lookup
         // (a close racing a present, e.g. via the menu modal loop or tooltip
         // force-present paths), so guard instead of unwrapping.
-        let configured = match self.state.windows.get(&id) {
-            Some(w) => w.configured,
+        let (configured, is_sub) = match self.state.windows.get(&id) {
+            Some(w) => (w.configured, matches!(w.role, Role::Subsurface { .. })),
             None => return,
         };
-        if !configured {
+        // A subsurface is not an xdg surface: it has no unconfigured state and
+        // never receives an xdg configure, so the recovery dance below would
+        // bail forever (it stays !configured after a hide -- corfu/child-frame
+        // popups went permanently invisible after the first hide/show).  Skip it
+        // for subsurfaces; they re-attach a buffer directly on the next present.
+        if !configured && !is_sub {
             // The surface is in the unconfigured xdg_surface state: it has
             // either never been configured, or it was unmapped (wlshm_window_unmap
             // commits a NULL buffer, which per xdg-shell returns the surface to
@@ -2233,12 +2238,18 @@ pub extern "C" fn wlshm_window_unmap(win: u64) {
                     let Some(surface) = w.wl_surface().cloned() else { return };
                     surface.attach(None, 0, 0);
                     surface.commit();
-                    // Unmapping returns the surface to the unconfigured
-                    // xdg_surface state: a fresh configure is required before the
-                    // next buffer.  Clear `configured` so the remap path in
-                    // present() re-enters the configure sequence instead of
-                    // committing a buffer (xdg_surface error 3).
-                    w.configured = false;
+                    // Unmapping an xdg surface returns it to the unconfigured
+                    // state: a fresh configure is required before the next
+                    // buffer.  Clear `configured` so the remap path in present()
+                    // re-enters the configure sequence instead of committing a
+                    // buffer (xdg_surface error 3).  But a SUBSURFACE is not an
+                    // xdg surface -- it gets no configure to clear the flag
+                    // again, so clearing it here would wedge it invisible after
+                    // the first hide (corfu popups).  Keep it configured; the
+                    // next present re-attaches a buffer + parent commit.
+                    if !matches!(w.role, Role::Subsurface { .. }) {
+                        w.configured = false;
+                    }
                     let _ = b.conn.flush();
                 }
             }
