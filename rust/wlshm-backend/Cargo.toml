@@ -35,3 +35,8 @@ libc = "0.2"               # timerfd for client-side key repeat
 opt-level = 3
 lto = true
 codegen-units = 1
+# This crate is a staticlib linked into Emacs; a panic must not unwind across
+# the extern "C" FFI boundary into C.  Abort instead so a panic is a clean,
+# defined process termination rather than relying on the per-target unwind
+# guard.  (Only affects release; the test profile keeps unwinding.)
+panic = "abort"
