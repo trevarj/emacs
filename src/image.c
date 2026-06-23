@@ -159,28 +159,11 @@ typedef struct pgtk_bitmap_record Bitmap_Record;
 #endif
 
 #ifdef HAVE_WLSHM
-/* The wlshm backend keeps images as plain in-memory pixel containers (the
-   same minimal struct USE_CAIRO uses), which it uploads to GPU textures at
-   draw time.  Pixel access is therefore pure buffer math.  The GET_PIXEL /
-   PUT_PIXEL / NO_PIXMAP / PIX_MASK_* / *_FROM_ULONG macros below are also
-   provided by the USE_CAIRO blocks above (with identical values); only the
-   Bitmap_Record typedef is unique to wlshm.  */
+/* A wlshm build always defines USE_CAIRO (enforced by the #error above), so the
+   GET_PIXEL / PUT_PIXEL / NO_PIXMAP / PIX_MASK_* / *_FROM_ULONG macros are
+   already provided by the USE_CAIRO blocks above.  Only the Bitmap_Record
+   typedef is unique to wlshm.  */
 typedef struct wlshm_bitmap_record Bitmap_Record;
-#define GET_PIXEL image_pix_context_get_pixel
-#define PUT_PIXEL image_pix_container_put_pixel
-#define NO_PIXMAP 0
-
-#define PIX_MASK_RETAIN	0
-#define PIX_MASK_DRAW	255
-
-#define RGB_TO_ULONG(r, g, b) (((r) << 16) | ((g) << 8) | (b))
-#define ARGB_TO_ULONG(a, r, g, b) (((a) << 24) | ((r) << 16) | ((g) << 8) | (b))
-#define RED_FROM_ULONG(color)	(((color) >> 16) & 0xff)
-#define GREEN_FROM_ULONG(color)	(((color) >> 8) & 0xff)
-#define BLUE_FROM_ULONG(color)	((color) & 0xff)
-#define RED16_FROM_ULONG(color)		(RED_FROM_ULONG (color) * 0x101)
-#define GREEN16_FROM_ULONG(color)	(GREEN_FROM_ULONG (color) * 0x101)
-#define BLUE16_FROM_ULONG(color)	(BLUE_FROM_ULONG (color) * 0x101)
 #endif /* HAVE_WLSHM */
 
 #if (defined HAVE_X_WINDOWS \
