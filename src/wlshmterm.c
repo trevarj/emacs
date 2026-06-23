@@ -1858,6 +1858,29 @@ wlshm_clear_under_internal_border (struct frame *f)
   unblock_input ();
 }
 
+/* Fill a LOGICAL rect with AA-none on the physical pixel grid (snapping edges),
+   for crisp window-divider / window-border lines.  Drawing a 1px-logical line
+   through the antialiased wlshm_fill_rect_pixel path smears it into a
+   0/128/255 coverage ramp at a fractional device scale (a fuzzy edge that also
+   overshoots the AA-none mode-line background by a row at the corner).  Mirrors
+   the box's wlshm_fill_phys path.  */
+static void
+wlshm_fill_rect_phys (int x, int y, int w, int h, unsigned long pixel)
+{
+  wlshm_ensure_canvas ();
+  if (!wlshm_canvas || w <= 0 || h <= 0)
+    return;
+  double sx = 1.0, sy = 1.0;
+  cairo_surface_get_device_scale (wlshm_canvas, &sx, &sy);
+  int pl = (int) lround (x * sx);
+  int pr = (int) lround ((x + w) * sx);
+  int pt = (int) lround (y * sy);
+  int pb = (int) lround ((y + h) * sy);
+  float r, g, b;
+  wlshm_unpack_pixel (pixel, &r, &g, &b);
+  wlshm_fill_phys (pl, pt, pr - pl, pb - pt, r, g, b);
+}
+
 /* 1px line separating side-by-side windows (no divider configured).  */
 static void
 wlshm_draw_vertical_window_border (struct window *w, int x, int y0, int y1)
@@ -1867,7 +1890,7 @@ wlshm_draw_vertical_window_border (struct window *w, int x, int y0, int y1)
   struct face *face = FACE_FROM_ID_OR_NULL (f, VERTICAL_BORDER_FACE_ID);
   unsigned long pixel = face ? face->foreground : FRAME_FOREGROUND_PIXEL (f);
   block_input ();
-  wlshm_fill_rect_pixel (x, y0, 1, y1 - y0, pixel);
+  wlshm_fill_rect_phys (x, y0, 1, y1 - y0, pixel);
   unblock_input ();
 }
 
@@ -1893,19 +1916,19 @@ wlshm_draw_window_divider (struct window *w, int x0, int x1, int y0, int y1)
   if (y1 - y0 > x1 - x0 && x1 - x0 > 2)
     {
       /* Vertical divider.  */
-      wlshm_fill_rect_pixel (x0, y0, 1, y1 - y0, color_first);
-      wlshm_fill_rect_pixel (x0 + 1, y0, x1 - x0 - 2, y1 - y0, color);
-      wlshm_fill_rect_pixel (x1 - 1, y0, 1, y1 - y0, color_last);
+      wlshm_fill_rect_phys (x0, y0, 1, y1 - y0, color_first);
+      wlshm_fill_rect_phys (x0 + 1, y0, x1 - x0 - 2, y1 - y0, color);
+      wlshm_fill_rect_phys (x1 - 1, y0, 1, y1 - y0, color_last);
     }
   else if (x1 - x0 > y1 - y0 && y1 - y0 > 3)
     {
       /* Horizontal divider.  */
-      wlshm_fill_rect_pixel (x0, y0, x1 - x0, 1, color_first);
-      wlshm_fill_rect_pixel (x0, y0 + 1, x1 - x0, y1 - y0 - 2, color);
-      wlshm_fill_rect_pixel (x0, y1 - 1, x1 - x0, 1, color_last);
+      wlshm_fill_rect_phys (x0, y0, x1 - x0, 1, color_first);
+      wlshm_fill_rect_phys (x0, y0 + 1, x1 - x0, y1 - y0 - 2, color);
+      wlshm_fill_rect_phys (x0, y1 - 1, x1 - x0, 1, color_last);
     }
   else
-    wlshm_fill_rect_pixel (x0, y0, x1 - x0, y1 - y0, color);
+    wlshm_fill_rect_phys (x0, y0, x1 - x0, y1 - y0, color);
   unblock_input ();
 }
 
