@@ -1108,10 +1108,16 @@ wlshm_frame_geometry (Lisp_Object frame, Lisp_Object attribute)
   struct frame *f = decode_live_frame (frame);
   int native_width = FRAME_PIXEL_WIDTH (f);
   int native_height = FRAME_PIXEL_HEIGHT (f);
-  int outer_left = 0, outer_top = 0;
-  int outer_right = native_width, outer_bottom = native_height;
-  int native_left = 0, native_top = 0;
-  int native_right = native_width, native_bottom = native_height;
+  /* A child frame's subsurface sits at (left_pos, top_pos) relative to its
+     parent; report that so frame-edges/frame-position track moves (corfu and
+     posframe rely on it).  A toplevel gets no global position from Wayland, so
+     it stays at the (0,0) origin.  */
+  int pos_left = FRAME_PARENT_FRAME (f) ? f->left_pos : 0;
+  int pos_top = FRAME_PARENT_FRAME (f) ? f->top_pos : 0;
+  int outer_left = pos_left, outer_top = pos_top;
+  int outer_right = pos_left + native_width, outer_bottom = pos_top + native_height;
+  int native_left = pos_left, native_top = pos_top;
+  int native_right = pos_left + native_width, native_bottom = pos_top + native_height;
   int internal_border_width = FRAME_INTERNAL_BORDER_WIDTH (f);
   int inner_left = native_left + internal_border_width;
   int inner_top = native_top + internal_border_width;

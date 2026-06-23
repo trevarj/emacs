@@ -2081,16 +2081,57 @@ wlshm_frame_raise_lower (struct frame *f, bool raise_flag)
   /* Wayland gives clients no control over window stacking.  No-op.  */
 }
 
+/* Resolve a negative (right/bottom-relative) child-frame offset to a top-left
+   position relative to the parent, mirroring pgtk_calc_absolute_position.  Only
+   child frames are positionable on Wayland, so this handles that case.  */
+static void
+wlshm_calc_absolute_position (struct frame *f)
+{
+  struct frame *p = FRAME_PARENT_FRAME (f);
+  int flags = f->size_hint_flags;
+
+  if (!p || !((flags & XNegative) || (flags & YNegative)))
+    return;
+
+  if (flags & XNegative)
+    f->left_pos = (FRAME_PIXEL_WIDTH (p) - FRAME_PIXEL_WIDTH (f)
+		   - 2 * f->border_width + f->left_pos);
+  if (flags & YNegative)
+    f->top_pos = (FRAME_PIXEL_HEIGHT (p) - FRAME_PIXEL_HEIGHT (f)
+		  - 2 * f->border_width + f->top_pos);
+  f->size_hint_flags &= ~ (XNegative | YNegative);
+}
+
 static void
 wlshm_set_frame_offset (struct frame *f, int xoff, int yoff, int change_gravity)
 {
+  /* Record the requested position.  Fset_frame_position routes here WITHOUT
+     updating left_pos/top_pos itself (unlike modify-frame-parameters), relying
+     on the backend hook to store them -- as pgtk_set_offset/x_set_offset do.
+     Child-frame packages (corfu-popupinfo, posframe) read a sibling's
+     frame-position to place the next popup, so a stale value makes them
+     overlap.  */
+  if (change_gravity > 0)
+    {
+      f->top_pos = yoff;
+      f->left_pos = xoff;
+      f->size_hint_flags &= ~ (XNegative | YNegative);
+      if (xoff < 0)
+	f->size_hint_flags |= XNegative;
+      if (yoff < 0)
+	f->size_hint_flags |= YNegative;
+      f->win_gravity = NorthWestGravity;
+    }
+  wlshm_calc_absolute_position (f);
+
   /* A plain toplevel cannot position itself on Wayland (no-op).  But a child
      frame is a wl_subsurface, which CAN be placed relative to its parent --
      position it so posframe/child-frame packages float at the right spot.  */
   if (FRAME_PARENT_FRAME (f) && WLSHM_FRAME_HANDLE (f))
     {
       block_input ();
-      wlshm_window_set_subsurface_pos (WLSHM_FRAME_HANDLE (f), xoff, yoff);
+      wlshm_window_set_subsurface_pos (WLSHM_FRAME_HANDLE (f),
+				       f->left_pos, f->top_pos);
       unblock_input ();
     }
 }
