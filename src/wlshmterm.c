@@ -2044,8 +2044,17 @@ wlshm_set_window_size (struct frame *f, bool change_gravity,
   wlshm_window_set_size (WLSHM_FRAME_HANDLE (f), width, height);
 
   /* WIDTH/HEIGHT are the native (pixel) size; change_frame_size converts to
-     text internally, so pass them straight through (no double conversion).  */
-  change_frame_size (f, width, height, false, true, false);
+     text internally, so pass them straight through (no double conversion).
+     A child frame is Emacs-driven (no compositor configure), so apply the size
+     SYNCHRONOUSLY (delay=false) -- mirroring pgtk.  Deferring it leaves
+     FRAME_PIXEL_WIDTH/HEIGHT stale until the next redisplay, and corfu runs its
+     popup placement under inhibit-redisplay: a sibling popup (corfu-popupinfo)
+     reading frame-pixel-width right after set-frame-size would then see the
+     freshly-created list frame's tiny figured size and place itself on top of
+     it (the first-call overlap).  Toplevels keep delay=true; their authoritative
+     size comes from the compositor configure.  */
+  bool delay = !FRAME_PARENT_FRAME (f);
+  change_frame_size (f, width, height, false, delay, false);
   SET_FRAME_GARBAGED (f);
   unblock_input ();
 }
