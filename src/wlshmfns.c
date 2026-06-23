@@ -225,6 +225,14 @@ DEFUN ("x-create-frame", Fx_create_frame, Sx_create_frame, 1, 1, 0,
     if (win == 0)
       error ("wlshm: cannot open a Wayland window (is WAYLAND_DISPLAY set?)");
     FRAME_X_OUTPUT (f)->wlshm_frame = win;
+    /* wlshm_window_open used the default title; apply the frame's name now so an
+       explicit name reaches the compositor at creation, not only after the
+       first frame-title-format update.  */
+    if (STRINGP (f->name))
+      {
+	Lisp_Object encoded = ENCODE_UTF_8 (f->name);
+	wlshm_window_set_title (win, SSDATA (encoded));
+      }
   }
 
   /* Pick an initial size; the compositor's configure (delivered via
@@ -415,14 +423,26 @@ DEFUN ("x-display-screens", Fx_display_screens, Sx_display_screens, 0, 1, 0,
   return make_fixnum (1);
 }
 
+/* Read the primary output's geometry (pixels in *W/*H, millimeters in
+   *MMW/*MMH).  Reports the display size, unlike wlshm_window_size which is a
+   per-window dimension.  Leaves the outputs at 0 if no output is available.  */
+static void
+wlshm_primary_output_geometry (int *w, int *h, int *mmw, int *mmh)
+{
+  int x = 0, y = 0, scale = 1;
+  char name[128];
+  name[0] = '\0';
+  wlshm_output_get (0, &x, &y, w, h, mmw, mmh, &scale, name, sizeof name);
+}
+
 DEFUN ("x-display-pixel-width", Fx_display_pixel_width, Sx_display_pixel_width,
        0, 1, 0,
        doc: /* Return the width in pixels of the wlshm display.  */)
   (Lisp_Object terminal)
 {
-  uint32_t w = 0, h = 0;
-  wlshm_window_size (0, &w, &h);
-  return make_fixnum (w ? (EMACS_INT) w : 1920);
+  int w = 0, h = 0, mmw = 0, mmh = 0;
+  wlshm_primary_output_geometry (&w, &h, &mmw, &mmh);
+  return make_fixnum (w > 0 ? (EMACS_INT) w : 1920);
 }
 
 DEFUN ("x-display-pixel-height", Fx_display_pixel_height,
@@ -430,18 +450,21 @@ DEFUN ("x-display-pixel-height", Fx_display_pixel_height,
        doc: /* Return the height in pixels of the wlshm display.  */)
   (Lisp_Object terminal)
 {
-  uint32_t w = 0, h = 0;
-  wlshm_window_size (0, &w, &h);
-  return make_fixnum (h ? (EMACS_INT) h : 1080);
+  int w = 0, h = 0, mmw = 0, mmh = 0;
+  wlshm_primary_output_geometry (&w, &h, &mmw, &mmh);
+  return make_fixnum (h > 0 ? (EMACS_INT) h : 1080);
 }
 
 DEFUN ("x-display-mm-width", Fx_display_mm_width, Sx_display_mm_width, 0, 1, 0,
        doc: /* Return the width in millimeters of the wlshm display.  */)
   (Lisp_Object terminal)
 {
-  uint32_t w = 0, h = 0;
-  wlshm_window_size (0, &w, &h);
-  return make_fixnum ((EMACS_INT) ((w ? w : 1920) * 25.4 / 96.0));
+  int w = 0, h = 0, mmw = 0, mmh = 0;
+  wlshm_primary_output_geometry (&w, &h, &mmw, &mmh);
+  /* Prefer the output's real physical width; fall back to 96 dpi.  */
+  if (mmw > 0)
+    return make_fixnum ((EMACS_INT) mmw);
+  return make_fixnum ((EMACS_INT) ((w > 0 ? w : 1920) * 25.4 / 96.0));
 }
 
 DEFUN ("x-display-mm-height", Fx_display_mm_height, Sx_display_mm_height,
@@ -449,9 +472,11 @@ DEFUN ("x-display-mm-height", Fx_display_mm_height, Sx_display_mm_height,
        doc: /* Return the height in millimeters of the wlshm display.  */)
   (Lisp_Object terminal)
 {
-  uint32_t w = 0, h = 0;
-  wlshm_window_size (0, &w, &h);
-  return make_fixnum ((EMACS_INT) ((h ? h : 1080) * 25.4 / 96.0));
+  int w = 0, h = 0, mmw = 0, mmh = 0;
+  wlshm_primary_output_geometry (&w, &h, &mmw, &mmh);
+  if (mmh > 0)
+    return make_fixnum ((EMACS_INT) mmh);
+  return make_fixnum ((EMACS_INT) ((h > 0 ? h : 1080) * 25.4 / 96.0));
 }
 
 DEFUN ("x-display-backing-store", Fx_display_backing_store,
