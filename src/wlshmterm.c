@@ -1825,9 +1825,27 @@ wlshm_fill_rect_pixel (int x, int y, int w, int h, unsigned long pixel)
 {
   if (w <= 0 || h <= 0)
     return;
+  /* Snap to the physical pixel grid, OVER-covering: floor the origin and ceil
+     the far edge.  Every backend background fill and clear funnels through here,
+     and at a fractional device scale two abutting AA-none rects round their
+     shared logical edge inconsistently, leaving an uncovered 1px physical seam
+     that keeps old pixels on the persistent canvas -- the seams accumulate as
+     "dirt all over" that only a full redraw clears.  Over-covering makes
+     adjacent fills overlap by the rounding slack instead of gapping, so no
+     pixel is ever left uncovered.  At an integer scale floor/ceil are exact, so
+     this is byte-identical to the old logical fill.  */
+  wlshm_ensure_canvas ();
+  if (!wlshm_canvas)
+    return;
+  double sx = 1.0, sy = 1.0;
+  cairo_surface_get_device_scale (wlshm_canvas, &sx, &sy);
+  int pl = (int) floor (x * sx);
+  int pt = (int) floor (y * sy);
+  int pr = (int) ceil ((x + w) * sx);
+  int pb = (int) ceil ((y + h) * sy);
   float r, g, b;
   wlshm_unpack_pixel (pixel, &r, &g, &b);
-  wlshm_window_rect ((float) x, (float) y, (float) w, (float) h, r, g, b, 1.0f);
+  wlshm_fill_phys (pl, pt, pr - pl, pb - pt, r, g, b);
 }
 
 /* Fill the internal border strips so no stale pixels show when the window
