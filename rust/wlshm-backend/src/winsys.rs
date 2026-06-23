@@ -72,7 +72,7 @@ use smithay_client_toolkit::reexports::protocols::wp::primary_selection::zv1::cl
     zwp_primary_selection_source_v1::ZwpPrimarySelectionSourceV1,
 };
 use wayland_client::{
-    backend::ObjectId,
+    backend::{ObjectId, WaylandError},
     globals::registry_queue_init,
     protocol::{
         wl_data_device::WlDataDevice, wl_data_device_manager::DndAction,
@@ -145,6 +145,22 @@ fn repeat_itimerspec(delay_ms: u32, rate_ms: u32) -> libc::itimerspec {
         it_interval: to_ts(rate_ms.max(1)),
         it_value: to_ts(delay_ms.max(1)),
     }
+}
+
+/// Create a CLOCK_MONOTONIC non-blocking timerfd, logging (not aborting) on
+/// failure.  A -1 here disables that timer (key repeat or the present
+/// deadline); arm/pump paths guard on `< 0`, so the rest keeps working.
+fn make_timer_fd(label: &str) -> i32 {
+    let fd = unsafe {
+        libc::timerfd_create(libc::CLOCK_MONOTONIC, libc::TFD_NONBLOCK | libc::TFD_CLOEXEC)
+    };
+    if fd < 0 {
+        eprintln!(
+            "wlshm: timerfd_create ({label}) failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    fd
 }
 
 /// True for X/xkb modifier and lock keysyms, which must not be delivered as
@@ -530,14 +546,8 @@ impl Backend {
             reposition_token: 0,
             current_cursor: 0,
             mods: 0,
-            timer_fd: unsafe {
-                libc::timerfd_create(libc::CLOCK_MONOTONIC,
-                                     libc::TFD_NONBLOCK | libc::TFD_CLOEXEC)
-            },
-            present_timer_fd: unsafe {
-                libc::timerfd_create(libc::CLOCK_MONOTONIC,
-                                     libc::TFD_NONBLOCK | libc::TFD_CLOEXEC)
-            },
+            timer_fd: make_timer_fd("key repeat"),
+            present_timer_fd: make_timer_fd("present deadline"),
             repeat_delay_ms: 400,
             repeat_rate_ms: 33,
             repeat: None,
@@ -901,7 +911,16 @@ impl Backend {
             let ready = unsafe { libc::poll(&mut pfd, 1, 0) } > 0
                 && (pfd.revents & libc::POLLIN) != 0;
             if ready {
-                let _ = guard.read();
+                match guard.read() {
+                    Ok(_) => {}
+                    // The socket can be drained between poll and read; that's
+                    // benign.  A real error (disconnect / protocol) must
+                    // propagate so the C side tears the connection down instead
+                    // of spinning on a dead-but-readable fd.
+                    Err(WaylandError::Io(e))
+                        if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(e) => return Err(format!("wayland read: {e}")),
+                }
                 self.event_queue
                     .dispatch_pending(&mut self.state)
                     .map_err(|e| format!("dispatch: {e}"))?;
