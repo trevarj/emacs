@@ -31,6 +31,7 @@
 (require 'frame)
 (require 'mouse)
 (require 'faces)
+(require 'fontset)
 
 (defvar x-command-line-resources)
 
@@ -54,6 +55,14 @@
   "Initialize the wlshm backend; DISPLAY is ignored (single Wayland display)."
   (cl-assert (not wlshm-initialized))
   (create-default-fontset)
+  ;; Create the standard fontset, like every other graphical backend, so
+  ;; "fontset-standard" exists for set-frame-font / fontset selection.
+  (condition-case err
+      (create-fontset-from-fontset-spec standard-fontset-spec t)
+    (error (display-warning
+            'initialization
+            (format "Creation of the standard fontset failed: %s" err)
+            :error)))
   (x-open-connection (or display "wayland") x-command-line-resources t)
   ;; The default font (12pt, derived from the display resolution to ~16px at
   ;; 96 DPI, matching pgtk) is chosen in C by wlshm_default_font_parameter when
