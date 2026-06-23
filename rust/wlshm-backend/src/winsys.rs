@@ -22,6 +22,7 @@ use std::collections::{HashMap, VecDeque};
 use std::mem::ManuallyDrop;
 use std::os::raw::{c_char, c_int};
 use std::os::unix::io::AsRawFd;
+use std::time::{Duration, Instant};
 
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState},
@@ -207,6 +208,13 @@ struct WlWindow {
     /// when the next frame callback fires.  Replacing it drops the previous
     /// buffer, freeing its pool slot, so at most ~2 buffers are ever in flight.
     pending: Option<(Buffer, i32, i32, i32, i32)>,
+    /// When we last committed a buffer.  Used as a present DEADLINE: if a frame
+    /// callback is overdue (the compositor withheld it -- e.g. an idle/occluded
+    /// output that only repaints on cursor motion), present() commits anyway
+    /// rather than stranding the latest frame off-screen (mode line stuck on
+    /// stale content until an unrelated event).  Still bounded to ~1 commit per
+    /// deadline, so it cannot flood the compositor.
+    last_commit: Option<Instant>,
 }
 
 impl WlWindow {
@@ -232,6 +240,13 @@ impl WlWindow {
         }
     }
 }
+
+/// How long present() will keep coalescing into `pending` while a frame callback
+/// is outstanding before committing anyway.  A safety net for compositors that
+/// withhold the wl_surface.frame callback on an idle output; ~2 frames at 60Hz,
+/// so the forced-commit rate stays bounded (no flood) yet stale content clears
+/// promptly.
+const PRESENT_DEADLINE: Duration = Duration::from_millis(33);
 
 /// Attach BUFFER to SURFACE, damage it, request a wl_surface.frame callback (so
 /// the next present throttles to the compositor's pace), and commit.  Returns
@@ -588,6 +603,7 @@ impl Backend {
                 configured: false,
                 frame_pending: false,
                 pending: None,
+                last_commit: None,
             });
             return id;
         }
@@ -629,6 +645,7 @@ impl Backend {
                     configured: true,
                     frame_pending: false,
                     pending: None,
+                    last_commit: None,
                 });
                 return id;
             }
@@ -687,6 +704,7 @@ impl Backend {
             configured: false,
             frame_pending: false,
             pending: None,
+            last_commit: None,
         });
 
         // Roundtrip so the compositor sends the initial configure (sizes us).
@@ -995,10 +1013,26 @@ impl Backend {
         // callback -- which would stick frame_pending and freeze the child at
         // its provisional size (it would never re-present at its real size).
         let is_sub = matches!(w.role, Role::Subsurface { .. });
-        if w.frame_pending && !is_sub {
+        // Throttle while a frame callback is genuinely in flight -- UNLESS it is
+        // overdue past PRESENT_DEADLINE.  Some compositors withhold the
+        // wl_surface.frame callback when the output is otherwise idle (it only
+        // repaints, and thus flushes callbacks, on cursor motion etc.), which
+        // would strand the latest buffer in `pending` and leave stale pixels on
+        // screen (mode line not redrawing until you move the mouse).  Committing
+        // anyway after the deadline unsticks it while staying bounded to ~1
+        // commit per deadline, so it still cannot flood the compositor.
+        let stalled = w
+            .last_commit
+            .map_or(false, |t| t.elapsed() >= PRESENT_DEADLINE);
+        if w.frame_pending && !is_sub && !stalled {
             w.pending = Some((buffer, dx, dy, dw, dh));
             return;
         }
+        // We are about to commit the CURRENT (newest) buffer.  Drop any older
+        // coalesced buffer so frame() can't later commit it on top of this one
+        // (which would flash stale content -- possible now that the deadline
+        // lets us commit while frame_pending is still set).
+        w.pending = None;
         let Some(surface) = w.wl_surface().cloned() else { return };
         let parent_surface = if let Role::Subsurface { parent_surface, .. } = &w.role {
             Some(parent_surface.clone())
@@ -1009,6 +1043,7 @@ impl Backend {
             if !is_sub {
                 w.frame_pending = true;
             }
+            w.last_commit = Some(Instant::now());
             // A subsurface's placement/mapping is applied on the PARENT's
             // commit, so nudge the parent after committing the child's buffer.
             if let Some(ps) = parent_surface {
@@ -1177,6 +1212,7 @@ impl CompositorHandler for AppState {
                 if commit_buffer(qh, &surf, &buffer, dx, dy, dw, dh) {
                     if let Some(w) = self.windows.get_mut(&id) {
                         w.frame_pending = true;
+                        w.last_commit = Some(Instant::now());
                     }
                     let _ = conn.flush();
                 }
