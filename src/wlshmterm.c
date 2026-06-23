@@ -290,26 +290,30 @@ wlshm_window_rect (float x, float y, float w, float h,
   cairo_restore (wlshm_cr);
 }
 
-/* Fill a rectangle given in PHYSICAL pixels (expressed back in logical coords so
-   the canvas device scale reproduces the exact integer physical rect).  Used to
-   fill a LOGICAL-coordinate rectangle with antialiasing enabled.  The canvas cr
-   is globally CAIRO_ANTIALIAS_NONE for crisp text and solid fills, but box/relief
-   edges must be drawn with AA: a 1px-logical edge at a fractional device scale
-   would otherwise quantize to 1 OR 2 physical px by sub-pixel phase, so a box's
-   top would differ in thickness from its bottom.  With AA on, every edge gets the
-   same soft partial-coverage rendering and they match, identical to pgtk.  At
-   integer device scale this is visually indistinguishable from a hard fill.  */
+/* Fill an integer PHYSICAL-pixel rectangle at full coverage, bypassing the canvas
+   device scale.  Box/relief edges must land exactly on the physical grid with a
+   uniform integer thickness so all four edges match in thickness AND opacity at
+   any scale.  A 1px-logical edge drawn in logical coords at scale 1.5 renders as
+   ~1.5 physical px whose antialiased coverage varies with sub-pixel phase -- so,
+   e.g., the right edge of an even-width box comes out lighter than the left.
+   Snapping to whole physical pixels (drawn under ANTIALIAS_NONE, with the device
+   scale temporarily undone so user space == physical pixels) avoids both the
+   uneven thickness and the uneven opacity.  At integer scale it is identical to a
+   plain logical fill.  */
 static void
-wlshm_fill_aa (int x, int y, int w, int h, float r, float g, float b)
+wlshm_fill_phys (int px, int py, int pw, int ph, float r, float g, float b)
 {
   wlshm_ensure_canvas ();
-  if (!wlshm_cr || w <= 0 || h <= 0)
+  if (!wlshm_cr || pw <= 0 || ph <= 0)
     return;
+  double sx = 1.0, sy = 1.0;
+  cairo_surface_get_device_scale (wlshm_canvas, &sx, &sy);
   cairo_save (wlshm_cr);
-  cairo_set_antialias (wlshm_cr, CAIRO_ANTIALIAS_GRAY);
+  cairo_scale (wlshm_cr, 1.0 / sx, 1.0 / sy);
+  cairo_set_antialias (wlshm_cr, CAIRO_ANTIALIAS_NONE);
   cairo_set_operator (wlshm_cr, CAIRO_OPERATOR_OVER);
   cairo_set_source_rgb (wlshm_cr, r, g, b);
-  cairo_rectangle (wlshm_cr, x, y, w, h);
+  cairo_rectangle (wlshm_cr, px, py, pw, ph);
   cairo_fill (wlshm_cr);
   cairo_restore (wlshm_cr);
 }
@@ -590,30 +594,54 @@ wlshm_draw_glyph_string_box (struct glyph_string *s)
   wlshm_unpack_pixel (top_left, &tr, &tg, &tb);
   wlshm_unpack_pixel (bottom_right, &br, &bg2, &bb);
   block_input ();
-  /* Draw the four edges exactly as pgtk_draw_box_rect does: integer logical
-     coordinates with the inclusive (right_x = left+width-1) convention, and
-     ANTIALIASING ENABLED.  The canvas cr is globally CAIRO_ANTIALIAS_NONE for
-     crisp text/fills, but a 1px-logical edge at a fractional device scale must
-     be drawn with AA -- otherwise AA-NONE quantizes each edge to 1 or 2 physical
-     px by sub-pixel phase, so the top comes out a different thickness from the
-     bottom (and left from right).  With AA on, every edge gets the same soft
-     partial-coverage rendering and they all match, identical to pgtk.  */
-  int left_x = left;
-  int top_y = top;
-  int right_x = left + width - 1;
-  int bottom_y = top + height - 1;
+  /* Snap the box rectangle to the physical pixel grid and give every edge the
+     same integer physical thickness, so all four edges match in thickness AND
+     opacity even at a fractional scale (a phase-dependent AA edge would otherwise
+     come out lighter on, e.g., the right side of an even-width box).  bottom/right
+     are anchored flush to the far snapped boundary.  */
+  double sx = 1.0, sy = 1.0;
+  cairo_surface_get_device_scale (wlshm_canvas, &sx, &sy);
+  int pl = (int) lround (left * sx);
+  int pr = (int) lround ((left + width) * sx);
+  int pt = (int) lround (top * sy);
+  int pb = (int) lround ((top + height) * sy);
+  /* Clamp the snapped box to the active glyph-string clip.  At a fractional scale
+     that clip can be up to a physical pixel shorter than the box (its logical
+     bounds round down), so the bottom/right edge's outer row would otherwise be
+     cut -- making the bottom thinner than the top.  Convert the clip's user-space
+     extents to physical and pull the box inside them.  */
+  {
+    double cx0 = 0, cy0 = 0, cx1 = 0, cy1 = 0;
+    cairo_clip_extents (wlshm_cr, &cx0, &cy0, &cx1, &cy1);
+    if (cx1 > cx0 && cy1 > cy0)
+      {
+	int clx0 = (int) ceil (cx0 * sx), cly0 = (int) ceil (cy0 * sy);
+	int clx1 = (int) floor (cx1 * sx), cly1 = (int) floor (cy1 * sy);
+	if (pl < clx0) pl = clx0;
+	if (pt < cly0) pt = cly0;
+	if (pr > clx1) pr = clx1;
+	if (pb > cly1) pb = cly1;
+      }
+  }
+  int th = (int) lround (hwidth * sy);
+  if (hwidth > 0 && th < 1)
+    th = 1;
+  if (th > pb - pt)
+    th = pb - pt;
+  int tv = (int) lround (vwidth * sx);
+  if (vwidth > 0 && tv < 1)
+    tv = 1;
+  if (tv > pr - pl)
+    tv = pr - pl;
   if (hwidth > 0)
     {
-      /* Top, then bottom.  */
-      wlshm_fill_aa (left_x, top_y, right_x - left_x + 1, hwidth, tr, tg, tb);
-      wlshm_fill_aa (left_x, bottom_y - hwidth + 1, right_x - left_x + 1, hwidth,
-		     br, bg2, bb);
+      wlshm_fill_phys (pl, pt, pr - pl, th, tr, tg, tb);          /* top */
+      wlshm_fill_phys (pl, pb - th, pr - pl, th, br, bg2, bb);    /* bottom */
     }
   if (left_p && vwidth > 0)
-    wlshm_fill_aa (left_x, top_y, vwidth, bottom_y - top_y + 1, tr, tg, tb);
+    wlshm_fill_phys (pl, pt, tv, pb - pt, tr, tg, tb);            /* left */
   if (right_p && vwidth > 0)
-    wlshm_fill_aa (right_x - vwidth + 1, top_y, vwidth, bottom_y - top_y + 1,
-		   br, bg2, bb);
+    wlshm_fill_phys (pr - tv, pt, tv, pb - pt, br, bg2, bb);      /* right */
   unblock_input ();
 }
 
