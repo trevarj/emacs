@@ -1473,7 +1473,20 @@ wlshm_scroll_run (struct window *w, struct run *run)
       width = (int) lround ((x + width) * dsx) - phys_x;
       int phys_from = (int) lround (from_y * dsy);
       int phys_to = (int) lround (to_y * dsy);
-      height = (int) lround ((from_y + height) * dsy) - phys_from;
+      /* Derive the row count from BOTH the source and destination edges and take
+	 the smaller.  At a fractional scale the source span [from_y, from_y+h]
+	 and destination span [to_y, to_y+h] can round to different physical
+	 heights; reusing the source height for the destination memmove would
+	 overrun the destination's true rounded bottom edge by one physical row --
+	 smearing buffer pixels down into the mode line (and, scrolling the other
+	 way, mode-line pixels up into the buffer).  min() can only shrink the
+	 span, never overrun either edge; the worst case is a 1px gap that
+	 redisplay repaints immediately, far better than persistent garbage.  */
+      int h_from = (int) lround ((from_y + height) * dsy) - phys_from;
+      int h_to = (int) lround ((to_y + height) * dsy) - phys_to;
+      height = min (h_from, h_to);
+      if (height < 0)
+	height = 0;
       x = phys_x;
       from_y = phys_from;
       to_y = phys_to;
