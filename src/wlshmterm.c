@@ -797,8 +797,62 @@ wlshm_draw_horizontal_wave (struct frame *f, unsigned long color, int x, int y,
 static void
 wlshm_draw_underline (struct glyph_string *s, unsigned long color)
 {
-  int thickness = s->underline_thickness > 0 ? s->underline_thickness : 1;
-  int pos = s->ybase + (s->underline_position > 0 ? s->underline_position : 1);
+  /* Compute the underline thickness and position the way the other backends
+     do.  xdisp.c does NOT fill in s->underline_thickness / s->underline_position
+     for us, so reading them directly gave 0 every time -- every underline drew
+     1px at ybase+1, ignoring the font's metrics and with no clamp against the
+     row bottom.  Honor the font metrics, the at-descent-line options, and clamp
+     so the underline can't spill into the line below.  Ported from
+     pgtk_draw_glyph_string's underline block.  */
+  int thickness, position;
+  if (s->prev
+      && (s->prev->face->underline != FACE_UNDERLINE_WAVE
+	  && s->prev->face->underline >= FACE_UNDERLINE_SINGLE)
+      && (s->prev->face->underline_at_descent_line_p
+	  == s->face->underline_at_descent_line_p)
+      && (s->prev->face->underline_pixels_above_descent_line
+	  == s->face->underline_pixels_above_descent_line))
+    {
+      /* Continue the previous glyph string's underline geometry unchanged.  */
+      thickness = s->prev->underline_thickness;
+      position = s->prev->underline_position;
+    }
+  else
+    {
+      struct font *font = font_for_underline_metrics (s);
+
+      if (font && font->underline_thickness > 0)
+	thickness = font->underline_thickness;
+      else
+	thickness = 1;
+      if (x_underline_at_descent_line || s->face->underline_at_descent_line_p)
+	position = ((s->height - thickness)
+		    - (s->ybase - s->y)
+		    - s->face->underline_pixels_above_descent_line);
+      else
+	{
+	  /* Recommended vertical offset from the baseline to the top of the
+	     underline; default ROUND ((maximum descent) / 2).  */
+	  if (x_use_underline_position_properties
+	      && font && font->underline_position >= 0)
+	    position = font->underline_position;
+	  else if (font)
+	    position = (font->descent + 1) / 2;
+	  else
+	    position = underline_minimum_offset;
+	}
+      /* Ignore minimum_offset if the pixel amount was explicitly specified.  */
+      if (!s->face->underline_pixels_above_descent_line)
+	position = max (position, underline_minimum_offset);
+    }
+  /* Keep the underline inside the current line area.  */
+  if (s->y + s->height <= s->ybase + position)
+    position = (s->height - 1) - (s->ybase - s->y);
+  if (s->y + s->height < s->ybase + position + thickness)
+    thickness = (s->y + s->height) - (s->ybase + position);
+  s->underline_thickness = thickness;
+  s->underline_position = position;
+  int pos = s->ybase + position;
   int x0 = s->x, w = s->width;
   if (w <= 0)
     return;
