@@ -1583,6 +1583,10 @@ wlshm_scroll_run (struct window *w, struct run *run)
 	 redisplay repaints immediately, far better than persistent garbage.  */
       int h_from = (int) lround ((from_y + height) * dsy) - phys_from;
       int h_to = (int) lround ((to_y + height) * dsy) - phys_to;
+      /* Intended destination bottom (physical).  min() below may copy fewer
+	 rows than this, leaving an uncovered gap at the destination bottom that
+	 we must clear (see after the memmove).  */
+      int dst_bottom = phys_to + h_to;
       height = min (h_from, h_to);
       if (height < 0)
 	height = 0;
@@ -1622,6 +1626,26 @@ wlshm_scroll_run (struct window *w, struct run *run)
 	      memmove (data + (size_t) (to_y + i) * stride + (size_t) x * 4,
 		       data + (size_t) (from_y + i) * stride + (size_t) x * 4,
 		       row_bytes);
+	  /* The min() height can leave the destination's bottom physical row(s)
+	     uncopied at a fractional scale; they keep the pre-scroll pixels (the
+	     previous line's glyph bottoms), and redisplay treats the scrolled
+	     rows as preserved so it never repaints them -- leaving faint
+	     fragments just above the mode line.  Clear that gap to the frame
+	     background; the next redisplay paints any real content over it.  The
+	     gap stays within the text area (h_to was clamped to bottom_y above),
+	     never the mode line.  */
+	  int gap_y = to_y + height;
+	  int gap_bottom = min (dst_bottom, ch);
+	  if (gap_bottom > gap_y && gap_y >= 0)
+	    {
+	      uint32_t px = (uint32_t) (FRAME_BACKGROUND_PIXEL (wlshm_cur) & 0xffffff);
+	      for (int yy = gap_y; yy < gap_bottom; yy++)
+		{
+		  uint32_t *row = (uint32_t *) (data + (size_t) yy * stride) + x;
+		  for (int xx = 0; xx < width; xx++)
+		    row[xx] = px;
+		}
+	    }
 	  cairo_surface_mark_dirty (wlshm_canvas);
 	}
     }
