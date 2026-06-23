@@ -2368,6 +2368,13 @@ pub extern "C" fn wlshm_window_unmap(win: u64) {
                     let Some(surface) = w.wl_surface().cloned() else { return };
                     surface.attach(None, 0, 0);
                     surface.commit();
+                    // Clone the parent first (so we can mutate `w` below without
+                    // holding a borrow of w.role).
+                    let parent = if let Role::Subsurface { parent_surface, .. } = &w.role {
+                        Some(parent_surface.clone())
+                    } else {
+                        None
+                    };
                     // Unmapping an xdg surface returns it to the unconfigured
                     // state: a fresh configure is required before the next
                     // buffer.  Clear `configured` so the remap path in present()
@@ -2377,8 +2384,17 @@ pub extern "C" fn wlshm_window_unmap(win: u64) {
                     // again, so clearing it here would wedge it invisible after
                     // the first hide (corfu popups).  Keep it configured; the
                     // next present re-attaches a buffer + parent commit.
-                    if !matches!(w.role, Role::Subsurface { .. }) {
+                    if parent.is_none() {
                         w.configured = false;
+                    }
+                    // A subsurface's NULL-buffer unmap applies on the child commit
+                    // (desync), but its PLACEMENT is parent-cached.  Commit the
+                    // parent here so the hide is ordered atomically -- otherwise a
+                    // sibling child's present() parent-commit can flush stale
+                    // placement of this hidden child, repainting it in the gap
+                    // between the two corfu popups (the "overlay between frames").
+                    if let Some(ps) = parent {
+                        ps.commit();
                     }
                     let _ = b.conn.flush();
                 }
