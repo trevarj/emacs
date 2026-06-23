@@ -1681,7 +1681,26 @@ wlshm_after_update_window_line (struct window *w, struct glyph_row *desired_row)
       unblock_input ();
     }
 }
-static void wlshm_flush_display (struct frame *f) {}
+/* flush_frame -> rif->flush_display.  echo_area_display / minibuffer / tooltip
+   force-draws update the canvas via update_single_window + flush_frame OUTSIDE
+   redisplay_internal, so they never reach wlshm_frame_up_to_date's present.
+   Without presenting here, a canvas change made on that path (e.g. clearing a
+   stale truncation fringe arrow when a shorter echo-area message replaces a
+   longer one) never reaches the screen until some later unrelated present --
+   the "stale until you move the mouse" symptom.  Present now, guarded exactly
+   like wlshm_read_socket's present so a half-built frame can't be touched.  */
+static void
+wlshm_flush_display (struct frame *f)
+{
+  if (!redisplaying_p
+      && FRAME_LIVE_P (f) && FRAME_X_OUTPUT (f)
+      && f->glyphs_initialized_p && !FRAME_GARBAGED_P (f))
+    {
+      block_input ();
+      wlshm_present_canvas (f);
+      unblock_input ();
+    }
+}
 
 /* Fringe bitmaps (continuation/truncation arrows, empty-line and buffer
    boundary indicators).  We keep the raw bits (copied at define time, since
