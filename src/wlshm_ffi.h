@@ -165,6 +165,12 @@ int wlshm_window_fd(void);
 int wlshm_window_timer_fd(void);
 
 /**
+ * The present-deadline timerfd; Emacs adds it as a keyboard wait descriptor so
+ * its firing wakes read_socket -> dispatch -> flush_overdue_pending().
+ */
+int wlshm_window_present_timer_fd(void);
+
+/**
  * Disarm the key-repeat timer and forget the held key.  The C side calls this
  * when entering/leaving a modal popup loop, so a key held during the menu does
  * not keep repeating into the main loop after the menu closes.

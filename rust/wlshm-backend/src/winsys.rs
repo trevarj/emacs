@@ -282,6 +282,13 @@ struct AppState {
     current_cursor: u32,
     mods: u32,
     timer_fd: i32,
+    /// Single-shot timerfd armed when present() coalesces a frame into `pending`
+    /// while a frame callback is outstanding.  It wakes the Emacs event loop
+    /// (registered as a keyboard wait descriptor) after PRESENT_DEADLINE so the
+    /// coalesced frame is committed even if the compositor never delivers the
+    /// callback and nothing else happens -- otherwise a single mode-line change
+    /// followed by idle would stay stale until an unrelated event (mouse-over).
+    present_timer_fd: i32,
     repeat_delay_ms: u32,
     repeat_rate_ms: u32,
     /// Currently-held repeating key: (raw keycode, keysym, unichar).
@@ -412,6 +419,38 @@ impl AppState {
         unsafe { libc::timerfd_settime(self.timer_fd, 0, &spec, std::ptr::null_mut()) };
     }
 
+    /// Arm the present-deadline timerfd to fire ONCE after PRESENT_DEADLINE, so
+    /// a coalesced frame is delivered even if no callback and no other event
+    /// arrive.  Idempotent-ish: re-arming just pushes the deadline out by one
+    /// interval from the latest coalesce, which is fine.
+    fn arm_present_timer(&self) {
+        if self.present_timer_fd < 0 {
+            return;
+        }
+        let ms = PRESENT_DEADLINE.as_millis() as i64;
+        let spec = libc::itimerspec {
+            it_interval: libc::timespec { tv_sec: 0, tv_nsec: 0 },
+            it_value: libc::timespec {
+                tv_sec: ms / 1000,
+                tv_nsec: (ms % 1000) * 1_000_000,
+            },
+        };
+        unsafe {
+            libc::timerfd_settime(self.present_timer_fd, 0, &spec, std::ptr::null_mut())
+        };
+    }
+
+    /// Drain the present-deadline timerfd (so it stops waking us).
+    fn drain_present_timer(&self) {
+        if self.present_timer_fd < 0 {
+            return;
+        }
+        let mut buf = [0u8; 8];
+        unsafe {
+            libc::read(self.present_timer_fd, buf.as_mut_ptr() as *mut libc::c_void, 8)
+        };
+    }
+
     fn disarm_repeat(&mut self) {
         self.repeat = None;
         if self.timer_fd < 0 {
@@ -492,6 +531,10 @@ impl Backend {
             current_cursor: 0,
             mods: 0,
             timer_fd: unsafe {
+                libc::timerfd_create(libc::CLOCK_MONOTONIC,
+                                     libc::TFD_NONBLOCK | libc::TFD_CLOEXEC)
+            },
+            present_timer_fd: unsafe {
                 libc::timerfd_create(libc::CLOCK_MONOTONIC,
                                      libc::TFD_NONBLOCK | libc::TFD_CLOEXEC)
             },
@@ -866,7 +909,48 @@ impl Backend {
         }
         self.state.pump_repeat();
         self.drain_pending_drop();
+        self.flush_overdue_pending();
         Ok(())
+    }
+
+    /// Commit any frame coalesced into `pending` whose present deadline has
+    /// passed (the compositor never delivered the frame callback that would
+    /// normally drain it).  Runs on every dispatch; the present-deadline timerfd
+    /// waking the event loop is what gets us here when nothing else happens.
+    /// Mirrors the frame() callback's commit path.
+    fn flush_overdue_pending(&mut self) {
+        self.state.drain_present_timer();
+        let ids: Vec<u64> = self
+            .state
+            .windows
+            .iter()
+            .filter(|(_, w)| {
+                w.pending.is_some()
+                    && w.last_commit.map_or(true, |t| t.elapsed() >= PRESENT_DEADLINE)
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        if ids.is_empty() {
+            return;
+        }
+        for id in ids {
+            let pending = self.state.windows.get_mut(&id).and_then(|w| w.pending.take());
+            let Some((buffer, dx, dy, dw, dh)) = pending else { continue };
+            let Some(surf) =
+                self.state.windows.get(&id).and_then(|w| w.wl_surface().cloned())
+            else {
+                continue;
+            };
+            if commit_buffer(&self.qh, &surf, &buffer, dx, dy, dw, dh) {
+                if let Some(w) = self.state.windows.get_mut(&id) {
+                    if !matches!(w.role, Role::Subsurface { .. }) {
+                        w.frame_pending = true;
+                    }
+                    w.last_commit = Some(Instant::now());
+                }
+            }
+        }
+        let _ = self.conn.flush();
     }
 
     /// If a drop landed (set in `drop_performed`), read its data from the
@@ -1026,6 +1110,9 @@ impl Backend {
             .map_or(false, |t| t.elapsed() >= PRESENT_DEADLINE);
         if w.frame_pending && !is_sub && !stalled {
             w.pending = Some((buffer, dx, dy, dw, dh));
+            // Wake the event loop after the deadline so this coalesced frame is
+            // delivered even if no callback / no other event ever arrives.
+            self.state.arm_present_timer();
             return;
         }
         // We are about to commit the CURRENT (newest) buffer.  Drop any older
@@ -1879,6 +1966,13 @@ pub extern "C" fn wlshm_window_fd() -> c_int {
 #[no_mangle]
 pub extern "C" fn wlshm_window_timer_fd() -> c_int {
     with_backend(|b| b.state.timer_fd, -1)
+}
+
+/// The present-deadline timerfd; Emacs adds it as a keyboard wait descriptor so
+/// its firing wakes read_socket -> dispatch -> flush_overdue_pending().
+#[no_mangle]
+pub extern "C" fn wlshm_window_present_timer_fd() -> c_int {
+    with_backend(|b| b.state.present_timer_fd, -1)
 }
 
 /// Disarm the key-repeat timer and forget the held key.  The C side calls this

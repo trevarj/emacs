@@ -4544,6 +4544,13 @@ wlshm_term_init (Lisp_Object display_name)
   int tfd = wlshm_window_timer_fd ();
   if (tfd >= 0)
     add_keyboard_wait_descriptor (tfd);
+  /* And on the present-deadline timerfd, so a frame coalesced by the present
+     throttle is flushed even if the compositor withholds its frame callback and
+     nothing else wakes the loop (mode line otherwise stays stale until a mouse
+     event); read_socket -> wlshm_window_dispatch -> flush_overdue_pending.  */
+  int ptfd = wlshm_window_present_timer_fd ();
+  if (ptfd >= 0)
+    add_keyboard_wait_descriptor (ptfd);
 
   unblock_input ();
   return dpyinfo;
