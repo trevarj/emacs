@@ -231,6 +231,14 @@ struct WlWindow {
     /// stale content until an unrelated event).  Still bounded to ~1 commit per
     /// deadline, so it cannot flood the compositor.
     last_commit: Option<Instant>,
+    /// Subsurfaces only: a parent commit is needed to apply this child's
+    /// placement (initial map / remap).  A desync subsurface applies its own
+    /// buffer on its own commit, so steady-state updates (e.g. corfu scrolling
+    /// the selection) do NOT need a parent commit -- committing the parent every
+    /// frame forces a redundant parent repaint.  Set on creation and on unmap,
+    /// cleared after present() commits the parent.  (Moves go through
+    /// wlshm_window_set_subsurface_pos, which commits the parent itself.)
+    parent_dirty: bool,
 }
 
 impl WlWindow {
@@ -657,6 +665,7 @@ impl Backend {
                 frame_pending: false,
                 pending: None,
                 last_commit: None,
+                parent_dirty: false,
             });
             return id;
         }
@@ -699,6 +708,8 @@ impl Backend {
                     frame_pending: false,
                     pending: None,
                     last_commit: None,
+                    // First present must commit the parent to map the subsurface.
+                    parent_dirty: true,
                 });
                 return id;
             }
@@ -758,6 +769,7 @@ impl Backend {
             frame_pending: false,
             pending: None,
             last_commit: None,
+            parent_dirty: false,
         });
 
         // Roundtrip so the compositor sends the initial configure (sizes us).
@@ -1157,15 +1169,24 @@ impl Backend {
         } else {
             None
         };
+        let parent_dirty = w.parent_dirty;
         if commit_buffer(&self.qh, &surface, &buffer, dx, dy, dw, dh) {
             if !is_sub {
                 w.frame_pending = true;
             }
             w.last_commit = Some(Instant::now());
-            // A subsurface's placement/mapping is applied on the PARENT's
-            // commit, so nudge the parent after committing the child's buffer.
+            // A subsurface's placement/mapping is applied on the PARENT's commit.
+            // Only nudge the parent when the placement actually changed (first
+            // map / remap, flagged by parent_dirty); a steady-state buffer update
+            // on a desync subsurface (corfu scrolling the selection) applies via
+            // the child's own commit above, so committing the parent every frame
+            // is a redundant parent repaint.  Moves go through
+            // wlshm_window_set_subsurface_pos, which commits the parent itself.
             if let Some(ps) = parent_surface {
-                ps.commit();
+                if parent_dirty {
+                    ps.commit();
+                    w.parent_dirty = false;
+                }
             }
         }
         let _ = self.conn.flush();
@@ -2438,6 +2459,9 @@ pub extern "C" fn wlshm_window_unmap(win: u64) {
                     // error 3).  The next present re-attaches a fresh buffer.
                     w.pending = None;
                     w.frame_pending = false;
+                    // Re-map (the next present) must commit the parent again to
+                    // re-apply this subsurface's placement.
+                    w.parent_dirty = true;
                     // A subsurface's NULL-buffer unmap applies on the child commit
                     // (desync), but its PLACEMENT is parent-cached.  Commit the
                     // parent here so the hide is ordered atomically -- otherwise a
