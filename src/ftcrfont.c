@@ -228,6 +228,14 @@ ftcrfont_open (struct frame *f, Lisp_Object entity, int pixel_size)
   match = FcFontMatch (NULL, pat, &result);
   ftfont_fix_match (pat, match);
 
+#ifdef HAVE_WLSHM
+  /* Resolve target="font" fontconfig edits (antialias/rgba/hintstyle) the same
+     way fc-match does; FcFontMatch alone does not apply them, so without this
+     wlshm would miss the user's subpixel/hinting preferences (which fontconfig
+     conventionally sets at target="font").  Used only to read render options
+     below; the font face is still created from MATCH.  */
+  FcPattern *wlshm_render = FcFontRenderPrepare (NULL, pat, match);
+#endif
   FcPatternDestroy (pat);
   font_face = cairo_ft_font_face_create_for_pattern (match);
   if (!font_face
@@ -245,7 +253,10 @@ ftcrfont_open (struct frame *f, Lisp_Object entity, int pixel_size)
   cairo_font_options_t *options = xsettings_get_font_options ();
 #elif defined HAVE_WLSHM
   /* Honor the user's fontconfig rendering preferences (no xsettings/GTK).  */
-  cairo_font_options_t *options = wlshm_font_options_from_pattern (match);
+  cairo_font_options_t *options =
+    wlshm_font_options_from_pattern (wlshm_render ? wlshm_render : match);
+  if (wlshm_render)
+    FcPatternDestroy (wlshm_render);
 #else
   cairo_font_options_t *options = cairo_font_options_create ();
 #endif
