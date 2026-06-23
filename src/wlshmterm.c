@@ -995,6 +995,16 @@ wlshm_set_glyph_string_clipping (struct glyph_string *s, cairo_t *cr)
 
   if (n > 0)
     {
+      /* Clip with AA-none so the clip edge snaps to the same physical-pixel
+	 grid as the AA-none background/box fills.  An antialiased clip lets a
+	 glyph's font-antialiased top/bottom scanline paint a partial-coverage
+	 row one physical pixel beyond where the opaque background fill rounds
+	 its edge (at a fractional device scale), leaving a coloured fringe over
+	 the neighbouring line's background -- e.g. the mode-line glyph tops
+	 bleeding into the buffer row above it on HiDPI.  Glyph interiors keep
+	 the font's own antialiasing (that is set via the font options, not the
+	 context), so only the boundary fringe is cropped.  */
+      cairo_set_antialias (cr, CAIRO_ANTIALIAS_NONE);
       for (int i = 0; i < n; i++)
 	cairo_rectangle (cr, r[i].x, r[i].y, r[i].width, r[i].height);
       cairo_clip (cr);
@@ -1281,32 +1291,23 @@ wlshm_draw_glyph_string (struct glyph_string *s)
     case COMPOSITE_GLYPH:
       {
 	struct font *font = s->font;
-	int box_line = max (s->face->box_horizontal_line_width, 0);
 
-	/* Background.  Mirror pgtk's x_draw_glyph_string_background: fill the cell
-	   rect ONLY when the glyphs won't cover it themselves (a short font, a
-	   missing font, or a stretch-to-end-of-line); a mouse-face hover always
-	   fills its rounded "pill".  Otherwise leave background_filled_p false so
-	   the glyphs below draw with their OWN opaque per-glyph background
-	   (with_background=true) -- the XDrawImageString backstop wlshm was
-	   missing.  That per-glyph fill clears the previous frame's glyphs even
-	   when a single rect fill would miss a sub-pixel row, which is the
-	   incremental mode-line redraw remnant ("**" -> "--" leaving a sliver).  */
+	/* Background: fill the FULL cell every time (mouse-face draws its rounded
+	   "pill" instead) so the glyphs draw with_background=false below and no
+	   stale ink (e.g. an underline in the line-spacing gap) survives a redraw.
+	   The glyph-string clip (set with AA-none, see wlshm_set_glyph_string_clipping)
+	   crops the glyphs to the same physical-pixel grid as this AA-none fill, so
+	   at a fractional device scale the glyphs' antialiased top scanline can no
+	   longer land one physical row above the fill and leave a coloured fringe
+	   over the line above (the streaks seen just above the mode line on HiDPI).  */
 	if (!s->background_filled_p && !s->for_overlaps)
 	  {
 	    block_input ();
 	    if (s->hl == DRAW_MOUSE_FACE)
-	      {
-		wlshm_draw_mouse_face_bg (s, bg, fg);
-		s->background_filled_p = true;
-	      }
-	    else if ((font && FONT_HEIGHT (font) < s->height - 2 * box_line)
-		     || s->font_not_found_p || s->extends_to_end_of_line_p)
-	      {
-		wlshm_fill_rect_pixel (s->x, s->y, s->background_width,
-				       s->height, bg);
-		s->background_filled_p = true;
-	      }
+	      wlshm_draw_mouse_face_bg (s, bg, fg);
+	    else
+	      wlshm_fill_rect_pixel (s->x, s->y, s->background_width, s->height, bg);
+	    s->background_filled_p = true;
 	    unblock_input ();
 	  }
 
