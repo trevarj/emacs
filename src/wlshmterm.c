@@ -630,10 +630,17 @@ wlshm_draw_glyph_string_box (struct glyph_string *s)
     cairo_clip_extents (wlshm_cr, &cx0, &cy0, &cx1, &cy1);
     if (cx1 > cx0 && cy1 > cy0)
       {
-	int clx0 = (int) ceil (cx0 * sx), cly0 = (int) ceil (cy0 * sy);
 	int clx1 = (int) floor (cx1 * sx), cly1 = (int) floor (cy1 * sy);
-	if (pl < clx0) pl = clx0;
-	if (pt < cly0) pt = cly0;
+	/* Clamp ONLY the far (bottom/right) edges inward so they land inside the
+	   clip -- that is the fractional-scale rounding the comment above is about.
+	   Do NOT clamp the near (top/left) edges: at a fractional device scale the
+	   clip's user-space top rounds UP (ceil), which would pull the box top edge
+	   one physical row DOWN, uncovering the cell's top row.  Because the box
+	   edges are drawn last and opaque (and Cairo clips any overdraw harmlessly),
+	   anchoring top/left to the snapped box position lets the top edge fully
+	   cover the cell top -- otherwise an incremental mode-line redraw leaves a
+	   stale sliver of the previous glyph in that uncovered top row (the
+	   "U:---" modified-indicator remnant on HiDPI).  */
 	if (pr > clx1) pr = clx1;
 	if (pb > cly1) pb = cly1;
       }
@@ -1273,39 +1280,52 @@ wlshm_draw_glyph_string (struct glyph_string *s)
     case CHAR_GLYPH:
     case COMPOSITE_GLYPH:
       {
-	/* Background (inset vertically by the box line so the box shows).  A
-	   mouse-face hover draws a modern rounded "pill" instead, replacing the
-	   face's beveled box.  */
+	struct font *font = s->font;
+	int box_line = max (s->face->box_horizontal_line_width, 0);
+
+	/* Background.  Mirror pgtk's x_draw_glyph_string_background: fill the cell
+	   rect ONLY when the glyphs won't cover it themselves (a short font, a
+	   missing font, or a stretch-to-end-of-line); a mouse-face hover always
+	   fills its rounded "pill".  Otherwise leave background_filled_p false so
+	   the glyphs below draw with their OWN opaque per-glyph background
+	   (with_background=true) -- the XDrawImageString backstop wlshm was
+	   missing.  That per-glyph fill clears the previous frame's glyphs even
+	   when a single rect fill would miss a sub-pixel row, which is the
+	   incremental mode-line redraw remnant ("**" -> "--" leaving a sliver).  */
 	if (!s->background_filled_p && !s->for_overlaps)
 	  {
-	    int box_line = max (s->face->box_horizontal_line_width, 0);
 	    block_input ();
 	    if (s->hl == DRAW_MOUSE_FACE)
-	      wlshm_draw_mouse_face_bg (s, bg, fg);
-	    else
 	      {
-		/* Clamp: a box wider than half the line makes height negative,
-		   painting an inverted/oversized fill.  */
-		int fill_h = max (s->height - 2 * box_line, 0);
-		wlshm_fill_rect_pixel (s->x, s->y + box_line,
-				       s->background_width, fill_h, bg);
+		wlshm_draw_mouse_face_bg (s, bg, fg);
+		s->background_filled_p = true;
+	      }
+	    else if ((font && FONT_HEIGHT (font) < s->height - 2 * box_line)
+		     || s->font_not_found_p || s->extends_to_end_of_line_p)
+	      {
+		wlshm_fill_rect_pixel (s->x, s->y, s->background_width,
+				       s->height, bg);
+		s->background_filled_p = true;
 	      }
 	    unblock_input ();
-	    s->background_filled_p = true;
 	  }
 
-	/* The pill replaces the box for hover; otherwise draw the face's box.  */
-	if (!s->for_overlaps && s->hl != DRAW_MOUSE_FACE)
-	  wlshm_draw_glyph_string_box (s);
-
-	/* Glyphs (background already drawn above).  */
-	struct font *font = s->font;
+	/* Glyphs.  with_background=true (per pgtk) whenever the background was not
+	   separately filled, so each glyph paints its own opaque background box.
+	   Inset the origin past a left box line so the text matches the box; the
+	   box itself is drawn LAST (after the glyphs) so these per-glyph fills
+	   cannot paint over its edges.  */
+	bool with_bg = !(s->for_overlaps
+			 || (s->background_filled_p && s->hl != DRAW_CURSOR));
+	int gx = s->x;
+	if (s->face->box != FACE_NO_BOX && s->first_glyph->left_box_line_p)
+	  gx += max (s->face->box_vertical_line_width, 0);
 	if (s->first_glyph->type == COMPOSITE_GLYPH)
 	  wlshm_draw_composite_glyph_string_foreground (s);
 	else if (font && font->driver && font->driver->draw)
 	  {
 	    int y = s->ybase - font->baseline_offset;
-	    font->driver->draw (s, 0, s->nchars, s->x, y, false);
+	    font->driver->draw (s, 0, s->nchars, gx, y, with_bg);
 	  }
 
 	/* Underline.  */
@@ -1338,28 +1358,28 @@ wlshm_draw_glyph_string (struct glyph_string *s)
 	    wlshm_fill_rect_pixel (s->x, glyph_y + dy, s->width, 1, sc);
 	    unblock_input ();
 	  }
+
+	/* The face's box, drawn LAST (after the glyphs) like pgtk so the
+	   per-glyph backgrounds above cannot paint over its edges.  The
+	   mouse-face pill replaces it for hover.  */
+	if (!s->for_overlaps && s->hl != DRAW_MOUSE_FACE)
+	  wlshm_draw_glyph_string_box (s);
       }
       break;
 
     case STRETCH_GLYPH:
       {
-	/* Background inset vertically by the box line, then the box -- so a
-	   stretch glyph that falls inside a face's box run (e.g. the padding
-	   between mode-line elements) continues the box's top/bottom edges
-	   instead of leaving a gap in the outline.  Mirrors the CHAR_GLYPH
-	   path and pgtk_draw_stretch_glyph_string.  */
-	int box_line = max (s->face->box_horizontal_line_width, 0);
+	/* Background then the box.  Clear the FULL cell height (not inset by the
+	   box line): the box is drawn on top afterward and continues its
+	   top/bottom edges over the fill, while clearing the box-line rows so an
+	   incremental mode-line redraw can't leave a stale sliver of a previous
+	   glyph there.  Mirrors the CHAR_GLYPH path and
+	   pgtk_draw_stretch_glyph_string.  */
 	block_input ();
 	if (s->hl == DRAW_MOUSE_FACE)
 	  wlshm_draw_mouse_face_bg (s, bg, fg);
 	else
-	  {
-	    /* Clamp: a box wider than half the line makes height negative,
-	       painting an inverted/oversized fill.  */
-	    int fill_h = max (s->height - 2 * box_line, 0);
-	    wlshm_fill_rect_pixel (s->x, s->y + box_line,
-				   s->background_width, fill_h, bg);
-	  }
+	  wlshm_fill_rect_pixel (s->x, s->y, s->background_width, s->height, bg);
 	unblock_input ();
 	if (!s->for_overlaps && s->hl != DRAW_MOUSE_FACE)
 	  wlshm_draw_glyph_string_box (s);
