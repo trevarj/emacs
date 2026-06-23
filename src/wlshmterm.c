@@ -226,6 +226,21 @@ wlshm_ensure_canvas (void)
 	 font's own AA), so text stays smooth.  At scale 1.0 (integer coords)
 	 this is byte-identical to the AA default.  */
       cairo_set_antialias (o->cr, CAIRO_ANTIALIAS_NONE);
+      /* A fresh Cairo image surface is zero-filled == opaque BLACK.  If an early
+	 or partial present ships before redisplay has painted every region --
+	 notably a child frame (corfu popup) just shown or just grown, whose first
+	 paint may be partial -- the unpainted area would composite as a black
+	 rectangle.  Pre-fill the new canvas with the frame background so any such
+	 gap shows the background instead, and gets painted over normally.  */
+      {
+	float br, bgc, bb;
+	wlshm_unpack_pixel (FRAME_BACKGROUND_PIXEL (f), &br, &bgc, &bb);
+	cairo_save (o->cr);
+	cairo_set_source_rgb (o->cr, br, bgc, bb);
+	cairo_set_operator (o->cr, CAIRO_OPERATOR_SOURCE);
+	cairo_paint (o->cr);
+	cairo_restore (o->cr);
+      }
       o->canvas_w = pw;
       o->canvas_h = ph;
     }
