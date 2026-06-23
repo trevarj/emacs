@@ -342,6 +342,12 @@ static unsigned long wlshm_blend_pixel (unsigned long a, unsigned long b,
 static void wlshm_fill_rect_pixel (int x, int y, int w, int h,
 				   unsigned long pixel);
 
+/* Physical-snapped AA-none rect fill (defined below).  Used for crisp 1px
+   line elements (overline/underline/strike-through) so a fractional device
+   scale can't ramp them into the neighbouring physical row.  */
+static void wlshm_fill_rect_phys (int x, int y, int w, int h,
+				  unsigned long pixel);
+
 /* 1px-thick rectangle outline in a packed pixel (defined below).  */
 static void wlshm_draw_box_outline (unsigned long color, int x, int y,
 				    int w, int h);
@@ -869,8 +875,8 @@ wlshm_draw_underline (struct glyph_string *s, unsigned long color)
   switch (s->face->underline)
     {
     case FACE_UNDERLINE_DOUBLE_LINE:
-      wlshm_window_rect ((float) x0, (float) pos, (float) w, 1.0f, r, g, b, 1.0f);
-      wlshm_window_rect ((float) x0, (float) (pos + 2), (float) w, 1.0f, r, g, b, 1.0f);
+      wlshm_fill_rect_phys (x0, pos, w, 1, color);
+      wlshm_fill_rect_phys (x0, pos + 2, w, 1, color);
       break;
     case FACE_UNDERLINE_WAVE:
       {
@@ -893,8 +899,7 @@ wlshm_draw_underline (struct glyph_string *s, unsigned long color)
       break;
     case FACE_UNDERLINE_SINGLE:
     default:
-      wlshm_window_rect ((float) x0, (float) pos, (float) w, (float) thickness,
-			r, g, b, 1.0f);
+      wlshm_fill_rect_phys (x0, pos, w, thickness, color);
       break;
     }
   unblock_input ();
@@ -1343,7 +1348,11 @@ wlshm_draw_glyph_string (struct glyph_string *s)
 	    unsigned long oc = (s->face->overline_color_defaulted_p
 				? fg : s->face->overline_color);
 	    block_input ();
-	    wlshm_fill_rect_pixel (s->x, s->y, s->width, 1, oc);
+	    /* Physical-snapped AA-none: an antialiased 1px line at the cell
+	       top ramps over two physical rows at fractional scale and pokes
+	       one row above the AA-none face box meant to cover it, bleeding
+	       into a :box / internal-border band above the mode line.  */
+	    wlshm_fill_rect_phys (s->x, s->y, s->width, 1, oc);
 	    unblock_input ();
 	  }
 
@@ -1356,7 +1365,7 @@ wlshm_draw_glyph_string (struct glyph_string *s)
 	    unsigned long sc = (s->face->strike_through_color_defaulted_p
 				? fg : s->face->strike_through_color);
 	    block_input ();
-	    wlshm_fill_rect_pixel (s->x, glyph_y + dy, s->width, 1, sc);
+	    wlshm_fill_rect_phys (s->x, glyph_y + dy, s->width, 1, sc);
 	    unblock_input ();
 	  }
 
