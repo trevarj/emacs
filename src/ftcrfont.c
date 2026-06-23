@@ -243,6 +243,10 @@ ftcrfont_open (struct frame *f, Lisp_Object entity, int pixel_size)
     {
       unblock_input ();
       FcPatternDestroy (match);
+#ifdef HAVE_WLSHM
+      if (wlshm_render)
+	FcPatternDestroy (wlshm_render);
+#endif
       return Qnil;
     }
   cairo_matrix_t font_matrix, ctm;
