@@ -3665,6 +3665,17 @@ wlshm_scroll_bar_report_motion (struct frame **fp, Lisp_Object *bar_window,
   dpyinfo->last_mouse_scroll_bar = NULL;
 }
 
+/* Bit for BUTTON in the `grabbed' mask.  The button number comes from the
+   compositor (button_to_emacs on a raw evdev code), so it can exceed the bit
+   width of `grabbed' (an int) for tablet/gamepad codes or wrap huge for codes
+   below BTN_LEFT; `1 << n' for such n is undefined behavior.  Clamp the shift
+   to a valid bit so an exotic/hostile button code can't trigger UB.  */
+static unsigned
+wlshm_grab_bit (unsigned button)
+{
+  return 1u << (button < 30 ? button : 30);
+}
+
 static int
 wlshm_read_socket (struct terminal *terminal, struct input_event *hold_quit)
 {
@@ -3838,6 +3849,25 @@ wlshm_read_socket (struct terminal *terminal, struct input_event *hold_quit)
 	  }
 	  break;
 
+	case WlshmEventKind_PointerLeave:
+	  {
+	    /* The pointer left the surface: clear any active mouse-face
+	       highlight (mode-line button, link, ...) so it doesn't linger
+	       until the next redisplay.  Mirrors pgtk's leave_notify_event.
+	       Guarded like the motion path: touching the glyph matrices
+	       mid-redisplay or while garbaged can crash.  */
+	    Mouse_HLInfo *hlinfo = MOUSE_HL_INFO (f);
+	    if (hlinfo->mouse_face_mouse_frame == f
+		&& !redisplaying_p && f->glyphs_initialized_p
+		&& !FRAME_GARBAGED_P (f) && FRAME_X_OUTPUT (f))
+	      {
+		clear_mouse_face (hlinfo);
+		hlinfo->mouse_face_mouse_frame = NULL;
+		need_present = true;
+	      }
+	  }
+	  break;
+
 	case WlshmEventKind_PointerPress:
 	case WlshmEventKind_PointerRelease:
 	  {
@@ -3863,11 +3893,11 @@ wlshm_read_socket (struct terminal *terminal, struct input_event *hold_quit)
 				: VERTICAL_SCROLL_BAR_MIN_HANDLE);
 		    if (rel >= sb->start && rel < sb->end + minh)
 		      sb->dragging = rel - sb->start;
-		    dpyinfo->grabbed |= (1 << evs[i].button);
+		    dpyinfo->grabbed |= wlshm_grab_bit (evs[i].button);
 		    dpyinfo->last_mouse_scroll_bar = sb;
 		  }
 		else
-		  dpyinfo->grabbed &= ~(1 << evs[i].button);
+		  dpyinfo->grabbed &= ~wlshm_grab_bit (evs[i].button);
 		struct input_event sie;
 		wlshm_scroll_bar_handle_click (sb, evs[i].button, mods,
 					       evs[i].x, evs[i].y, press, &sie);
@@ -3915,7 +3945,7 @@ wlshm_read_socket (struct terminal *terminal, struct input_event *hold_quit)
 
 	    if (press)
 	      {
-		dpyinfo->grabbed |= (1 << evs[i].button);
+		dpyinfo->grabbed |= wlshm_grab_bit (evs[i].button);
 		dpyinfo->last_mouse_frame = f;
 		/* The pointer is stationary at the press; clear any pending
 		   "moved" flag from gliding onto the target.  Otherwise the
@@ -3927,7 +3957,7 @@ wlshm_read_socket (struct terminal *terminal, struct input_event *hold_quit)
 		f->mouse_moved = false;
 	      }
 	    else
-	      dpyinfo->grabbed &= ~(1 << evs[i].button);
+	      dpyinfo->grabbed &= ~wlshm_grab_bit (evs[i].button);
 
 	    /* Suppress the generic click for a tab-bar press not yet resolved to
 	       a tab, and for any tool-bar click (handled above); otherwise emit

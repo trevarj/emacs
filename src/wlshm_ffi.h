@@ -75,6 +75,11 @@ typedef enum {
    * codepoint, so it flows through the normal keystroke path.
    */
   WlshmEventKind_Preedit = 10,
+  /**
+   * The pointer left the surface; the C side clears any lingering mouse-face
+   * highlight so it doesn't persist until the next redisplay.
+   */
+  WlshmEventKind_PointerLeave = 11,
 } WlshmEventKind;
 
 /**

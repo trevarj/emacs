@@ -38,6 +38,9 @@ pub enum WlshmEventKind {
     /// is delivered separately as ordinary `KeyPress` events, one per
     /// codepoint, so it flows through the normal keystroke path.
     Preedit = 10,
+    /// The pointer left the surface; the C side clears any lingering mouse-face
+    /// highlight so it doesn't persist until the next redisplay.
+    PointerLeave = 11,
 }
 
 /// Modifier bits (our own encoding; translated to Emacs modifiers on the C
@@ -143,6 +146,11 @@ impl WlshmEvent {
     /// via `wlshm_window_get_preedit`; an empty string clears the preedit.
     pub fn preedit() -> Self {
         Self::blank(WlshmEventKind::Preedit)
+    }
+
+    /// The pointer left the surface.
+    pub fn pointer_leave() -> Self {
+        Self::blank(WlshmEventKind::PointerLeave)
     }
 
     pub fn axis(axis_x: i32, axis_y: i32, x: i32, y: i32, modifiers: u32, time: u32) -> Self {

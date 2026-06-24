@@ -315,8 +315,10 @@ struct AppState {
     present_timer_fd: i32,
     repeat_delay_ms: u32,
     repeat_rate_ms: u32,
-    /// Currently-held repeating key: (raw keycode, keysym, unichar).
-    repeat: Option<(u32, u32, u32)>,
+    /// Currently-held repeating key: (raw keycode, keysym, unichar, window id).
+    /// The window id pins replays to the frame focused at press time, so a frame
+    /// deleted mid-repeat can't redirect the held key into another frame.
+    repeat: Option<(u32, u32, u32, u64)>,
     serial: u32,
     data_device_manager: Option<DataDeviceManagerState>,
     data_device: Option<DataDevice>,
@@ -494,10 +496,13 @@ impl AppState {
             return;
         }
         let expirations = u64::from_ne_bytes(buf);
-        let win = self.primary();
-        if let Some((_, ks, unichar)) = self.repeat {
-            for _ in 0..expirations.min(4) {
-                self.push(WlshmEvent::key(ks, unichar, self.mods).on(win));
+        if let Some((_, ks, unichar, win)) = self.repeat {
+            // Replay to the window focused when the key was pressed, not to
+            // whatever primary() resolves to now; skip it if that window is gone.
+            if self.windows.contains_key(&win) {
+                for _ in 0..expirations.min(4) {
+                    self.push(WlshmEvent::key(ks, unichar, self.mods).on(win));
+                }
             }
         }
     }
@@ -896,6 +901,11 @@ impl Backend {
             }
             if self.state.focused_window == Some(win) {
                 self.state.focused_window = None;
+            }
+            // Drop a held key-repeat aimed at this window so its timer can't
+            // replay the key into an arbitrary surviving frame.
+            if matches!(self.state.repeat, Some((_, _, _, w)) if w == win) {
+                self.state.disarm_repeat();
             }
             // A subsurface and its plain wl_surface have no Drop destructor
             // (unlike sctk's Window/Popup), so destroy them explicitly and
@@ -1525,14 +1535,14 @@ impl KeyboardHandler for AppState {
         let win = self.primary();
         self.push(WlshmEvent::key(ks, unichar, self.mods).on(win));
         if self.repeat_rate_ms > 0 {
-            self.repeat = Some((event.raw_code, ks, unichar));
+            self.repeat = Some((event.raw_code, ks, unichar, win));
             self.arm_repeat();
         }
     }
 
     fn release_key(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlKeyboard,
                    _: u32, event: KeyEvent) {
-        if matches!(self.repeat, Some((rc, _, _)) if rc == event.raw_code) {
+        if matches!(self.repeat, Some((rc, _, _, _)) if rc == event.raw_code) {
             self.disarm_repeat();
         }
     }
@@ -1803,7 +1813,9 @@ impl PointerHandler for AppState {
                     self.pointer_pos = (x, y);
                     self.push(WlshmEvent::motion(x, y, self.mods, *time).on(id));
                 }
-                PointerEventKind::Leave { .. } => {}
+                PointerEventKind::Leave { .. } => {
+                    self.push(WlshmEvent::pointer_leave().on(id));
+                }
                 PointerEventKind::Press { time, button, serial } => {
                     // Track the latest input serial: an xdg_popup (menu) opened
                     // in response to this click must grab with THIS serial, or

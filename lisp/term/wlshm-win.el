@@ -134,7 +134,16 @@ the data is inserted via `dnd-insert-text'."
          (posn (event-start event))
          (window (posn-window posn))
          (frame (cond ((framep window) window)
-                      ((windowp window) (window-frame window)))))
+                      ((windowp window) (window-frame window))))
+         ;; POSN-WINDOW is a frame (not a live window) for drops on the
+         ;; tool/menu bar, internal border, etc.  `dnd-handle-multiple-urls'
+         ;; wraps its body in `with-selected-window', which rejects a frame,
+         ;; so resolve a live window to dispatch URI drops into.  (The `text'
+         ;; branch keeps WINDOW: `dnd-insert-text' has its own non-window
+         ;; kill-ring fallback.)
+         (win (if (window-live-p window)
+                  window
+                (frame-selected-window (or frame (selected-frame))))))
     (when frame
       (raise-frame frame)
       (select-frame frame))
@@ -148,7 +157,7 @@ the data is inserted via `dnd-insert-text'."
                                    (string-prefix-p "#" s)))
                    (split-string (string-trim-right data) "[\r\n]+"))))
         (when urls
-          (dnd-handle-multiple-urls window urls 'copy))))
+          (dnd-handle-multiple-urls win urls 'copy))))
      ((eq tag 'text)
       (dnd-insert-text window 'copy data)))))
 
