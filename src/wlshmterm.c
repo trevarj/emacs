@@ -1749,13 +1749,15 @@ wlshm_flush_display (struct frame *f)
 }
 
 /* Fringe bitmaps (continuation/truncation arrows, empty-line and buffer
-   boundary indicators).  We keep the raw bits (copied at define time, since
-   define may run before the window exists) and lazily rasterize them onto the
-   canvas with Cairo on first draw.  */
+   boundary indicators).  We keep the raw bits and rasterize a reusable 1-bit
+   Cairo mask once at define time (a standalone image surface, so it works even
+   before the window exists); each draw just cairo_mask_surfaces the cached mask
+   in the fringe color.  */
 struct wlshm_fringe_bmp
 {
   unsigned short *bits;
   int h, wd;
+  cairo_surface_t *mask;		/* cached 1-bit mask, built at define time */
 };
 static struct wlshm_fringe_bmp *wlshm_fringe_bmps;
 static int wlshm_fringe_bmp_max;
@@ -1774,10 +1776,32 @@ wlshm_define_fringe_bitmap (int which, unsigned short *bits, int h, int wd)
     }
   struct wlshm_fringe_bmp *fb = &wlshm_fringe_bmps[which];
   xfree (fb->bits);
+  if (fb->mask)
+    {
+      cairo_surface_destroy (fb->mask);
+      fb->mask = NULL;
+    }
   fb->bits = xnmalloc (h, sizeof (unsigned short));
   memcpy (fb->bits, bits, h * sizeof (unsigned short));
   fb->h = h;
   fb->wd = wd;
+  /* Rasterize the 1-bit cairo mask ONCE here and reuse it on every draw
+     (mirrors pgtk_define_fringe_bitmap), instead of allocating + copying +
+     destroying a fresh A1 surface per draw in the redisplay hot path.  An
+     image surface is standalone (no frame/canvas needed), so it is safe to
+     build at define time even before any GUI frame exists.  */
+  cairo_surface_t *mask = cairo_image_surface_create (CAIRO_FORMAT_A1, wd, h);
+  if (cairo_surface_status (mask) == CAIRO_STATUS_SUCCESS)
+    {
+      int stride = cairo_image_surface_get_stride (mask);
+      unsigned char *data = cairo_image_surface_get_data (mask);
+      for (int i = 0; i < h; i++)
+	*((unsigned short *) (data + i * stride)) = bits[i];
+      cairo_surface_mark_dirty (mask);
+      fb->mask = mask;
+    }
+  else
+    cairo_surface_destroy (mask);
 }
 
 static void
@@ -1788,6 +1812,11 @@ wlshm_destroy_fringe_bitmap (int which)
   struct wlshm_fringe_bmp *fb = &wlshm_fringe_bmps[which];
   xfree (fb->bits);
   fb->bits = NULL;
+  if (fb->mask)
+    {
+      cairo_surface_destroy (fb->mask);
+      fb->mask = NULL;
+    }
   fb->h = fb->wd = 0;
 }
 
@@ -1838,7 +1867,7 @@ wlshm_draw_fringe_bitmap (struct window *w, struct glyph_row *row,
       struct wlshm_fringe_bmp *fb
 	= (p->which < wlshm_fringe_bmp_max) ? &wlshm_fringe_bmps[p->which] : NULL;
       wlshm_ensure_canvas ();
-      if (fb && fb->bits && fb->h > 0 && fb->wd > 0 && wlshm_cr)
+      if (fb && fb->mask && fb->h > 0 && fb->wd > 0 && wlshm_cr)
 	{
 	  unsigned long fg
 	    = (p->cursor_p
@@ -1849,34 +1878,21 @@ wlshm_draw_fringe_bitmap (struct window *w, struct glyph_row *row,
 	  float r, g, b;
 	  wlshm_unpack_pixel (fg, &r, &g, &b);
 
-	  cairo_surface_t *mask
-	    = cairo_image_surface_create (CAIRO_FORMAT_A1, fb->wd, fb->h);
-	  /* Skip the bitmap if the mask surface couldn't be allocated (its data
-	     would be NULL); the row still renders, just without the indicator.  */
-	  if (cairo_surface_status (mask) == CAIRO_STATUS_SUCCESS)
-	    {
-	      int stride = cairo_image_surface_get_stride (mask);
-	      unsigned char *data = cairo_image_surface_get_data (mask);
-	      for (int i = 0; i < fb->h; i++)
-		*((unsigned short *) (data + i * stride)) = fb->bits[i];
-	      cairo_surface_mark_dirty (mask);
-
-	      cairo_save (wlshm_cr);
-	      /* Clip to the bitmap's VISIBLE extent (p->wd x p->h).  p->h is the
-		 fringe.c-adjusted height: clamped to the row and reduced by the
-		 p->dh phase offset, exactly what pgtk_cr_draw_image clips to.
-		 Using fb->h / p->ny here drew the wrong rows of periodic bitmaps
-		 (the empty-line ~ indicator), mispositioned custom bitmaps, and
-		 let a tall bitmap bleed past the row down over the mode line.  */
-	      cairo_rectangle (wlshm_cr, p->x, p->y, p->wd, p->h);
-	      cairo_clip (wlshm_cr);
-	      cairo_set_source_rgb (wlshm_cr, r, g, b);
-	      /* Offset by -dh so visible rows [dh, dh+h) land at p->y (partial
-		 rows at window edges; dh is 0 in the common case).  */
-	      cairo_mask_surface (wlshm_cr, mask, p->x, p->y - p->dh);
-	      cairo_restore (wlshm_cr);
-	    }
-	  cairo_surface_destroy (mask);
+	  cairo_save (wlshm_cr);
+	  /* Clip to the bitmap's VISIBLE extent (p->wd x p->h).  p->h is the
+	     fringe.c-adjusted height: clamped to the row and reduced by the
+	     p->dh phase offset, exactly what pgtk_cr_draw_image clips to.
+	     Using fb->h / p->ny here drew the wrong rows of periodic bitmaps
+	     (the empty-line ~ indicator), mispositioned custom bitmaps, and
+	     let a tall bitmap bleed past the row down over the mode line.  */
+	  cairo_rectangle (wlshm_cr, p->x, p->y, p->wd, p->h);
+	  cairo_clip (wlshm_cr);
+	  cairo_set_source_rgb (wlshm_cr, r, g, b);
+	  /* Offset by -dh so visible rows [dh, dh+h) land at p->y (partial
+	     rows at window edges; dh is 0 in the common case).  Reuses the
+	     mask cached at define time.  */
+	  cairo_mask_surface (wlshm_cr, fb->mask, p->x, p->y - p->dh);
+	  cairo_restore (wlshm_cr);
 	}
     }
 
