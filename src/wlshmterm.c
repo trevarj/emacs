@@ -4908,6 +4908,16 @@ wlshm_term_init (Lisp_Object display_name)
     wlshm_color_map
       = Fx_load_color_file (Fexpand_file_name (build_string ("rgb.txt"),
 					       Vdata_directory));
+  /* GUI frames are not slow terminals: give the canonical fast baud rate the
+     other window-system backends use (pgtk/haiku/android all set 19200).  Left
+     unset, baud_rate stays 0, so isearch sees (<= baud-rate search-slow-speed)
+     as true and enters isearch-slow-terminal-mode: on every search step whose
+     match is not already on screen it splits off a small "slow scroll" window
+     (search-slow-window-lines tall) instead of scrolling.  At fractional scale
+     that transient extra window plus its mode line reads as a stale duplicate
+     band above the real mode line.  A fast baud rate disables the slow-terminal
+     path entirely, matching every other GUI backend.  */
+  baud_rate = 19200;
   dpyinfo->smallest_font_height = 1;
   dpyinfo->smallest_char_width = 1;
   /* True-color depth: like pgtk.  A nonzero value (>= 2) also makes disabled
