@@ -551,12 +551,12 @@ wlshm_relief_color (unsigned long p, double factor, int delta)
 static void
 wlshm_draw_box_outline (unsigned long color, int x, int y, int w, int h)
 {
-  float r, g, b;
-  wlshm_unpack_pixel (color, &r, &g, &b);
-  wlshm_window_rect ((float) x, (float) y, (float) w, 1.0f, r, g, b, 1.0f);
-  wlshm_window_rect ((float) x, (float) (y + h), (float) w, 1.0f, r, g, b, 1.0f);
-  wlshm_window_rect ((float) x, (float) y, 1.0f, (float) h, r, g, b, 1.0f);
-  wlshm_window_rect ((float) (x + w), (float) y, 1.0f, (float) h, r, g, b, 1.0f);
+  /* Physical-snapped AA-none edges (like the 3D-relief/divider paths) so a
+     fractional device scale can't ramp a 1px edge across two physical rows.  */
+  wlshm_fill_rect_phys (x, y, w, 1, color);		/* top */
+  wlshm_fill_rect_phys (x, y + h, w, 1, color);		/* bottom */
+  wlshm_fill_rect_phys (x, y, 1, h, color);		/* left */
+  wlshm_fill_rect_phys (x + w, y, 1, h, color);		/* right */
 }
 
 /* Draw the face box around glyph string S: a flat box for FACE_SIMPLE_BOX, or
@@ -1060,12 +1060,11 @@ static void
 wlshm_draw_rectangle (struct frame *f, unsigned long color,
 		      int x, int y, int w, int h)
 {
-  float r, g, b;
-  wlshm_unpack_pixel (color, &r, &g, &b);
-  wlshm_window_rect ((float) x, (float) y, (float) (w + 1), 1.0f, r, g, b, 1.0f);
-  wlshm_window_rect ((float) x, (float) (y + h), (float) (w + 1), 1.0f, r, g, b, 1.0f);
-  wlshm_window_rect ((float) x, (float) y, 1.0f, (float) (h + 1), r, g, b, 1.0f);
-  wlshm_window_rect ((float) (x + w), (float) y, 1.0f, (float) (h + 1), r, g, b, 1.0f);
+  /* Physical-snapped AA-none edges, matching wlshm_draw_box_outline.  */
+  wlshm_fill_rect_phys (x, y, w + 1, 1, color);		/* top */
+  wlshm_fill_rect_phys (x, y + h, w + 1, 1, color);	/* bottom */
+  wlshm_fill_rect_phys (x, y, 1, h + 1, color);		/* left */
+  wlshm_fill_rect_phys (x + w, y, 1, h + 1, color);	/* right */
 }
 
 /* Draw a cairo image PATTERN onto the canvas at DEST_X,DEST_Y, sampling from
@@ -1386,7 +1385,46 @@ wlshm_draw_glyph_string (struct glyph_string *s)
 	   glyph there.  Mirrors the CHAR_GLYPH path and
 	   pgtk_draw_stretch_glyph_string.  */
 	block_input ();
-	if (s->hl == DRAW_MOUSE_FACE)
+	if (s->hl == DRAW_CURSOR && !x_stretch_cursor_p)
+	  {
+	    /* With `x-stretch-cursor' nil, don't paint a block cursor as wide
+	       as the whole stretch glyph: draw a single-column cursor and clear
+	       the rest with the non-cursor face background.  Mirrors
+	       pgtk_draw_stretch_glyph_string.  */
+	    int width, background_width = s->background_width;
+	    int x = s->x;
+	    if (!s->row->reversed_p)
+	      {
+		int left_x = window_box_left_offset (s->w, TEXT_AREA);
+		if (x < left_x)
+		  {
+		    background_width -= left_x - x;
+		    x = left_x;
+		  }
+	      }
+	    else
+	      {
+		/* R2L: cursor on the right edge of the stretch glyph.  */
+		int right_x = window_box_right (s->w, TEXT_AREA);
+		if (x + background_width > right_x)
+		  background_width -= x - right_x;
+		x += background_width;
+	      }
+	    width = min (FRAME_COLUMN_WIDTH (s->f), background_width);
+	    if (s->row->reversed_p)
+	      x -= width;
+	    wlshm_fill_rect_pixel (x, s->y, width, s->height, bg);
+	    if (width < background_width)
+	      {
+		int w = background_width - width;
+		if (!s->row->reversed_p)
+		  x += width;
+		else
+		  x = s->x;
+		wlshm_fill_rect_pixel (x, s->y, w, s->height, s->face->background);
+	      }
+	  }
+	else if (s->hl == DRAW_MOUSE_FACE)
 	  wlshm_draw_mouse_face_bg (s, bg, fg);
 	else
 	  wlshm_fill_rect_pixel (s->x, s->y, s->background_width, s->height, bg);
@@ -1488,16 +1526,15 @@ wlshm_draw_window_cursor (struct window *w, struct glyph_row *glyph_row,
 			      ? cface->foreground : FRAME_CURSOR_COLOR (f));
 	int gx, gy, gh, wd = cursor_glyph->pixel_width;
 	get_phys_cursor_geometry (w, glyph_row, cursor_glyph, &gx, &gy, &gh);
-	float r, g, b;
-	wlshm_unpack_pixel (ccol, &r, &g, &b);
 	block_input ();
 	if (cursor_type == HOLLOW_BOX_CURSOR)
 	  {
-	    /* Outline only.  */
-	    wlshm_window_rect ((float) gx, (float) gy, (float) wd, 1.0f, r, g, b, 1.0f);
-	    wlshm_window_rect ((float) gx, (float) (gy + gh - 1), (float) wd, 1.0f, r, g, b, 1.0f);
-	    wlshm_window_rect ((float) gx, (float) gy, 1.0f, (float) gh, r, g, b, 1.0f);
-	    wlshm_window_rect ((float) (gx + wd - 1), (float) gy, 1.0f, (float) gh, r, g, b, 1.0f);
+	    /* Outline only.  Physical-snapped AA-none edges so the hollow
+	       cursor stays a crisp, even 1px rectangle at fractional scale.  */
+	    wlshm_fill_rect_phys (gx, gy, wd, 1, ccol);
+	    wlshm_fill_rect_phys (gx, gy + gh - 1, wd, 1, ccol);
+	    wlshm_fill_rect_phys (gx, gy, 1, gh, ccol);
+	    wlshm_fill_rect_phys (gx + wd - 1, gy, 1, gh, ccol);
 	  }
 	else if (cursor_type == BAR_CURSOR)
 	  {
