@@ -1005,9 +1005,12 @@ ifneq ($(WLSHM_STATICLIB),)
 $(WLSHM_STATICLIB): FORCE
 	$(CARGO) build --release --manifest-path $(WLSHM_CARGO_DIR)/Cargo.toml
 
-## Order-only (|): guarantee the staticlib exists before temacs is linked
-## (LIBES references it via WLSHM_LIBS), without forcing a temacs relink merely
-## because cargo touched the archive's mtime.
-temacs$(EXEEXT): | $(WLSHM_STATICLIB)
+## Normal (content-sensitive) prerequisite: temacs links the staticlib via
+## LIBES -> WLSHM_LIBS, so it must relink whenever the archive changes.  The
+## FORCE rule above runs cargo every build, but cargo only rewrites the .a
+## (bumping its mtime) when Rust sources actually changed; a no-op build leaves
+## it untouched.  So this relinks temacs exactly when Rust changed and skips
+## relinking otherwise -- order-only (|) would never relink on a Rust change.
+temacs$(EXEEXT): $(WLSHM_STATICLIB)
 
 endif
