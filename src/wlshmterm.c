@@ -2007,27 +2007,38 @@ wlshm_hide_hourglass (struct frame *f)
 
 /* delete_frame_hook: destroy F's Wayland surface and Cairo canvas.  Without
    this the surface leaks until process exit.  */
-static void
-wlshm_destroy_window (struct frame *f)
+/* Free all window-system resources of frame F: drop any dangling references
+   to it, destroy its Cairo context/canvas, close its Wayland window, and free
+   the output struct itself.  Shared by wlshm_destroy_window (delete_frame_hook)
+   and the create-frame unwinders in wlshmfns.c, so a frame that dies
+   mid-creation leaks nothing.  Caller must hold block_input.  NULL-safe on both
+   the output and the display info, since the tooltip unwinder can fire before
+   either is set up.  Mirrors pgtk_free_frame_resources.  */
+void
+wlshm_free_frame_resources (struct frame *f)
 {
-  struct wlshm_display_info *dpyinfo = FRAME_DISPLAY_INFO (f);
   struct wlshm_output *o = FRAME_X_OUTPUT (f);
+  if (!o)
+    return;
 
-  block_input ();
-
-  /* Drop any dangling references to this frame.  */
-  if (dpyinfo->highlight_frame == f)
-    dpyinfo->highlight_frame = NULL;
-  if (dpyinfo->x_focus_frame == f)
-    dpyinfo->x_focus_frame = NULL;
-  if (dpyinfo->x_focus_event_frame == f)
-    dpyinfo->x_focus_event_frame = NULL;
-  if (dpyinfo->last_mouse_frame == f)
-    dpyinfo->last_mouse_frame = NULL;
-  if (dpyinfo->last_mouse_motion_frame == f)
-    dpyinfo->last_mouse_motion_frame = NULL;
-  if (dpyinfo->last_mouse_glyph_frame == f)
-    dpyinfo->last_mouse_glyph_frame = NULL;
+  /* display_info is set just after the output is allocated; the tooltip
+     unwinder can run in the window between the two, so guard it.  */
+  struct wlshm_display_info *dpyinfo = FRAME_DISPLAY_INFO (f);
+  if (dpyinfo)
+    {
+      if (dpyinfo->highlight_frame == f)
+	dpyinfo->highlight_frame = NULL;
+      if (dpyinfo->x_focus_frame == f)
+	dpyinfo->x_focus_frame = NULL;
+      if (dpyinfo->x_focus_event_frame == f)
+	dpyinfo->x_focus_event_frame = NULL;
+      if (dpyinfo->last_mouse_frame == f)
+	dpyinfo->last_mouse_frame = NULL;
+      if (dpyinfo->last_mouse_motion_frame == f)
+	dpyinfo->last_mouse_motion_frame = NULL;
+      if (dpyinfo->last_mouse_glyph_frame == f)
+	dpyinfo->last_mouse_glyph_frame = NULL;
+    }
   if (wlshm_cur == f)
     {
       wlshm_cur = NULL;
@@ -2035,24 +2046,33 @@ wlshm_destroy_window (struct frame *f)
       wlshm_cr = NULL;
     }
 
-  if (o)
+  if (o->cr)
     {
-      if (o->cr)
-	{
-	  cairo_destroy (o->cr);
-	  o->cr = NULL;
-	}
-      if (o->canvas)
-	{
-	  cairo_surface_destroy (o->canvas);
-	  o->canvas = NULL;
-	}
-      uint64_t h = WLSHM_FRAME_HANDLE (f);
-      if (h)
-	wlshm_window_close (h);
-      o->wlshm_frame = 0;
+      cairo_destroy (o->cr);
+      o->cr = NULL;
     }
+  if (o->canvas)
+    {
+      cairo_surface_destroy (o->canvas);
+      o->canvas = NULL;
+    }
+  uint64_t h = WLSHM_FRAME_HANDLE (f);
+  if (h)
+    wlshm_window_close (h);
+  o->wlshm_frame = 0;
 
+  /* Free the output struct itself.  delete_frame in frame.c does not free
+     output_data for window-system frames, so (like pgtk) we must do it here
+     or leak one struct per deleted frame/tooltip.  */
+  xfree (o);
+  FRAME_X_OUTPUT (f) = NULL;
+}
+
+static void
+wlshm_destroy_window (struct frame *f)
+{
+  block_input ();
+  wlshm_free_frame_resources (f);
   unblock_input ();
 }
 
@@ -4627,16 +4647,19 @@ wlshm_menu_show (struct frame *f, int x, int y, int menuflags,
     { wlshm_free_rows (rows, n); return Qnil; }
   cairo_surface_destroy (probe);	/* just for geometry */
 
+  /* Free the rows + close the popup on ANY exit (incl. a non-local one).  Arm
+     this BEFORE opening the popup, with pw == 0, so a failing xmalloc here can
+     never strand an open popup; pw is filled in only after a successful open.  */
+  struct wlshm_menu_data *md = xmalloc (sizeof *md);
+  *md = (struct wlshm_menu_data){ rows, n, 0 };
+  specpdl_ref count = SPECPDL_INDEX ();
+  record_unwind_protect_ptr (wlshm_free_menu_data, md);
+
   char *tc = STRINGP (title) ? SSDATA (ENCODE_UTF_8 (title)) : NULL;
   uint64_t pw = wlshm_window_open (tc, WLSHM_FRAME_HANDLE (f), 1 /* Popup */);
   if (pw == 0)
-    { wlshm_free_rows (rows, n); return Qnil; }
-
-  /* Free the rows + close the popup on ANY exit (incl. a non-local one).  */
-  struct wlshm_menu_data *md = xmalloc (sizeof *md);
-  *md = (struct wlshm_menu_data){ rows, n, pw };
-  specpdl_ref count = SPECPDL_INDEX ();
-  record_unwind_protect_ptr (wlshm_free_menu_data, md);
+    return unbind_to (count, Qnil);	/* protector frees rows */
+  md->pw = pw;
 
   wlshm_window_set_geometry (pw, x, y, mw, mh);
 
@@ -4687,15 +4710,17 @@ wlshm_popup_dialog (struct frame *f, Lisp_Object header, Lisp_Object contents)
   if (!probe)
     { wlshm_free_rows (rows, n); return Qnil; }
   cairo_surface_destroy (probe);
+  /* Arm the rows/popup cleanup BEFORE opening the popup (see wlshm_menu_show).  */
+  struct wlshm_menu_data *md = xmalloc (sizeof *md);
+  *md = (struct wlshm_menu_data){ rows, n, 0 };
+  specpdl_ref count = SPECPDL_INDEX ();
+  record_unwind_protect_ptr (wlshm_free_menu_data, md);
+
   uint64_t pw = wlshm_window_open (STRINGP (question) ? SSDATA (ENCODE_UTF_8 (question)) : NULL,
 				   WLSHM_FRAME_HANDLE (f), 1);
   if (pw == 0)
-    { wlshm_free_rows (rows, n); return Qnil; }
-
-  struct wlshm_menu_data *md = xmalloc (sizeof *md);
-  *md = (struct wlshm_menu_data){ rows, n, pw };
-  specpdl_ref count = SPECPDL_INDEX ();
-  record_unwind_protect_ptr (wlshm_free_menu_data, md);
+    return unbind_to (count, Qnil);	/* protector frees rows */
+  md->pw = pw;
 
   wlshm_window_set_geometry (pw, 0, 0, mw, mh);
   block_input ();

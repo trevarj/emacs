@@ -331,6 +331,7 @@ extern void wlshm_set_cr_source_with_color (struct frame *f, unsigned long color
 extern bool wlshm_dump_canvas_png (struct frame *f, const char *path);
 /* Present frame F's canvas to its Wayland window (used by tooltips).  */
 extern void wlshm_present_frame (struct frame *f);
+extern void wlshm_free_frame_resources (struct frame *f);
 
 /* RIF default-font hook + pixel helper, used by frame creation.  */
 extern void wlshm_default_font_parameter (struct frame *f, Lisp_Object parms);

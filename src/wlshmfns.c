@@ -523,9 +523,13 @@ unwind_create_frame (Lisp_Object frame)
 
   if (NILP (Fmemq (frame, Vframe_list)))
     {
-      if (FRAME_X_OUTPUT (f) && WLSHM_FRAME_HANDLE (f))
-	wlshm_window_close (WLSHM_FRAME_HANDLE (f));
       free_glyphs (f);
+      /* Full teardown (cr/canvas/window + the output struct itself), so a
+	 frame that dies mid-creation leaks nothing.  Mirrors pgtk, which
+	 calls pgtk_free_frame_resources here.  */
+      block_input ();
+      wlshm_free_frame_resources (f);
+      unblock_input ();
       return Qt;
     }
 
@@ -838,26 +842,108 @@ DEFUN ("x-show-tip", Fx_show_tip, Sx_show_tip, 1, 6, 0,
       goto start_timer;
     }
 
-  /* Otherwise drop any existing tooltip and (re)create one.  */
-  wlshm_hide_tip (true);
+  /* Otherwise hide any existing tooltip.  When tooltip-reuse-hidden-frame is
+     set and only position parameters differ, keep the frame alive
+     (wlshm_hide_tip (false)) so it can be re-shown below instead of rebuilt.
+     Mirrors pgtk's tooltip_reuse_hidden_frame branch.  */
+  if (FRAMEP (tip_frame) && FRAME_LIVE_P (XFRAME (tip_frame)))
+    {
+      if (tooltip_reuse_hidden_frame && EQ (frame, tip_last_frame))
+	{
+	  bool delete = false;
+	  Lisp_Object tail, elt, parm, last;
+
+	  /* Check if every parameter in PARMS has the same value in
+	     tip_last_parms.  This may destruct tip_last_parms which,
+	     however, will be recreated below.  */
+	  for (tail = parms; CONSP (tail); tail = XCDR (tail))
+	    {
+	      elt = XCAR (tail);
+	      parm = Fcar (elt);
+	      /* The left, top, right and bottom parameters are handled
+		 by compute_tip_xy so they can be ignored here.  */
+	      if (!EQ (parm, Qleft) && !EQ (parm, Qtop)
+		  && !EQ (parm, Qright) && !EQ (parm, Qbottom))
+		{
+		  last = Fassq (parm, tip_last_parms);
+		  if (NILP (Fequal (Fcdr (elt), Fcdr (last))))
+		    {
+		      /* We lost, delete the old tooltip.  */
+		      delete = true;
+		      break;
+		    }
+		  else
+		    tip_last_parms
+		      = calln (Qassq_delete_all, parm, tip_last_parms);
+		}
+	      else
+		tip_last_parms
+		  = calln (Qassq_delete_all, parm, tip_last_parms);
+	    }
+
+	  /* Now check if every parameter in what is left of tip_last_parms
+	     with a non-nil value has an association in PARMS.  */
+	  for (tail = tip_last_parms; CONSP (tail); tail = XCDR (tail))
+	    {
+	      elt = XCAR (tail);
+	      parm = Fcar (elt);
+	      if (!EQ (parm, Qleft) && !EQ (parm, Qtop) && !EQ (parm, Qright)
+		  && !EQ (parm, Qbottom) && !NILP (Fcdr (elt)))
+		{
+		  /* We lost, delete the old tooltip.  */
+		  delete = true;
+		  break;
+		}
+	    }
+
+	  wlshm_hide_tip (delete);
+	}
+      else
+	wlshm_hide_tip (true);
+    }
+  else
+    wlshm_hide_tip (true);
 
   tip_last_frame = frame;
   tip_last_string = string;
   tip_last_parms = parms;
 
-  if (NILP (Fassq (Qname, parms)))
-    parms = Fcons (Fcons (Qname, build_string ("tooltip")), parms);
-  if (NILP (Fassq (Qinternal_border_width, parms)))
-    parms = Fcons (Fcons (Qinternal_border_width, make_fixnum (3)), parms);
-  if (NILP (Fassq (Qborder_width, parms)))
-    parms = Fcons (Fcons (Qborder_width, make_fixnum (1)), parms);
-  if (NILP (Fassq (Qbackground_color, parms)))
-    parms = Fcons (Fcons (Qbackground_color, build_string ("lightyellow")),
-		   parms);
+  if (!FRAMEP (tip_frame) || !FRAME_LIVE_P (XFRAME (tip_frame)))
+    {
+      /* Add default values to frame parameters.  */
+      if (NILP (Fassq (Qname, parms)))
+	parms = Fcons (Fcons (Qname, build_string ("tooltip")), parms);
+      if (NILP (Fassq (Qinternal_border_width, parms)))
+	parms = Fcons (Fcons (Qinternal_border_width, make_fixnum (3)), parms);
+      if (NILP (Fassq (Qborder_width, parms)))
+	parms = Fcons (Fcons (Qborder_width, make_fixnum (1)), parms);
+      if (NILP (Fassq (Qborder_color, parms)))
+	parms = Fcons (Fcons (Qborder_color, build_string ("lightyellow")),
+		       parms);
+      if (NILP (Fassq (Qbackground_color, parms)))
+	parms = Fcons (Fcons (Qbackground_color, build_string ("lightyellow")),
+		       parms);
 
-  tip_frame = wlshm_create_tip_frame (FRAME_DISPLAY_INFO (f), parms, f);
-  if (NILP (tip_frame))
-    return unbind_to (count, Qnil);
+      tip_frame = wlshm_create_tip_frame (FRAME_DISPLAY_INFO (f), parms, f);
+      if (NILP (tip_frame))
+	/* Creating the tip frame failed.  */
+	return unbind_to (count, Qnil);
+    }
+  else
+    {
+      /* Reusing a hidden-but-alive tip frame.  wlshm_hide_tip (false) closed
+	 its Wayland window and zeroed the handle, so reopen one (kind=2
+	 tooltip, parented to the parent frame) before geometry and
+	 visibility are set below.  */
+      struct frame *tf = XFRAME (tip_frame);
+      if (!WLSHM_FRAME_HANDLE (tf))
+	{
+	  uint64_t win = wlshm_window_open (NULL, WLSHM_FRAME_HANDLE (f), 2);
+	  if (win == 0)
+	    return unbind_to (count, Qnil);
+	  FRAME_X_OUTPUT (tf)->wlshm_frame = win;
+	}
+    }
 
   tip_f = XFRAME (tip_frame);
   window = FRAME_ROOT_WINDOW (tip_f);
@@ -1244,6 +1330,7 @@ syms_of_wlshmfns (void)
   DEFSYM (Qrun_at_time, "run-at-time");
   DEFSYM (Qcancel_timer, "cancel-timer");
   DEFSYM (Qx_hide_tip, "x-hide-tip");
+  DEFSYM (Qassq_delete_all, "assq-delete-all");
 
   DEFVAR_LISP ("x-max-tooltip-size", Vx_max_tooltip_size,
 	       doc: /* Maximum size for tooltips.
