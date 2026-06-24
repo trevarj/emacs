@@ -338,7 +338,11 @@ struct AppState {
     /// A drop awaiting its pipe read: (pipe, is_uri_list, x, y, window).  Set in
     /// `drop_performed`; drained in `Backend::dispatch` (where the event queue
     /// is available to roundtrip so the source can write the data).
-    pending_drop: Option<(ReadPipe, bool, i32, i32, u64)>,
+    /// A drop awaiting its deferred read in Backend::drain_pending_drop:
+    /// (pipe, is_uri, x, y, win, offer).  The offer is held so finish() is sent
+    /// only AFTER the bytes are read; some sources free the transfer on
+    /// dnd_finished, which would truncate a finish-then-read sequence.
+    pending_drop: Option<(ReadPipe, bool, i32, i32, u64, DragOffer)>,
     /// Bytes of the most recent completed drop, handed to C via the
     /// `wlshm_window_get_drop` side-channel after it pops the Drop event.
     drop_text: Vec<u8>,
@@ -917,6 +921,16 @@ impl Backend {
                 parent_surface.commit();
                 let _ = self.conn.flush();
             }
+            // wp_viewport / wp_fractional_scale_v1 are raw wayland-client proxies
+            // whose explicit destroy request Drop does NOT send (same reason the
+            // subsurface/surface are destroyed above), so release them here or
+            // every closed window leaks a server object.
+            if let Some(vp) = &w.viewport {
+                vp.destroy();
+            }
+            if let Some(fs) = &w.fractional {
+                fs.destroy();
+            }
             // w drops here: destroys the xdg surface (safe while connected).
         }
     }
@@ -1011,10 +1025,12 @@ impl Backend {
     /// callback) because reading needs a flush + roundtrip so the drag source
     /// writes the bytes, and the event queue lives on `Backend`.
     fn drain_pending_drop(&mut self) {
-        let Some((pipe, is_uri, x, y, win)) = self.state.pending_drop.take() else { return };
+        let Some((pipe, is_uri, x, y, win, offer)) = self.state.pending_drop.take() else { return };
         let _ = self.conn.flush();
         let _ = self.event_queue.roundtrip(&mut self.state);
         let bytes = read_pipe_timeout(&pipe, 500);
+        // The transfer is fully read; only now signal completion to the source.
+        offer.finish();
         if bytes.is_empty() {
             return;
         }
@@ -1115,7 +1131,11 @@ impl Backend {
         };
         let src_stride = src_stride as usize;
         let dst_stride = stride as usize;
-        let row_bytes = (pw as usize) * 4;
+        // Each row copies pw*4 bytes but advances by src_stride; if a caller ever
+        // passed src_stride < pw*4 the last rows would read past the documented
+        // src_h*src_stride bound.  Cairo always pads stride >= width*4, so clamp
+        // defensively rather than trust the FFI caller at this unsafe boundary.
+        let row_bytes = ((pw as usize) * 4).min(src_stride).min(dst_stride);
         for y in 0..ph as usize {
             let s = std::slice::from_raw_parts(src.add(y * src_stride), row_bytes);
             canvas[y * dst_stride..y * dst_stride + row_bytes].copy_from_slice(s);
@@ -1315,6 +1335,58 @@ fn read_pipe_timeout(pipe: &ReadPipe, timeout_ms: u64) -> Vec<u8> {
     out
 }
 
+/// Write all of `data` to a selection pipe, non-blocking with a total timeout so
+/// a slow or stuck reader can never hang Emacs's main loop.  This is the write
+/// counterpart to read_pipe_timeout: send_request runs synchronously on the main
+/// thread inside the event-queue dispatch, and a POSIX pipe has a bounded kernel
+/// buffer, so a blocking write_all of a large selection would otherwise freeze
+/// the editor until the peer drains (or never).
+fn write_pipe_timeout(pipe: &WritePipe, data: &[u8], timeout_ms: u64) {
+    use std::os::unix::io::AsRawFd;
+    use std::time::{Duration, Instant};
+
+    let fd = pipe.as_raw_fd();
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        if flags >= 0 {
+            libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+    }
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    let mut off = 0usize;
+    while off < data.len() {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let mut pfd = libc::pollfd { fd, events: libc::POLLOUT, revents: 0 };
+        let pr = unsafe {
+            libc::poll(&mut pfd, 1, remaining.as_millis().min(i32::MAX as u128) as i32)
+        };
+        if pr <= 0 {
+            break;
+        }
+        // Reader closed its end: stop before writing to avoid EPIPE/SIGPIPE.
+        if pfd.revents & (libc::POLLERR | libc::POLLHUP) != 0 {
+            break;
+        }
+        let n = unsafe {
+            libc::write(fd, data[off..].as_ptr() as *const libc::c_void, data.len() - off)
+        };
+        if n > 0 {
+            off += n as usize;
+        } else if n < 0 {
+            let e = std::io::Error::last_os_error();
+            match e.raw_os_error() {
+                Some(libc::EAGAIN) | Some(libc::EINTR) => continue,
+                _ => break,
+            }
+        } else {
+            break;
+        }
+    }
+}
+
 // ----- sctk handlers -------------------------------------------------------
 
 impl CompositorHandler for AppState {
@@ -1324,6 +1396,13 @@ impl CompositorHandler for AppState {
         }
         let id = self.id_for_surface(s);
         let Some(w) = self.windows.get_mut(&id) else { return };
+        // A subsurface child frame is Emacs-driven and inherits its scale at
+        // creation; it has no xdg configure handshake, so pushing a Configure
+        // here would garbage the frame and risk a wp_viewport buffer/scale
+        // divergence (see update_viewport).  Leave its scale as set at creation.
+        if matches!(w.role, Role::Subsurface { .. }) {
+            return;
+        }
         // Integer fallback only: when the fractional-scale protocol is active
         // (per-surface wp_fractional_scale_v1), the preferred_scale event is
         // authoritative and we ignore the wl_output integer scale here.
@@ -1887,21 +1966,25 @@ impl DataDeviceHandler for AppState {
             return;
         };
         let Some(mime) = self.dnd_accept() else {
-            // Nothing we can take: end the drag so the source isn't stuck.
-            offer.finish();
+            // Nothing we can take.  Do NOT finish(): per the wl_data_offer
+            // protocol finish() is only valid once an action has been accepted,
+            // and here dnd_accept() accepted nothing, so finish() would raise the
+            // fatal invalid_finish protocol error and disconnect Emacs.  Just
+            // drop the offer; the source cancels the unfinished drag itself.
             return;
         };
         let is_uri = mime_is_uri_list(&mime);
         // Open the receive pipe now; the actual bytes are read later in
         // Backend::dispatch where the event queue can roundtrip so the source
-        // gets a chance to write.  finish() tells the source the transfer is
-        // accepted (the fd stays valid for reading after finish()).
+        // gets a chance to write.  finish() is deferred until after that read
+        // (see drain_pending_drop): per the wl_data_offer protocol the source is
+        // free to free its data on dnd_finished, so finishing before reading can
+        // truncate or empty the transfer.
         match offer.receive(mime) {
             Ok(pipe) => {
                 let (x, y) = self.dnd_pos;
                 let win = if self.dnd_window != 0 { self.dnd_window } else { self.primary() };
-                self.pending_drop = Some((pipe, is_uri, x, y, win));
-                offer.finish();
+                self.pending_drop = Some((pipe, is_uri, x, y, win, offer));
             }
             Err(_) => {
                 offer.finish();
@@ -1913,10 +1996,8 @@ impl DataDeviceHandler for AppState {
 impl DataSourceHandler for AppState {
     fn accept_mime(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataSource, _: Option<String>) {}
     fn send_request(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataSource,
-                    _mime: String, mut fd: WritePipe) {
-        use std::io::Write;
-        let _ = fd.write_all(&self.clipboard_text);
-        let _ = fd.flush();
+                    _mime: String, fd: WritePipe) {
+        write_pipe_timeout(&fd, &self.clipboard_text, 500);
     }
     fn cancelled(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataSource) {
         self.clipboard_source = None;
@@ -1943,10 +2024,8 @@ impl PrimarySelectionSourceHandler for AppState {
     // A client wants our primary text: write it to the fd, mirroring
     // DataSourceHandler::send_request for the clipboard.
     fn send_request(&mut self, _: &Connection, _: &QueueHandle<Self>,
-                    _: &ZwpPrimarySelectionSourceV1, _mime: String, mut write_pipe: WritePipe) {
-        use std::io::Write;
-        let _ = write_pipe.write_all(&self.primary_text);
-        let _ = write_pipe.flush();
+                    _: &ZwpPrimarySelectionSourceV1, _mime: String, write_pipe: WritePipe) {
+        write_pipe_timeout(&write_pipe, &self.primary_text, 500);
     }
     fn cancelled(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &ZwpPrimarySelectionSourceV1) {
         self.primary_source = None;
