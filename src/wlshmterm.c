@@ -4204,7 +4204,17 @@ wlshm_read_socket (struct terminal *terminal, struct input_event *hold_quit)
 	       through the keysym path so they map to <backspace>, <tab>, etc.
 	       rather than C-h, C-i, ...  */
 	    bool printable = cp >= 32 && cp != 127;
-	    if (printable && mods == 0)
+	    if ((mods & ctrl_modifier) && cp > 0 && cp < 32)
+	      {
+		/* Some xkb layouts report Ctrl-letter as the resulting ASCII
+		   control code rather than as a printable base keysym plus a
+		   control modifier.  Preserve that as an ASCII keystroke so
+		   C-g is always recognized as quit_char.  */
+		ie.kind = ASCII_KEYSTROKE_EVENT;
+		ie.code = cp;
+		ie.modifiers = mods;
+	      }
+	    else if (printable && mods == 0)
 	      {
 		/* Plain printable text (shift already applied).  */
 		ie.kind = (cp < 128) ? ASCII_KEYSTROKE_EVENT
@@ -4250,9 +4260,52 @@ wlshm_read_socket (struct terminal *terminal, struct input_event *hold_quit)
   return count;
 }
 
+static void
+wlshm_register_wait_descriptors (struct wlshm_display_info *dpyinfo)
+{
+  dpyinfo->input_fd = wlshm_window_fd ();
+  if (dpyinfo->input_fd >= 0)
+    add_keyboard_wait_descriptor (dpyinfo->input_fd);
+
+  /* Also wake on the key-repeat timerfd so held keys repeat.  */
+  dpyinfo->repeat_timer_fd = wlshm_window_timer_fd ();
+  if (dpyinfo->repeat_timer_fd >= 0)
+    add_keyboard_wait_descriptor (dpyinfo->repeat_timer_fd);
+
+  /* And on the present-deadline timerfd, so a frame coalesced by the present
+     throttle is flushed even if the compositor withholds its frame callback and
+     nothing else wakes the loop (mode line otherwise stays stale until a mouse
+     event); read_socket -> wlshm_window_dispatch -> flush_overdue_pending.  */
+  dpyinfo->present_timer_fd = wlshm_window_present_timer_fd ();
+  if (dpyinfo->present_timer_fd >= 0)
+    add_keyboard_wait_descriptor (dpyinfo->present_timer_fd);
+}
+
+static void
+wlshm_unregister_wait_descriptor (int *fd)
+{
+  if (*fd >= 0)
+    {
+      delete_keyboard_wait_descriptor (*fd);
+      *fd = -1;
+    }
+}
+
+static void
+wlshm_unregister_wait_descriptors (struct wlshm_display_info *dpyinfo)
+{
+  wlshm_unregister_wait_descriptor (&dpyinfo->present_timer_fd);
+  wlshm_unregister_wait_descriptor (&dpyinfo->repeat_timer_fd);
+  wlshm_unregister_wait_descriptor (&dpyinfo->input_fd);
+}
+
 void
 wlshm_delete_terminal (struct terminal *terminal)
 {
+  struct wlshm_display_info *dpyinfo = terminal->display_info.wlshm;
+  if (dpyinfo)
+    wlshm_unregister_wait_descriptors (dpyinfo);
+
   /* Windows are leaked at process exit (the connection is ManuallyDrop on the
      Rust side to avoid libwayland teardown crashes); per-frame close happens
      via the delete_frame hook.  */
@@ -4996,6 +5049,9 @@ wlshm_term_init (Lisp_Object display_name)
   block_input ();
 
   struct wlshm_display_info *dpyinfo = xzalloc (sizeof *dpyinfo);
+  dpyinfo->input_fd = -1;
+  dpyinfo->repeat_timer_fd = -1;
+  dpyinfo->present_timer_fd = -1;
   struct terminal *terminal = wlshm_create_terminal (dpyinfo);
 
   terminal->kboard = allocate_kboard (Qwlshm);
@@ -5040,20 +5096,7 @@ wlshm_term_init (Lisp_Object display_name)
   dpyinfo->next = x_display_list;
   x_display_list = dpyinfo;
 
-  int fd = wlshm_window_fd ();
-  if (fd >= 0)
-    add_keyboard_wait_descriptor (fd);
-  /* Also wake on the key-repeat timerfd so held keys repeat.  */
-  int tfd = wlshm_window_timer_fd ();
-  if (tfd >= 0)
-    add_keyboard_wait_descriptor (tfd);
-  /* And on the present-deadline timerfd, so a frame coalesced by the present
-     throttle is flushed even if the compositor withholds its frame callback and
-     nothing else wakes the loop (mode line otherwise stays stale until a mouse
-     event); read_socket -> wlshm_window_dispatch -> flush_overdue_pending.  */
-  int ptfd = wlshm_window_present_timer_fd ();
-  if (ptfd >= 0)
-    add_keyboard_wait_descriptor (ptfd);
+  wlshm_register_wait_descriptors (dpyinfo);
 
   unblock_input ();
   return dpyinfo;

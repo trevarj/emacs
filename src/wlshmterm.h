@@ -105,6 +105,12 @@ struct wlshm_display_info
   void *last_mouse_scroll_bar;
 
   Emacs_Cursor invisible_cursor;
+
+  /* File descriptors registered with Emacs's input wait set.  Keep the exact
+     values so terminal teardown can unregister only wlshm-owned descriptors.  */
+  int input_fd;
+  int repeat_timer_fd;
+  int present_timer_fd;
 };
 
 /* Per-frame backend state, hung off f->output_data.wlshm.  */
