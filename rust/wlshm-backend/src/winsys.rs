@@ -196,6 +196,75 @@ enum Role {
     Pending { parent: u64, grab: bool },
 }
 
+/// Latest redraw coalesced while a frame callback is still outstanding.
+///
+/// This deliberately is NOT a wl_buffer.  Creating a SlotPool buffer sends a
+/// Wayland create_buffer request immediately, and a benchmark can generate many
+/// full-screen redisplays before the compositor releases the previous frame.
+/// Keep only one client-side pixel snapshot and create the wl_buffer when that
+/// snapshot is actually committed.
+struct PendingFrame {
+    width: u32,
+    height: u32,
+    stride: u32,
+    dx: i32,
+    dy: i32,
+    dw: i32,
+    dh: i32,
+    pixels: Vec<u8>,
+}
+
+impl PendingFrame {
+    unsafe fn new_from_source(
+        src: *const u8,
+        src_w: u32,
+        src_h: u32,
+        src_stride: u32,
+        dx: i32,
+        dy: i32,
+        dw: i32,
+        dh: i32,
+    ) -> Self {
+        let stride = src_w * 4;
+        let mut pixels = vec![0; (src_h as usize) * (stride as usize)];
+        copy_source_pixels(src, src_w, src_h, src_stride, stride, &mut pixels);
+        Self {
+            width: src_w,
+            height: src_h,
+            stride,
+            dx,
+            dy,
+            dw,
+            dh,
+            pixels,
+        }
+    }
+
+    unsafe fn replace_from_source(
+        &mut self,
+        src: *const u8,
+        src_w: u32,
+        src_h: u32,
+        src_stride: u32,
+        dx: i32,
+        dy: i32,
+        dw: i32,
+        dh: i32,
+    ) {
+        let stride = src_w * 4;
+        self.width = src_w;
+        self.height = src_h;
+        self.stride = stride;
+        self.dx = dx;
+        self.dy = dy;
+        self.dw = dw;
+        self.dh = dh;
+        self.pixels.resize((src_h as usize) * (stride as usize), 0);
+        copy_source_pixels(src, src_w, src_h, src_stride, stride,
+                           &mut self.pixels);
+    }
+}
+
 /// Per-surface state.  One per Emacs frame (toplevel), menu popup, or tooltip.
 struct WlWindow {
     role: Role,
@@ -220,10 +289,11 @@ struct WlWindow {
     /// nonstop scrolling) throttles to the compositor's frame rate and cannot
     /// flood it with buffer commits.
     frame_pending: bool,
-    /// Latest prepared-but-uncommitted frame (buffer + damage rect), committed
-    /// when the next frame callback fires.  Replacing it drops the previous
-    /// buffer, freeing its pool slot, so at most ~2 buffers are ever in flight.
-    pending: Option<(Buffer, i32, i32, i32, i32)>,
+    /// Latest prepared-but-uncommitted frame snapshot.  It is copied into a
+    /// wl_shm buffer only when the frame callback/deadline path will actually
+    /// commit it, so throttled redraws do not create/destroy Wayland buffer
+    /// objects at benchmark speed.
+    pending: Option<PendingFrame>,
     /// When we last committed a buffer.  Used as a present DEADLINE: if a frame
     /// callback is overdue (the compositor withheld it -- e.g. an idle/occluded
     /// output that only repaints on cursor motion), present() commits anyway
@@ -271,6 +341,76 @@ impl WlWindow {
 /// so the forced-commit rate stays bounded (no flood) yet stale content clears
 /// promptly.
 const PRESENT_DEADLINE: Duration = Duration::from_millis(33);
+
+unsafe fn copy_source_pixels(
+    src: *const u8,
+    src_w: u32,
+    src_h: u32,
+    src_stride: u32,
+    dst_stride: u32,
+    dst: &mut [u8],
+) {
+    let src_stride = src_stride as usize;
+    let dst_stride = dst_stride as usize;
+    // Each row copies src_w*4 bytes but advances by src_stride; if a caller ever
+    // passed src_stride < src_w*4 the last rows would read past the documented
+    // src_h*src_stride bound.  Cairo always pads stride >= width*4, so clamp
+    // defensively rather than trust the FFI caller at this unsafe boundary.
+    let row_bytes = ((src_w as usize) * 4).min(src_stride).min(dst_stride);
+    for y in 0..src_h as usize {
+        let s = std::slice::from_raw_parts(src.add(y * src_stride), row_bytes);
+        dst[y * dst_stride..y * dst_stride + row_bytes].copy_from_slice(s);
+    }
+}
+
+unsafe fn create_buffer_from_source(
+    pool: &mut SlotPool,
+    src: *const u8,
+    src_w: u32,
+    src_h: u32,
+    src_stride: u32,
+) -> Option<Buffer> {
+    let stride = src_w as i32 * 4;
+    let (buffer, canvas) = match pool.create_buffer(
+        src_w as i32, src_h as i32, stride, wl_shm::Format::Xrgb8888,
+    ) {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln!("wlshm: shm create_buffer: {e}");
+            return None;
+        }
+    };
+    copy_source_pixels(src, src_w, src_h, src_stride, stride as u32, canvas);
+    Some(buffer)
+}
+
+fn create_buffer_from_pending(pool: &mut SlotPool, pending: &PendingFrame) -> Option<Buffer> {
+    let (buffer, canvas) = match pool.create_buffer(
+        pending.width as i32,
+        pending.height as i32,
+        pending.stride as i32,
+        wl_shm::Format::Xrgb8888,
+    ) {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln!("wlshm: shm create_buffer: {e}");
+            return None;
+        }
+    };
+    canvas[..pending.pixels.len()].copy_from_slice(&pending.pixels);
+    Some(buffer)
+}
+
+fn set_viewport_source(w: &WlWindow, pw: u32, ph: u32) {
+    if w.fractional.is_some() {
+        if let Some(vp) = w.viewport.as_ref() {
+            let s = w.scale120 as f64 / 120.0;
+            let sw = (w.size.0 as f64 * s).min(pw as f64).max(1.0);
+            let sh = (w.size.1 as f64 * s).min(ph as f64).max(1.0);
+            vp.set_source(0.0, 0.0, sw, sh);
+        }
+    }
+}
 
 /// Attach BUFFER to SURFACE, damage it, request a wl_surface.frame callback (so
 /// the next present throttles to the compositor's pace), and commit.  Returns
@@ -990,31 +1130,31 @@ impl Backend {
         }
         for id in ids {
             let pending = self.state.windows.get_mut(&id).and_then(|w| w.pending.take());
-            let Some((buffer, dx, dy, dw, dh)) = pending else { continue };
+            let Some(pending) = pending else { continue };
             // Skip an unconfigured xdg surface: it was unmapped/hidden after this
-            // buffer was coalesced, so attaching it now is xdg_surface error 3
+            // frame was coalesced, so attaching it now is xdg_surface error 3
             // (unconfigured_buffer) and the compositor disconnects us.  A
             // subsurface has no unconfigured state, so it is always eligible.
-            // Dropping the taken `pending` frees its pool slot; the next present
-            // re-attaches once a fresh configure lands.
+            // Dropping the taken `pending` forgets the stale pixels; the next
+            // present re-attaches once a fresh configure lands.
             let eligible = self.state.windows.get(&id).map_or(false, |w| {
                 w.configured || matches!(w.role, Role::Subsurface { .. })
             });
             if !eligible {
                 continue;
             }
-            let Some(surf) =
-                self.state.windows.get(&id).and_then(|w| w.wl_surface().cloned())
-            else {
+            let Some(w) = self.state.windows.get_mut(&id) else { continue };
+            let Some(surf) = w.wl_surface().cloned() else { continue };
+            let Some(buffer) = create_buffer_from_pending(&mut w.pool, &pending) else {
                 continue;
             };
-            if commit_buffer(&self.qh, &surf, &buffer, dx, dy, dw, dh) {
-                if let Some(w) = self.state.windows.get_mut(&id) {
-                    if !matches!(w.role, Role::Subsurface { .. }) {
-                        w.frame_pending = true;
-                    }
-                    w.last_commit = Some(Instant::now());
+            set_viewport_source(w, pending.width, pending.height);
+            if commit_buffer(&self.qh, &surf, &buffer,
+                             pending.dx, pending.dy, pending.dw, pending.dh) {
+                if !matches!(w.role, Role::Subsurface { .. }) {
+                    w.frame_pending = true;
                 }
+                w.last_commit = Some(Instant::now());
             }
         }
         let _ = self.conn.flush();
@@ -1119,39 +1259,6 @@ impl Backend {
         if pw == 0 || ph == 0 {
             return;
         }
-        let stride = pw as i32 * 4;
-        let (buffer, canvas) = match w.pool.create_buffer(
-            pw as i32, ph as i32, stride, wl_shm::Format::Xrgb8888,
-        ) {
-            Ok(x) => x,
-            Err(e) => {
-                eprintln!("wlshm: shm create_buffer: {e}");
-                return;
-            }
-        };
-        let src_stride = src_stride as usize;
-        let dst_stride = stride as usize;
-        // Each row copies pw*4 bytes but advances by src_stride; if a caller ever
-        // passed src_stride < pw*4 the last rows would read past the documented
-        // src_h*src_stride bound.  Cairo always pads stride >= width*4, so clamp
-        // defensively rather than trust the FFI caller at this unsafe boundary.
-        let row_bytes = ((pw as usize) * 4).min(src_stride).min(dst_stride);
-        for y in 0..ph as usize {
-            let s = std::slice::from_raw_parts(src.add(y * src_stride), row_bytes);
-            canvas[y * dst_stride..y * dst_stride + row_bytes].copy_from_slice(s);
-        }
-        // Set the viewport SOURCE to the crisp logical*scale crop, CLAMPED to
-        // this buffer (pw x ph) so it can never exceed the content area (a
-        // wp_viewport out_of_buffer protocol error).  Applied on the commit
-        // below, so source and buffer always agree.
-        if w.fractional.is_some() {
-            if let Some(vp) = w.viewport.as_ref() {
-                let s = w.scale120 as f64 / 120.0;
-                let sw = (w.size.0 as f64 * s).min(pw as f64).max(1.0);
-                let sh = (w.size.1 as f64 * s).min(ph as f64).max(1.0);
-                vp.set_source(0.0, 0.0, sw, sh);
-            }
-        }
         // Resolve damage to a concrete rect (full buffer when none was given).
         let (dx, dy, dw, dh) = if dmg_w > 0 && dmg_h > 0 {
             (dmg_x, dmg_y, dmg_w, dmg_h)
@@ -1159,12 +1266,12 @@ impl Backend {
             (0, 0, pw as i32, ph as i32)
         };
         // Flow control: at most one buffer in flight per frame callback.  If a
-        // frame callback is still outstanding, stash this as the pending frame
-        // (dropping any previous pending buffer, which frees its pool slot) and
-        // return -- it is committed when the callback fires.  Otherwise commit
-        // now and arm the next callback.  This throttles a fast redisplay loop
-        // (nonstop scroll) to the compositor's frame rate so we never flood it
-        // with buffer commits.
+        // frame callback is still outstanding, stash a client-side snapshot as
+        // the pending frame and return -- it is copied into a wl_shm buffer when
+        // the callback fires.  Otherwise commit now and arm the next callback.
+        // This throttles a fast redisplay loop (nonstop scroll) to the
+        // compositor's frame rate so we never flood it with buffer commits or
+        // create/destroy uncommitted wl_buffer objects.
         // Subsurfaces (child frames) bypass the frame-callback throttle: they
         // don't rapid-update, and an unmapped subsurface may never get a frame
         // callback -- which would stick frame_pending and freeze the child at
@@ -1182,7 +1289,16 @@ impl Backend {
             .last_commit
             .map_or(false, |t| t.elapsed() >= PRESENT_DEADLINE);
         if w.frame_pending && !is_sub && !stalled {
-            w.pending = Some((buffer, dx, dy, dw, dh));
+            match w.pending.as_mut() {
+                Some(pending) => {
+                    pending.replace_from_source(src, pw, ph, src_stride, dx, dy, dw, dh);
+                }
+                None => {
+                    w.pending =
+                        Some(PendingFrame::new_from_source(
+                            src, pw, ph, src_stride, dx, dy, dw, dh));
+                }
+            }
             // Wake the event loop after the deadline so this coalesced frame is
             // delivered even if no callback / no other event ever arrives.
             self.state.arm_present_timer();
@@ -1193,6 +1309,14 @@ impl Backend {
         // (which would flash stale content -- possible now that the deadline
         // lets us commit while frame_pending is still set).
         w.pending = None;
+        let Some(buffer) = create_buffer_from_source(&mut w.pool, src, pw, ph, src_stride) else {
+            return;
+        };
+        // Set the viewport SOURCE to the crisp logical*scale crop, CLAMPED to
+        // this buffer (pw x ph) so it can never exceed the content area (a
+        // wp_viewport out_of_buffer protocol error).  Applied on the commit
+        // below, so source and buffer always agree.
+        set_viewport_source(w, pw, ph);
         let Some(surface) = w.wl_surface().cloned() else { return };
         let parent_surface = if let Role::Subsurface { parent_surface, .. } = &w.role {
             Some(parent_surface.clone())
@@ -1435,13 +1559,13 @@ impl CompositorHandler for AppState {
             }
             None => return,
         };
-        if let Some((buffer, dx, dy, dw, dh)) = pending {
+        if let Some(pending) = pending {
             // Don't commit onto an unconfigured xdg surface: it was unmapped
             // while this frame callback was still outstanding, and attaching a
             // buffer to a surface in the initial unconfigured state is
             // xdg_surface error 3 (the compositor disconnects us).  Subsurfaces
             // have no unconfigured state, so they stay eligible.  The taken
-            // buffer is dropped (its pool slot freed); the next present
+            // snapshot is dropped; the next present
             // re-attaches after a fresh configure.
             let eligible = self.windows.get(&id).map_or(false, |w| {
                 w.configured || matches!(w.role, Role::Subsurface { .. })
@@ -1449,12 +1573,16 @@ impl CompositorHandler for AppState {
             if !eligible {
                 return;
             }
-            if let Some(surf) = self.windows.get(&id).and_then(|w| w.wl_surface().cloned()) {
-                if commit_buffer(qh, &surf, &buffer, dx, dy, dw, dh) {
-                    if let Some(w) = self.windows.get_mut(&id) {
-                        w.frame_pending = true;
-                        w.last_commit = Some(Instant::now());
-                    }
+            if let Some(w) = self.windows.get_mut(&id) {
+                let Some(surf) = w.wl_surface().cloned() else { return };
+                let Some(buffer) = create_buffer_from_pending(&mut w.pool, &pending) else {
+                    return;
+                };
+                set_viewport_source(w, pending.width, pending.height);
+                if commit_buffer(qh, &surf, &buffer,
+                                 pending.dx, pending.dy, pending.dw, pending.dh) {
+                    w.frame_pending = true;
+                    w.last_commit = Some(Instant::now());
                     let _ = conn.flush();
                 }
             }
