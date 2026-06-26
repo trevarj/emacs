@@ -1,9 +1,9 @@
 /* Wayland + wlshm terminal backend for Emacs -- frame/Lisp glue.
 
 This holds x-create-frame and friends for the wlshm backend, plus the
-test/validation primitive `wlshm-dump-frame'.
+test/validation primitive `wlshm-dump-canvas'.
 
-See wlshm-backend-plan.md.  */
+See wlshm-architecture.md.  */
 
 #include <config.h>
 

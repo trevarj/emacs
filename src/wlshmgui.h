@@ -1,6 +1,6 @@
 /* Definitions and headers for the wlshm (Wayland + wl_shm) backend.
 
-This file is part of a personal-fork experiment (see wlshm-backend-plan.md).
+This file is part of a personal-fork experiment (see wlshm-architecture.md).
 It mirrors pgtkgui.h: it supplies the X-flavored type/aliases the generic
 display code still expects, but with backend-neutral handle types since the
 wlshm backend talks raw Wayland (no Gdk/Xlib).  */

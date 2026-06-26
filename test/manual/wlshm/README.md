@@ -1,19 +1,8 @@
 # wlshm backend manual tests
 
-Golden-image and bring-up tests for the experimental wlshm (Wayland + GPU)
-backend.  See `../../../wlshm-backend-plan.md`.
-
-## Standalone Rust window (M1c/M2)
-
-Open a Wayland window that renders demo content (a row of atlas glyphs + a
-cursor fill, over a clear background) via the same `Renderer` the offscreen
-golden path uses (needs `WAYLAND_DISPLAY`):
-
-```sh
-cd rust/wlshm-backend
-guix shell -m ../../manifest.scm -- cargo run --example clear_color        # until closed
-guix shell -m ../../manifest.scm -- cargo run --example clear_color -- 90   # 90 frames
-```
+Golden-image and bring-up tests for the experimental wlshm backend: raw
+Wayland plus CPU Cairo rendering presented through `wl_shm`.  See
+`../../../wlshm-architecture.md`.
 
 ## Windowed tests without disturbing your session
 
@@ -37,25 +26,32 @@ Drive editing with `--eval` (not key injection) and read back state, e.g.:
   (kill-emacs 0)))'
 ```
 
-## Offscreen golden images (M1d)
+## Render smoke and golden images
 
-The offscreen render path is deterministic and needs only a Vulkan/GL device
-(software lavapipe is fine), no display, so it runs in CI.  From Emacs:
-
-```elisp
-(wlshm-dump-frame "/tmp/frame.png")   ; render offscreen, write PNG
-```
-
-`golden-test.el` drives this and compares against committed goldens in
-`golden/` with a per-pixel tolerance.
+The main harness runs Emacs under a private compositor and captures the current
+Cairo canvas via the debug-only dump primitive:
 
 ```sh
-guix shell -m manifest.scm -- ./src/emacs -Q --batch \
-  -l test/manual/wlshm/golden-test.el -f wlshm-golden-run
+test/manual/wlshm/run-tests.sh [all|1|2|3]
+```
+
+Tier 1 is a render smoke test.  Tier 2 compares committed PNG goldens in
+`golden/`.  Tier 3 uses nested niri and skips unless `WLSHM_PARENT_WL` is set.
+
+From a test Emacs started with `WLSHM_DEBUG=1`:
+
+```elisp
+(wlshm-dump-canvas "/tmp/frame.png") ; write the current canvas to PNG
+```
+
+To run only the golden PNG tier:
+
+```sh
+test/manual/wlshm/run-tests.sh 2
 ```
 
 To (re)generate goldens after an intentional visual change:
 
 ```sh
-... -l test/manual/wlshm/golden-test.el -f wlshm-golden-regenerate
+WLSHM_REGEN=1 test/manual/wlshm/run-tests.sh 2
 ```

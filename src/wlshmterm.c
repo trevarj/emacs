@@ -4,7 +4,7 @@ This wires the Emacs redisplay interface (RIF) and terminal hooks to the Rust
 backend over FFI (wlshm_ffi.h): RIF draw hooks paint fills/glyphs with CPU
 Cairo onto a persistent image-surface canvas, and frame_up_to_date presents
 that canvas via wl_shm.  Single-threaded model; structurally mirrors
-pgtkterm.c.  See wlshm-backend-plan.md.  */
+pgtkterm.c.  See wlshm-architecture.md.  */
 
 #include <config.h>
 

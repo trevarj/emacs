@@ -1,6 +1,6 @@
 /* Wayland + wlshm terminal backend for Emacs -- header.
 
-This file is part of a personal-fork experiment (see wlshm-backend-plan.md).
+This file is part of a personal-fork experiment (see wlshm-architecture.md).
 The Wayland windowing/event plumbing lives in the Rust crate
 rust/wlshm-backend; this C side holds the redisplay interface + terminal
 hooks and does the actual CPU Cairo drawing onto a persistent image-surface

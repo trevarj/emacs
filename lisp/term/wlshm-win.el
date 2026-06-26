@@ -23,7 +23,7 @@
 ;; CPU Cairo rendering presented via wl_shm; window/event plumbing in Rust over
 ;; FFI).  Mirrors term/pgtk-win.el: it registers the
 ;; `wlshm' window system's initialization, argument handling and frame
-;; creation.  See wlshm-backend-plan.md.
+;; creation.  See wlshm-architecture.md.
 
 ;;; Code:
 

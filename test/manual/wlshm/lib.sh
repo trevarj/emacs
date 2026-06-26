@@ -1,6 +1,6 @@
 # lib.sh --- shared primitives for the wlshm graphical test harness.
 #
-# Sourced by run-tests.sh.  Provides: software-GPU env, a build-tree Emacs
+# Sourced by run-tests.sh.  Provides: CPU/Cairo env, a build-tree Emacs
 # runner, headless-weston and nested-niri launchers, a hang/crash watchdog
 # that captures a gdb backtrace, virtual input injection, emacsclient-driven
 # state evaluation, PNG golden comparison, and cleanup that only kills PIDs we
@@ -11,7 +11,7 @@
 #     UNSET, otherwise it picks up the packaged emacs-next lisp and fails to
 #     load cl-lib etc.
 #   * Rendering is CPU/Cairo (no GPU), so frames are deterministic on a given
-#     machine without any software-GPU setup.
+#     machine without any GPU setup.
 
 set -u
 
@@ -31,7 +31,7 @@ mkdir -p "$WLSHM_TMP"
 
 wlshm_setup_env () {
   # Rendering is CPU/Cairo now (no GPU/Vulkan), so output is deterministic
-  # without any software-GPU setup.
+  # without any GPU setup.
   # The build-tree binary must use ITS OWN lisp/, not the packaged emacs's.
   unset EMACSLOADPATH EMACSDATA EMACSDOC EMACSPATH 2>/dev/null || true
   echo "[env] CPU/Cairo backend (no Vulkan)"
@@ -70,7 +70,7 @@ wlshm_gdb_bt () {
 
 # --- the build-tree Emacs --------------------------------------------------
 
-# wlshm_emacs WAYLAND_DISPLAY ARGS...  -- run the build-tree emacs, software GPU,
+# wlshm_emacs WAYLAND_DISPLAY ARGS...  -- run the build-tree emacs,
 # clean load path, WLSHM_DEBUG on.  Runs in the FOREGROUND.
 wlshm_emacs () {
   wd=$1; shift
