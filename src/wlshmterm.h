@@ -176,6 +176,8 @@ struct wlshm_output
   cairo_surface_t *canvas;
   cairo_t *cr;
   int canvas_w, canvas_h;
+  bool damage_valid;
+  int damage_x, damage_y, damage_w, damage_h;
 
   int has_been_visible;
   int focus_state;

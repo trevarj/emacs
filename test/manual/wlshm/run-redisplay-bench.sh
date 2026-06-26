@@ -203,7 +203,7 @@ fullscreen_parent_niri_window () {
     if [ -n "$id" ]; then
       parent_niri_msg action focus-window --id "$id" >/dev/null
       sleep 0.2
-      parent_niri_msg action fullscreen-window >/dev/null
+      parent_niri_msg action fullscreen-window --id "$id" >/dev/null
       sleep 1
       return 0
     fi

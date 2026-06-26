@@ -214,7 +214,41 @@ struct PendingFrame {
     pixels: Vec<u8>,
 }
 
+struct CachedBuffer {
+    buffer: Buffer,
+}
+
+const BUFFER_CACHE_LIMIT: usize = 3;
+
 impl PendingFrame {
+    fn union_damage(&mut self, dx: i32, dy: i32, dw: i32, dh: i32) {
+        let max_x = self.width as i64;
+        let max_y = self.height as i64;
+        let old_x0 = i64::from(self.dx).clamp(0, max_x);
+        let old_y0 = i64::from(self.dy).clamp(0, max_y);
+        let old_x1 = (i64::from(self.dx) + i64::from(self.dw)).clamp(0, max_x);
+        let old_y1 = (i64::from(self.dy) + i64::from(self.dh)).clamp(0, max_y);
+        let new_x0 = i64::from(dx).clamp(0, max_x);
+        let new_y0 = i64::from(dy).clamp(0, max_y);
+        let new_x1 = (i64::from(dx) + i64::from(dw)).clamp(0, max_x);
+        let new_y1 = (i64::from(dy) + i64::from(dh)).clamp(0, max_y);
+        let x0 = old_x0.min(new_x0);
+        let y0 = old_y0.min(new_y0);
+        let x1 = old_x1.max(new_x1);
+        let y1 = old_y1.max(new_y1);
+        if x1 <= x0 || y1 <= y0 {
+            self.dx = 0;
+            self.dy = 0;
+            self.dw = self.width as i32;
+            self.dh = self.height as i32;
+        } else {
+            self.dx = x0 as i32;
+            self.dy = y0 as i32;
+            self.dw = (x1 - x0) as i32;
+            self.dh = (y1 - y0) as i32;
+        }
+    }
+
     unsafe fn new_from_source(
         src: *const u8,
         src_w: u32,
@@ -252,16 +286,30 @@ impl PendingFrame {
         dh: i32,
     ) {
         let stride = src_w * 4;
+        let size_changed = self.width != src_w
+            || self.height != src_h
+            || self.stride != stride;
+        let full_damage = dx <= 0
+            && dy <= 0
+            && dw >= src_w as i32
+            && dh >= src_h as i32;
         self.width = src_w;
         self.height = src_h;
         self.stride = stride;
-        self.dx = dx;
-        self.dy = dy;
-        self.dw = dw;
-        self.dh = dh;
-        self.pixels.resize((src_h as usize) * (stride as usize), 0);
-        copy_source_pixels(src, src_w, src_h, src_stride, stride,
-                           &mut self.pixels);
+        let len = (src_h as usize) * (stride as usize);
+        self.pixels.resize(len, 0);
+        if size_changed || full_damage {
+            copy_source_pixels(src, src_w, src_h, src_stride, stride,
+                               &mut self.pixels);
+            self.dx = 0;
+            self.dy = 0;
+            self.dw = src_w as i32;
+            self.dh = src_h as i32;
+        } else {
+            copy_source_rect_pixels(src, src_w, src_h, src_stride, stride,
+                                    dx, dy, dw, dh, &mut self.pixels);
+            self.union_damage(dx, dy, dw, dh);
+        }
     }
 }
 
@@ -283,17 +331,21 @@ struct WlWindow {
     /// New size the compositor asked for, pending delivery to Emacs.
     pending_resize: Option<(u32, u32)>,
     configured: bool,
-    /// A wl_surface.frame callback is outstanding: the compositor has not yet
-    /// signalled it is ready for the next buffer.  While true, present() coalesces
-    /// into `pending` instead of committing, so a fast redisplay loop (e.g.
-    /// nonstop scrolling) throttles to the compositor's frame rate and cannot
-    /// flood it with buffer commits.
-    frame_pending: bool,
+    /// Number of wl_surface.frame callbacks outstanding for committed toplevel
+    /// buffers.  While nonzero, present() coalesces into `pending` instead of
+    /// committing, so a fast redisplay loop (e.g. nonstop scrolling) throttles
+    /// to the compositor's frame pace and cannot flood it with buffer commits.
+    frame_callbacks_pending: u32,
     /// Latest prepared-but-uncommitted frame snapshot.  It is copied into a
     /// wl_shm buffer only when the frame callback/deadline path will actually
     /// commit it, so throttled redraws do not create/destroy Wayland buffer
     /// objects at benchmark speed.
     pending: Option<PendingFrame>,
+    /// Retained wl_shm buffers for the current source dimensions.  SCTK's
+    /// Buffer::canvas reports None while the compositor still owns a buffer, so
+    /// reuse is keyed by real wl_buffer release rather than frame callbacks.
+    buffers: Vec<CachedBuffer>,
+    buffer_size: Option<(u32, u32, u32)>,
     /// When we last committed a buffer.  Used as a present DEADLINE: if a frame
     /// callback is overdue (the compositor withheld it -- e.g. an idle/occluded
     /// output that only repaints on cursor motion), present() commits anyway
@@ -363,15 +415,85 @@ unsafe fn copy_source_pixels(
     }
 }
 
-unsafe fn create_buffer_from_source(
-    pool: &mut SlotPool,
+unsafe fn copy_source_rect_pixels(
     src: *const u8,
     src_w: u32,
     src_h: u32,
     src_stride: u32,
-) -> Option<Buffer> {
+    dst_stride: u32,
+    dx: i32,
+    dy: i32,
+    dw: i32,
+    dh: i32,
+    dst: &mut [u8],
+) {
+    if dw <= 0 || dh <= 0 {
+        return;
+    }
+    let x0 = i64::from(dx).clamp(0, src_w as i64) as usize;
+    let y0 = i64::from(dy).clamp(0, src_h as i64) as usize;
+    let x1 = (i64::from(dx) + i64::from(dw)).clamp(0, src_w as i64) as usize;
+    let y1 = (i64::from(dy) + i64::from(dh)).clamp(0, src_h as i64) as usize;
+    if x1 <= x0 || y1 <= y0 {
+        return;
+    }
+
+    let src_stride = src_stride as usize;
+    let dst_stride = dst_stride as usize;
+    let row_bytes = ((x1 - x0) * 4).min(src_stride.saturating_sub(x0 * 4))
+        .min(dst_stride.saturating_sub(x0 * 4));
+    if row_bytes == 0 {
+        return;
+    }
+    for y in y0..y1 {
+        let src_off = y * src_stride + x0 * 4;
+        let dst_off = y * dst_stride + x0 * 4;
+        // SAFETY: The FFI present contract guarantees the source has at least
+        // src_h * src_stride readable bytes.  The clamped rectangle and
+        // row_bytes bounds keep each per-row copy inside both source and dst.
+        let s = std::slice::from_raw_parts(src.add(src_off), row_bytes);
+        dst[dst_off..dst_off + row_bytes].copy_from_slice(s);
+    }
+}
+
+fn reset_buffer_cache_if_needed(w: &mut WlWindow, width: u32, height: u32, stride: u32) {
+    let key = (width, height, stride);
+    if w.buffer_size != Some(key) {
+        // Dropping active SCTK Buffers schedules wl_buffer.destroy after release,
+        // so this is safe across resize/scale changes.
+        w.buffers.clear();
+        w.buffer_size = Some(key);
+    }
+}
+
+fn released_cached_buffer(w: &mut WlWindow) -> Option<usize> {
+    for i in 0..w.buffers.len() {
+        if w.buffers[i].buffer.canvas(&mut w.pool).is_some() {
+            return Some(i);
+        }
+    }
+    None
+}
+
+unsafe fn prepare_buffer_from_source(
+    w: &mut WlWindow,
+    src: *const u8,
+    src_w: u32,
+    src_h: u32,
+    src_stride: u32,
+) -> Option<usize> {
     let stride = src_w as i32 * 4;
-    let (buffer, canvas) = match pool.create_buffer(
+    reset_buffer_cache_if_needed(w, src_w, src_h, stride as u32);
+    if let Some(idx) = released_cached_buffer(w) {
+        let canvas = w.buffers[idx].buffer.canvas(&mut w.pool)?;
+        copy_source_pixels(src, src_w, src_h, src_stride, stride as u32, canvas);
+        return Some(idx);
+    }
+    if w.buffers.len() >= BUFFER_CACHE_LIMIT {
+        return None;
+    }
+
+    let (buffer, canvas) = match w.pool.create_buffer(
         src_w as i32, src_h as i32, stride, wl_shm::Format::Xrgb8888,
     ) {
         Ok(x) => x,
@@ -381,11 +503,23 @@ unsafe fn create_buffer_from_source(
         }
     };
     copy_source_pixels(src, src_w, src_h, src_stride, stride as u32, canvas);
-    Some(buffer)
+    let idx = w.buffers.len();
+    w.buffers.push(CachedBuffer { buffer });
+    Some(idx)
 }
 
-fn create_buffer_from_pending(pool: &mut SlotPool, pending: &PendingFrame) -> Option<Buffer> {
-    let (buffer, canvas) = match pool.create_buffer(
+fn prepare_buffer_from_pending(w: &mut WlWindow, pending: &PendingFrame) -> Option<usize> {
+    reset_buffer_cache_if_needed(w, pending.width, pending.height, pending.stride);
+    if let Some(idx) = released_cached_buffer(w) {
+        let canvas = w.buffers[idx].buffer.canvas(&mut w.pool)?;
+        canvas[..pending.pixels.len()].copy_from_slice(&pending.pixels);
+        return Some(idx);
+    }
+    if w.buffers.len() >= BUFFER_CACHE_LIMIT {
+        return None;
+    }
+
+    let (buffer, canvas) = match w.pool.create_buffer(
         pending.width as i32,
         pending.height as i32,
         pending.stride as i32,
@@ -398,7 +532,9 @@ fn create_buffer_from_pending(pool: &mut SlotPool, pending: &PendingFrame) -> Op
         }
     };
     canvas[..pending.pixels.len()].copy_from_slice(&pending.pixels);
-    Some(buffer)
+    let idx = w.buffers.len();
+    w.buffers.push(CachedBuffer { buffer });
+    Some(idx)
 }
 
 fn set_viewport_source(w: &WlWindow, pw: u32, ph: u32) {
@@ -414,9 +550,9 @@ fn set_viewport_source(w: &WlWindow, pw: u32, ph: u32) {
 
 /// Attach BUFFER to SURFACE, damage it, request a wl_surface.frame callback (so
 /// the next present throttles to the compositor's pace), and commit.  Returns
-/// false if the attach failed (the caller then leaves frame_pending clear so the
-/// next present retries).  Shared by present() (Backend) and the frame callback
-/// (AppState), both of which hold a QueueHandle<AppState>.
+/// false if the attach failed (the caller then leaves the callback count
+/// unchanged so the next present retries).  Shared by present() (Backend) and
+/// the frame callback (AppState), both of which hold a QueueHandle<AppState>.
 fn commit_buffer(qh: &QueueHandle<AppState>, surface: &wl_surface::WlSurface,
                  buffer: &Buffer, dx: i32, dy: i32, dw: i32, dh: i32) -> bool {
     if buffer.attach_to(surface).is_err() {
@@ -811,8 +947,10 @@ impl Backend {
                 viewport: None,
                 pending_resize: None,
                 configured: false,
-                frame_pending: false,
+                frame_callbacks_pending: 0,
                 pending: None,
+                buffers: Vec::new(),
+                buffer_size: None,
                 last_commit: None,
                 parent_dirty: false,
             });
@@ -854,8 +992,10 @@ impl Backend {
                     // Subsurfaces get no xdg configure; ready to present at the
                     // size Emacs assigns via wlshm_window_set_size.
                     configured: true,
-                    frame_pending: false,
+                    frame_callbacks_pending: 0,
                     pending: None,
+                    buffers: Vec::new(),
+                    buffer_size: None,
                     last_commit: None,
                     // First present must commit the parent to map the subsurface.
                     parent_dirty: true,
@@ -915,8 +1055,10 @@ impl Backend {
             viewport,
             pending_resize: None,
             configured: false,
-            frame_pending: false,
+            frame_callbacks_pending: 0,
             pending: None,
+            buffers: Vec::new(),
+            buffer_size: None,
             last_commit: None,
             parent_dirty: false,
         });
@@ -1128,6 +1270,7 @@ impl Backend {
         if ids.is_empty() {
             return;
         }
+        let mut retry_pending = false;
         for id in ids {
             let pending = self.state.windows.get_mut(&id).and_then(|w| w.pending.take());
             let Some(pending) = pending else { continue };
@@ -1145,17 +1288,27 @@ impl Backend {
             }
             let Some(w) = self.state.windows.get_mut(&id) else { continue };
             let Some(surf) = w.wl_surface().cloned() else { continue };
-            let Some(buffer) = create_buffer_from_pending(&mut w.pool, &pending) else {
+            let Some(buffer_idx) = prepare_buffer_from_pending(w, &pending) else {
+                w.pending = Some(pending);
+                retry_pending = true;
                 continue;
             };
             set_viewport_source(w, pending.width, pending.height);
-            if commit_buffer(&self.qh, &surf, &buffer,
+            let buffer = &w.buffers[buffer_idx].buffer;
+            if commit_buffer(&self.qh, &surf, buffer,
                              pending.dx, pending.dy, pending.dw, pending.dh) {
                 if !matches!(w.role, Role::Subsurface { .. }) {
-                    w.frame_pending = true;
+                    w.frame_callbacks_pending =
+                        w.frame_callbacks_pending.saturating_add(1);
                 }
                 w.last_commit = Some(Instant::now());
+            } else {
+                w.pending = Some(pending);
+                retry_pending = true;
             }
+        }
+        if retry_pending {
+            self.state.arm_present_timer();
         }
         let _ = self.conn.flush();
     }
@@ -1274,21 +1427,21 @@ impl Backend {
         // create/destroy uncommitted wl_buffer objects.
         // Subsurfaces (child frames) bypass the frame-callback throttle: they
         // don't rapid-update, and an unmapped subsurface may never get a frame
-        // callback -- which would stick frame_pending and freeze the child at
-        // its provisional size (it would never re-present at its real size).
+        // callback -- which would leave the callback count nonzero and freeze
+        // the child at its provisional size (it would never re-present at its
+        // real size).
         let is_sub = matches!(w.role, Role::Subsurface { .. });
-        // Throttle while a frame callback is genuinely in flight -- UNLESS it is
-        // overdue past PRESENT_DEADLINE.  Some compositors withhold the
-        // wl_surface.frame callback when the output is otherwise idle (it only
-        // repaints, and thus flushes callbacks, on cursor motion etc.), which
-        // would strand the latest buffer in `pending` and leave stale pixels on
-        // screen (mode line not redrawing until you move the mouse).  Committing
-        // anyway after the deadline unsticks it while staying bounded to ~1
-        // commit per deadline, so it still cannot flood the compositor.
-        let stalled = w
-            .last_commit
-            .map_or(false, |t| t.elapsed() >= PRESENT_DEADLINE);
-        if w.frame_pending && !is_sub && !stalled {
+        // Throttle while a frame callback is in flight.  Do not bypass this
+        // synchronously just because last_commit is older than PRESENT_DEADLINE:
+        // a full-frame redisplay can itself take longer than the deadline, and
+        // present() may run repeatedly before the event loop drains the callback
+        // that would release the throttle.  Committing here would recreate the
+        // fullscreen benchmark failure: one large wl_shm buffer per redisplay.
+        // True idle/stalled presents are handled by the present_timer_fd waking
+        // read_socket -> dispatch -> flush_overdue_pending, which is bounded to
+        // the timer cadence instead of redisplay speed.
+        if w.frame_callbacks_pending > 0 && !is_sub {
+            let had_pending = w.pending.is_some();
             match w.pending.as_mut() {
                 Some(pending) => {
                     pending.replace_from_source(src, pw, ph, src_stride, dx, dy, dw, dh);
@@ -1301,15 +1454,20 @@ impl Backend {
             }
             // Wake the event loop after the deadline so this coalesced frame is
             // delivered even if no callback / no other event ever arrives.
-            self.state.arm_present_timer();
+            if !had_pending {
+                self.state.arm_present_timer();
+            }
             return;
         }
         // We are about to commit the CURRENT (newest) buffer.  Drop any older
         // coalesced buffer so frame() can't later commit it on top of this one
         // (which would flash stale content -- possible now that the deadline
-        // lets us commit while frame_pending is still set).
+        // lets us commit while callbacks are still outstanding).
         w.pending = None;
-        let Some(buffer) = create_buffer_from_source(&mut w.pool, src, pw, ph, src_stride) else {
+        let Some(buffer_idx) = prepare_buffer_from_source(w, src, pw, ph, src_stride) else {
+            w.pending =
+                Some(PendingFrame::new_from_source(src, pw, ph, src_stride, dx, dy, dw, dh));
+            self.state.arm_present_timer();
             return;
         };
         // Set the viewport SOURCE to the crisp logical*scale crop, CLAMPED to
@@ -1324,9 +1482,11 @@ impl Backend {
             None
         };
         let parent_dirty = w.parent_dirty;
-        if commit_buffer(&self.qh, &surface, &buffer, dx, dy, dw, dh) {
+        let buffer = &w.buffers[buffer_idx].buffer;
+        if commit_buffer(&self.qh, &surface, buffer, dx, dy, dw, dh) {
             if !is_sub {
-                w.frame_pending = true;
+                w.frame_callbacks_pending =
+                    w.frame_callbacks_pending.saturating_add(1);
             }
             w.last_commit = Some(Instant::now());
             // A subsurface's placement/mapping is applied on the PARENT's commit.
@@ -1342,6 +1502,10 @@ impl Backend {
                     w.parent_dirty = false;
                 }
             }
+        } else {
+            w.pending =
+                Some(PendingFrame::new_from_source(src, pw, ph, src_stride, dx, dy, dw, dh));
+            self.state.arm_present_timer();
         }
         let _ = self.conn.flush();
     }
@@ -1554,7 +1718,7 @@ impl CompositorHandler for AppState {
         let id = self.id_for_surface(surface);
         let pending = match self.windows.get_mut(&id) {
             Some(w) => {
-                w.frame_pending = false;
+                w.frame_callbacks_pending = w.frame_callbacks_pending.saturating_sub(1);
                 w.pending.take()
             }
             None => return,
@@ -1573,18 +1737,31 @@ impl CompositorHandler for AppState {
             if !eligible {
                 return;
             }
+            let mut retry_pending = false;
             if let Some(w) = self.windows.get_mut(&id) {
                 let Some(surf) = w.wl_surface().cloned() else { return };
-                let Some(buffer) = create_buffer_from_pending(&mut w.pool, &pending) else {
-                    return;
-                };
-                set_viewport_source(w, pending.width, pending.height);
-                if commit_buffer(qh, &surf, &buffer,
-                                 pending.dx, pending.dy, pending.dw, pending.dh) {
-                    w.frame_pending = true;
-                    w.last_commit = Some(Instant::now());
-                    let _ = conn.flush();
+                if let Some(buffer_idx) = prepare_buffer_from_pending(w, &pending) {
+                    set_viewport_source(w, pending.width, pending.height);
+                    let buffer = &w.buffers[buffer_idx].buffer;
+                    if commit_buffer(qh, &surf, buffer,
+                                     pending.dx, pending.dy, pending.dw, pending.dh) {
+                        if !matches!(w.role, Role::Subsurface { .. }) {
+                            w.frame_callbacks_pending =
+                                w.frame_callbacks_pending.saturating_add(1);
+                        }
+                        w.last_commit = Some(Instant::now());
+                        let _ = conn.flush();
+                    } else {
+                        w.pending = Some(pending);
+                        retry_pending = true;
+                    }
+                } else {
+                    w.pending = Some(pending);
+                    retry_pending = true;
                 }
+            }
+            if retry_pending {
+                self.arm_present_timer();
             }
         }
     }
@@ -1610,10 +1787,10 @@ impl WindowHandler for AppState {
                 w.size = (cw.get(), ch.get());
             }
             w.configured = true;
-            // A fresh configure invites a new buffer; clear any stuck throttle
-            // (e.g. left over from an unmap that got no frame callback) so the
-            // next present commits immediately.
-            w.frame_pending = false;
+            // A fresh configure invalidates coalesced pixels, but it does not
+            // cancel old frame callbacks.  Leave the callback count alone so
+            // stale callbacks drain naturally; the deadline path still allows a
+            // fresh present if the compositor withholds them.
             w.pending = None;
             w.pending_resize = Some(w.size);
             let (sw, sh) = w.size;
@@ -1636,7 +1813,7 @@ impl PopupHandler for AppState {
             // geometry the compositor just assigned (HiDPI; no-op at scale 1).
             w.update_viewport();
             w.configured = true;
-            w.frame_pending = false;
+            // Old callbacks are not canceled by configure; let them drain.
             w.pending = None;
         }
     }
@@ -2671,13 +2848,12 @@ pub extern "C" fn wlshm_window_unmap(win: u64) {
                     if parent.is_none() {
                         w.configured = false;
                     }
-                    // Drop any buffer coalesced before this unmap and clear the
-                    // throttle.  Otherwise a stranded frame() callback or the
-                    // present-deadline flush could later commit that stale buffer
-                    // onto the now unmapped/unconfigured surface (xdg_surface
-                    // error 3).  The next present re-attaches a fresh buffer.
+                    // Drop any buffer coalesced before this unmap.  Frame
+                    // callbacks already requested by older commits are not
+                    // canceled; keep the count so they drain without
+                    // undercounting newer commits.  The deadline path handles
+                    // withheld callbacks after the next present.
                     w.pending = None;
-                    w.frame_pending = false;
                     // Re-map (the next present) must commit the parent again to
                     // re-apply this subsurface's placement.
                     w.parent_dirty = true;

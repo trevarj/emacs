@@ -112,6 +112,8 @@ static cairo_surface_t *wlshm_canvas;
 static cairo_t *wlshm_cr;
 static int wlshm_canvas_w, wlshm_canvas_h;
 
+static void wlshm_ensure_canvas (void);
+
 /* The frame whose canvas the drawing helpers should target.  */
 static struct frame *
 wlshm_canvas_frame (void)
@@ -136,6 +138,83 @@ wlshm_frame_scale_factor (struct frame *f)
 {
   uint32_t scale120 = wlshm_window_scale120 (WLSHM_FRAME_HANDLE (f));
   return scale120 < 120 ? 1.0 : (double) scale120 / 120.0;
+}
+
+static void
+wlshm_damage_reset (struct wlshm_output *o)
+{
+  if (o)
+    {
+      o->damage_valid = false;
+      o->damage_x = o->damage_y = o->damage_w = o->damage_h = 0;
+    }
+}
+
+static void
+wlshm_damage_phys (struct frame *f, int x, int y, int w, int h)
+{
+  if (!f || !FRAME_WLSHM_P (f) || !FRAME_X_OUTPUT (f) || w <= 0 || h <= 0)
+    return;
+
+  struct wlshm_output *o = FRAME_X_OUTPUT (f);
+  if (o->canvas_w <= 0 || o->canvas_h <= 0)
+    return;
+
+  int x0 = max (x, 0);
+  int y0 = max (y, 0);
+  int x1 = min (x + w, o->canvas_w);
+  int y1 = min (y + h, o->canvas_h);
+  if (x1 <= x0 || y1 <= y0)
+    return;
+
+  if (!o->damage_valid)
+    {
+      o->damage_x = x0;
+      o->damage_y = y0;
+      o->damage_w = x1 - x0;
+      o->damage_h = y1 - y0;
+      o->damage_valid = true;
+      return;
+    }
+
+  int old_x1 = o->damage_x + o->damage_w;
+  int old_y1 = o->damage_y + o->damage_h;
+  int nx0 = min (o->damage_x, x0);
+  int ny0 = min (o->damage_y, y0);
+  int nx1 = max (old_x1, x1);
+  int ny1 = max (old_y1, y1);
+  o->damage_x = nx0;
+  o->damage_y = ny0;
+  o->damage_w = nx1 - nx0;
+  o->damage_h = ny1 - ny0;
+}
+
+static void
+wlshm_damage_logical (struct frame *f, double x, double y, double w, double h)
+{
+  if (!f || w <= 0.0 || h <= 0.0)
+    return;
+  wlshm_cur = f;
+  wlshm_ensure_canvas ();
+  if (!wlshm_canvas)
+    return;
+
+  double sx = 1.0, sy = 1.0;
+  cairo_surface_get_device_scale (wlshm_canvas, &sx, &sy);
+  int x0 = (int) floor (x * sx);
+  int y0 = (int) floor (y * sy);
+  int x1 = (int) ceil ((x + w) * sx);
+  int y1 = (int) ceil ((y + h) * sy);
+  wlshm_damage_phys (f, x0, y0, x1 - x0, y1 - y0);
+}
+
+static void
+wlshm_damage_full (struct frame *f)
+{
+  if (!f || !FRAME_X_OUTPUT (f))
+    return;
+  struct wlshm_output *o = FRAME_X_OUTPUT (f);
+  wlshm_damage_phys (f, 0, 0, o->canvas_w, o->canvas_h);
 }
 
 /* Ensure wlshm_cur's per-frame canvas matches its Wayland surface size, and
@@ -243,6 +322,7 @@ wlshm_ensure_canvas (void)
       }
       o->canvas_w = pw;
       o->canvas_h = ph;
+      wlshm_damage_full (f);
     }
   wlshm_canvas = o->canvas;
   wlshm_cr = o->cr;
@@ -259,12 +339,22 @@ wlshm_present_canvas (struct frame *f)
   if (!wlshm_canvas)
     return;
   cairo_surface_flush (wlshm_canvas);
+  struct wlshm_output *o = FRAME_X_OUTPUT (f);
+  int dx = 0, dy = 0, dw = 0, dh = 0;
+  if (o && o->damage_valid)
+    {
+      dx = o->damage_x;
+      dy = o->damage_y;
+      dw = o->damage_w;
+      dh = o->damage_h;
+    }
   wlshm_window_present (WLSHM_FRAME_HANDLE (f),
 			cairo_image_surface_get_data (wlshm_canvas),
 			(uint32_t) cairo_image_surface_get_width (wlshm_canvas),
 			(uint32_t) cairo_image_surface_get_height (wlshm_canvas),
 			(uint32_t) cairo_image_surface_get_stride (wlshm_canvas),
-			0, 0, 0, 0);
+			dx, dy, dw, dh);
+  wlshm_damage_reset (o);
 }
 
 /* Public wrapper: present frame F's canvas (used by the tooltip code, which
@@ -303,6 +393,7 @@ wlshm_window_rect (float x, float y, float w, float h,
   cairo_rectangle (wlshm_cr, x, y, w, h);
   cairo_fill (wlshm_cr);
   cairo_restore (wlshm_cr);
+  wlshm_damage_logical (wlshm_canvas_frame (), x, y, w, h);
 }
 
 /* Fill an integer PHYSICAL-pixel rectangle at full coverage, bypassing the canvas
@@ -331,6 +422,7 @@ wlshm_fill_phys (int px, int py, int pw, int ph, float r, float g, float b)
   cairo_rectangle (wlshm_cr, px, py, pw, ph);
   cairo_fill (wlshm_cr);
   cairo_restore (wlshm_cr);
+  wlshm_damage_phys (wlshm_canvas_frame (), px, py, pw, ph);
 }
 
 /* Blend two packed pixels (defined later; also used by the scroll bar).  */
@@ -1461,6 +1553,9 @@ wlshm_draw_glyph_string (struct glyph_string *s)
     }
 
   s->num_clips = 0;
+  wlshm_damage_logical (s->f, s->x - 2, s->y - 2,
+			max (s->width, s->background_width) + 4,
+			s->height + 4);
   wlshm_end_cr_clip (s->f);
 }
 
@@ -1692,8 +1787,10 @@ wlshm_scroll_run (struct window *w, struct run *run)
 		  for (int xx = 0; xx < width; xx++)
 		    row[xx] = px;
 		}
+	      wlshm_damage_phys (wlshm_cur, x, gap_y, width, gap_bottom - gap_y);
 	    }
 	  cairo_surface_mark_dirty (wlshm_canvas);
+	  wlshm_damage_phys (wlshm_cur, x, to_y, width, height);
 	}
     }
   unblock_input ();
@@ -1897,6 +1994,13 @@ wlshm_draw_fringe_bitmap (struct window *w, struct glyph_row *row,
     }
 
   cairo_restore (wlshm_cr);
+  {
+    int wbx, wby, wbw;
+    window_box (w, ANY_AREA, &wbx, &wby, &wbw, 0);
+    int ry = WINDOW_TO_FRAME_PIXEL_Y (w, max (0, row->y));
+    ry = max (ry, wby);
+    wlshm_damage_logical (f, wbx, ry, wbw, row->visible_height);
+  }
   unblock_input ();
 }
 
@@ -2342,6 +2446,7 @@ wlshm_ring_bell (struct frame *f)
   cairo_set_source_rgba (wlshm_cr, 0.5, 0.5, 0.5, 0.45);
   cairo_paint (wlshm_cr);
   cairo_restore (wlshm_cr);
+  wlshm_damage_full (f);
   wlshm_present_canvas (f);
 
   struct timespec ts = { 0, 40 * 1000 * 1000 };  /* ~40ms flash */
@@ -2349,6 +2454,7 @@ wlshm_ring_bell (struct frame *f)
 
   memcpy (data, snap, nbytes);
   cairo_surface_mark_dirty (wlshm_canvas);
+  wlshm_damage_full (f);
   wlshm_present_canvas (f);
   xfree (snap);
   unblock_input ();

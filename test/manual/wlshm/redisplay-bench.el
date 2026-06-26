@@ -132,13 +132,20 @@
   (set-window-start (selected-window) (point-min))
   (redisplay t))
 
-(defun wlshm-redisplay-bench--frames (n thunk)
+(defun wlshm-redisplay-bench--frames (n thunk &optional workload)
   "Call THUNK N times, forcing redisplay after each call.
 Return elapsed seconds."
-  (let ((start (float-time)))
-    (dotimes (_ n)
+  (let ((start (float-time))
+        (progress-every
+         (wlshm-redisplay-bench--env-int "WLSHM_BENCH_PROGRESS_EVERY" 0)))
+    (dotimes (i n)
       (funcall thunk)
-      (redisplay t))
+      (redisplay t)
+      (when (and workload
+                 (> progress-every 0)
+                 (zerop (mod (1+ i) progress-every)))
+        (wlshm-redisplay-bench--progress
+         (format "%s:frame:%d/%d" workload (1+ i) n))))
     (- (float-time) start)))
 
 (defun wlshm-redisplay-bench--line-scroll ()
@@ -184,6 +191,18 @@ FULL and SMOKE are the normal and smoke-test counts."
   ;; ensure the first measured frame does not include initial map work.
   (dotimes (_ 12)
     (redisplay t)
+    (sit-for 0.1))
+  ;; Some backends ignore fullscreen requests made before the initial map.  The
+  ;; benchmark's fullscreen mode is part of the scenario, so assert it again
+  ;; after the frame has had a chance to become visible.  Clear first so this
+  ;; second request is not optimized away as an unchanged frame parameter.
+  (when (string= (wlshm-redisplay-bench--env "WLSHM_BENCH_FULLSCREEN" "0") "1")
+    (set-frame-parameter frame 'fullscreen nil)
+    (redisplay t)
+    (sit-for 0.1)
+    (set-frame-parameter frame 'fullscreen 'fullboth))
+  (dotimes (_ 12)
+    (redisplay t)
     (sit-for 0.1)))
 
 (defun wlshm-redisplay-bench-run ()
@@ -202,14 +221,16 @@ FULL and SMOKE are the normal and smoke-test counts."
         (wlshm-redisplay-bench--progress "warmup:start")
         (wlshm-redisplay-bench--frames
          (wlshm-redisplay-bench--frame-count "warmup" 80 8)
-         #'wlshm-redisplay-bench--line-scroll)
+         #'wlshm-redisplay-bench--line-scroll
+         "warmup")
         (wlshm-redisplay-bench--progress "warmup:done")
         (wlshm-redisplay-bench--top)
 
         (wlshm-redisplay-bench--progress "line-scroll:start")
         (let* ((n (wlshm-redisplay-bench--frame-count "line-scroll" 800 20))
                (s (wlshm-redisplay-bench--frames
-                   n #'wlshm-redisplay-bench--line-scroll)))
+                   n #'wlshm-redisplay-bench--line-scroll
+                   "line-scroll")))
           (wlshm-redisplay-bench--log "line-scroll" n s))
         (wlshm-redisplay-bench--progress "line-scroll:done")
 
@@ -217,7 +238,8 @@ FULL and SMOKE are the normal and smoke-test counts."
         (wlshm-redisplay-bench--progress "page-scroll:start")
         (let* ((n (wlshm-redisplay-bench--frame-count "page-scroll" 400 12))
                (s (wlshm-redisplay-bench--frames
-                   n #'wlshm-redisplay-bench--page-scroll)))
+                   n #'wlshm-redisplay-bench--page-scroll
+                   "page-scroll")))
           (wlshm-redisplay-bench--log "page-scroll" n s))
         (wlshm-redisplay-bench--progress "page-scroll:done")
 
@@ -225,7 +247,8 @@ FULL and SMOKE are the normal and smoke-test counts."
         (wlshm-redisplay-bench--progress "full-redraw:start")
         (let* ((n (wlshm-redisplay-bench--frame-count "full-redraw" 300 10))
                (s (wlshm-redisplay-bench--frames
-                   n (lambda () (redraw-frame frame)))))
+                   n (lambda () (redraw-frame frame))
+                   "full-redraw")))
           (wlshm-redisplay-bench--log "full-redraw" n s))
         (wlshm-redisplay-bench--progress "full-redraw:done")
 
@@ -242,7 +265,8 @@ FULL and SMOKE are the normal and smoke-test counts."
                          (insert (char-to-string (+ ?a (mod i 26))))
                          (setq i (1+ i))
                          (when (> (current-column) 150)
-                           (insert "\n"))))))
+                           (insert "\n")))
+                     "typing")))
             (wlshm-redisplay-bench--log "typing" n s)))
         (wlshm-redisplay-bench--progress "typing:done")
 
@@ -254,7 +278,8 @@ FULL and SMOKE are the normal and smoke-test counts."
               (wlshm-redisplay-bench--top)
               (let* ((n (wlshm-redisplay-bench--frame-count "image-scroll" 500 12))
                      (s (wlshm-redisplay-bench--frames
-                         n #'wlshm-redisplay-bench--line-scroll)))
+                         n #'wlshm-redisplay-bench--line-scroll
+                         "image-scroll")))
                 (wlshm-redisplay-bench--log "image-scroll" n s))
               (wlshm-redisplay-bench--progress "image-scroll:done"))
           (error
