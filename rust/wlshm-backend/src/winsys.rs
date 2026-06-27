@@ -1226,8 +1226,20 @@ impl Backend {
         if let Some(guard) = self.conn.prepare_read() {
             let fd = self.conn.backend().poll_fd().as_raw_fd();
             let mut pfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
-            let ready = unsafe { libc::poll(&mut pfd, 1, 0) } > 0
-                && (pfd.revents & libc::POLLIN) != 0;
+            // SAFETY: `pfd` is a valid pointer to one initialized pollfd.
+            let nready = unsafe { libc::poll(&mut pfd, 1, 0) };
+            if nready < 0 {
+                let e = std::io::Error::last_os_error();
+                if e.kind() != std::io::ErrorKind::Interrupted {
+                    return Err(format!("wayland poll: {e}"));
+                }
+            }
+            if nready > 0
+                && (pfd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL)) != 0
+            {
+                return Err(format!("wayland fd error: revents=0x{:x}", pfd.revents));
+            }
+            let ready = nready > 0 && (pfd.revents & libc::POLLIN) != 0;
             if ready {
                 match guard.read() {
                     Ok(_) => {}

@@ -26,6 +26,7 @@ pgtkterm.c.  See wlshm-architecture.md.  */
 #include "composite.h"
 #include "menu.h"		/* MENU_KEYMAPS */
 #include "coding.h"		/* ENCODE_UTF_8 */
+#include <errno.h>
 #include <poll.h>
 #include "systime.h"
 #include "wlshmterm.h"
@@ -3789,7 +3790,15 @@ wlshm_read_socket (struct terminal *terminal, struct input_event *hold_quit)
   WlshmEvent evs[BATCH];
 
   block_input ();
-  wlshm_window_dispatch ();
+  if (wlshm_window_dispatch () < 0)
+    {
+      wlshm_log ("dispatch failed in read_socket");
+      unblock_input ();
+      /* termhooks.h specifies -2 for a closed/non-transient terminal error.
+	 Returning a positive progress value here would keep gobble_input in its
+	 immediate drain loop on the same fatal fd.  */
+      return -2;
+    }
   int nev = wlshm_window_poll_events (evs, BATCH);
   unblock_input ();
 
@@ -4265,12 +4274,19 @@ wlshm_register_wait_descriptors (struct wlshm_display_info *dpyinfo)
 {
   dpyinfo->input_fd = wlshm_window_fd ();
   if (dpyinfo->input_fd >= 0)
-    add_keyboard_wait_descriptor (dpyinfo->input_fd);
+    {
+      wlshm_log ("register wait descriptor input fd=%d", dpyinfo->input_fd);
+      add_keyboard_wait_descriptor (dpyinfo->input_fd);
+    }
 
   /* Also wake on the key-repeat timerfd so held keys repeat.  */
   dpyinfo->repeat_timer_fd = wlshm_window_timer_fd ();
   if (dpyinfo->repeat_timer_fd >= 0)
-    add_keyboard_wait_descriptor (dpyinfo->repeat_timer_fd);
+    {
+      wlshm_log ("register wait descriptor repeat fd=%d",
+		 dpyinfo->repeat_timer_fd);
+      add_keyboard_wait_descriptor (dpyinfo->repeat_timer_fd);
+    }
 
   /* And on the present-deadline timerfd, so a frame coalesced by the present
      throttle is flushed even if the compositor withholds its frame callback and
@@ -4278,14 +4294,19 @@ wlshm_register_wait_descriptors (struct wlshm_display_info *dpyinfo)
      event); read_socket -> wlshm_window_dispatch -> flush_overdue_pending.  */
   dpyinfo->present_timer_fd = wlshm_window_present_timer_fd ();
   if (dpyinfo->present_timer_fd >= 0)
-    add_keyboard_wait_descriptor (dpyinfo->present_timer_fd);
+    {
+      wlshm_log ("register wait descriptor present fd=%d",
+		 dpyinfo->present_timer_fd);
+      add_keyboard_wait_descriptor (dpyinfo->present_timer_fd);
+    }
 }
 
 static void
-wlshm_unregister_wait_descriptor (int *fd)
+wlshm_unregister_wait_descriptor (const char *name, int *fd)
 {
   if (*fd >= 0)
     {
+      wlshm_log ("unregister wait descriptor %s fd=%d", name, *fd);
       delete_keyboard_wait_descriptor (*fd);
       *fd = -1;
     }
@@ -4294,9 +4315,9 @@ wlshm_unregister_wait_descriptor (int *fd)
 static void
 wlshm_unregister_wait_descriptors (struct wlshm_display_info *dpyinfo)
 {
-  wlshm_unregister_wait_descriptor (&dpyinfo->present_timer_fd);
-  wlshm_unregister_wait_descriptor (&dpyinfo->repeat_timer_fd);
-  wlshm_unregister_wait_descriptor (&dpyinfo->input_fd);
+  wlshm_unregister_wait_descriptor ("present", &dpyinfo->present_timer_fd);
+  wlshm_unregister_wait_descriptor ("repeat", &dpyinfo->repeat_timer_fd);
+  wlshm_unregister_wait_descriptor ("input", &dpyinfo->input_fd);
 }
 
 void
@@ -4720,9 +4741,30 @@ wlshm_menu_modal_loop (struct frame *f, uint64_t pw,
       if (wlfd >= 0)
 	{
 	  struct pollfd pfd = { .fd = wlfd, .events = POLLIN, .revents = 0 };
-	  poll (&pfd, 1, 40);
+	  int nready = poll (&pfd, 1, 40);
+	  if (nready < 0)
+	    {
+	      if (errno == EINTR)
+		continue;
+	      wlshm_log ("menu poll failed errno=%d", errno);
+	      cancelled = true;
+	      break;
+	    }
+	  if (nready > 0
+	      && (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0)
+	    {
+	      wlshm_log ("menu fd error revents=0x%x",
+			 (unsigned int) pfd.revents);
+	      cancelled = true;
+	      break;
+	    }
 	}
-      wlshm_window_dispatch ();
+      if (wlshm_window_dispatch () < 0)
+	{
+	  wlshm_log ("dispatch failed in menu modal loop");
+	  cancelled = true;
+	  break;
+	}
       WlshmEvent evs[64];
       int ne = wlshm_window_poll_events (evs, 64);
       for (int j = 0; j < ne && !done; j++)
