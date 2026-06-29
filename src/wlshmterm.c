@@ -26,6 +26,7 @@ pgtkterm.c.  See wlshm-architecture.md.  */
 #include "composite.h"
 #include "menu.h"		/* MENU_KEYMAPS */
 #include "coding.h"		/* ENCODE_UTF_8 */
+#include "process.h"		/* add_non_keyboard_read_fd */
 #include <errno.h>
 #include <poll.h>
 #include "systime.h"
@@ -4280,6 +4281,29 @@ wlshm_read_socket (struct terminal *terminal, struct input_event *hold_quit)
   return count;
 }
 
+static void wlshm_unregister_wait_descriptors (struct wlshm_display_info *);
+
+static void
+wlshm_present_timer_callback (int fd, void *data)
+{
+  struct wlshm_display_info *dpyinfo = data;
+
+  if (!dpyinfo || dpyinfo->present_timer_fd != fd || dpyinfo->connection_dead)
+    return;
+
+  block_input ();
+  int rc = wlshm_window_dispatch ();
+  if (rc < 0)
+    {
+      dpyinfo->connection_dead = true;
+      wlshm_log ("dispatch failed in present timer callback");
+    }
+  unblock_input ();
+
+  if (rc < 0)
+    wlshm_unregister_wait_descriptors (dpyinfo);
+}
+
 static void
 wlshm_register_wait_descriptors (struct wlshm_display_info *dpyinfo)
 {
@@ -4299,21 +4323,23 @@ wlshm_register_wait_descriptors (struct wlshm_display_info *dpyinfo)
       add_keyboard_wait_descriptor (dpyinfo->repeat_timer_fd);
     }
 
-  /* And on the present-deadline timerfd, so a frame coalesced by the present
-     throttle is flushed even if the compositor withholds its frame callback and
-     nothing else wakes the loop (mode line otherwise stays stale until a mouse
-     event); read_socket -> wlshm_window_dispatch -> flush_overdue_pending.  */
+  /* The present-deadline timer is not keyboard input.  It must also wake
+     process-output waits (ERC/GnuTLS disconnect handling, filters, sentinels),
+     where wait_reading_process_output deliberately excludes KEYBOARD_FDs.
+     The callback dispatches wlshm, which drains the timer and flushes any
+     overdue coalesced frame.  */
   dpyinfo->present_timer_fd = wlshm_window_present_timer_fd ();
   if (dpyinfo->present_timer_fd >= 0)
     {
       wlshm_log ("register wait descriptor present fd=%d",
 		 dpyinfo->present_timer_fd);
-      add_keyboard_wait_descriptor (dpyinfo->present_timer_fd);
+      add_non_keyboard_read_fd (dpyinfo->present_timer_fd,
+				wlshm_present_timer_callback, dpyinfo);
     }
 }
 
 static void
-wlshm_unregister_wait_descriptor (const char *name, int *fd)
+wlshm_unregister_keyboard_wait_descriptor (const char *name, int *fd)
 {
   if (*fd >= 0)
     {
@@ -4324,11 +4350,24 @@ wlshm_unregister_wait_descriptor (const char *name, int *fd)
 }
 
 static void
+wlshm_unregister_read_wait_descriptor (const char *name, int *fd)
+{
+  if (*fd >= 0)
+    {
+      wlshm_log ("unregister wait descriptor %s fd=%d", name, *fd);
+      delete_read_fd (*fd);
+      *fd = -1;
+    }
+}
+
+static void
 wlshm_unregister_wait_descriptors (struct wlshm_display_info *dpyinfo)
 {
-  wlshm_unregister_wait_descriptor ("present", &dpyinfo->present_timer_fd);
-  wlshm_unregister_wait_descriptor ("repeat", &dpyinfo->repeat_timer_fd);
-  wlshm_unregister_wait_descriptor ("input", &dpyinfo->input_fd);
+  wlshm_unregister_read_wait_descriptor ("present",
+					 &dpyinfo->present_timer_fd);
+  wlshm_unregister_keyboard_wait_descriptor ("repeat",
+					     &dpyinfo->repeat_timer_fd);
+  wlshm_unregister_keyboard_wait_descriptor ("input", &dpyinfo->input_fd);
 }
 
 static void
