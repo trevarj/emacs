@@ -110,6 +110,12 @@ thread_local! {
     static BACKEND: RefCell<Option<ManuallyDrop<Backend>>> = const { RefCell::new(None) };
 }
 
+pub fn shutdown_backend() {
+    BACKEND.with(|b| {
+        let _ = b.borrow_mut().take();
+    });
+}
+
 /// MIME types we offer/accept for the text clipboard, in preference order.
 const CLIPBOARD_MIME: &[&str] = &[
     "text/plain;charset=utf-8",
@@ -793,6 +799,7 @@ struct Backend {
     qh: QueueHandle<AppState>,
     event_queue: EventQueue<AppState>,
     state: AppState,
+    fatal_error: Option<String>,
 }
 
 impl Backend {
@@ -912,7 +919,31 @@ impl Backend {
             }
         }
 
-        Ok(Backend { conn, qh, event_queue, state })
+        Ok(Backend { conn, qh, event_queue, state, fatal_error: None })
+    }
+
+    fn record_fatal(&mut self, msg: String) -> String {
+        if self.fatal_error.is_none() {
+            self.fatal_error = Some(msg.clone());
+        }
+        msg
+    }
+
+    fn flush_wayland(&mut self, context: &str) -> Result<(), String> {
+        match self.conn.flush() {
+            Ok(()) => Ok(()),
+            Err(WaylandError::Io(e)) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(()),
+            Err(e) => Err(self.record_fatal(format!("wayland flush {context}: {e}"))),
+        }
+    }
+
+    fn roundtrip_wayland(&mut self, context: &str) -> Result<(), String> {
+        match self.event_queue.roundtrip(&mut self.state) {
+            Ok(_) => Ok(()),
+            Err(wayland_client::DispatchError::Backend(WaylandError::Io(e)))
+                if e.kind() == std::io::ErrorKind::WouldBlock => Ok(()),
+            Err(e) => Err(self.record_fatal(format!("wayland roundtrip {context}: {e}"))),
+        }
     }
 
     /// Create a new window and return its handle (0 on failure).
@@ -1064,7 +1095,7 @@ impl Backend {
         });
 
         // Roundtrip so the compositor sends the initial configure (sizes us).
-        let _ = self.event_queue.roundtrip(&mut self.state);
+        let _ = self.roundtrip_wayland("open window");
         id
     }
 
@@ -1113,7 +1144,7 @@ impl Backend {
         }
         // Pump the reposition/configure round-trip so the new geometry is in
         // effect before the C side presents the next buffer.
-        let _ = self.event_queue.roundtrip(&mut self.state);
+        let _ = self.roundtrip_wayland("reposition popup");
         true
     }
 
@@ -1175,8 +1206,8 @@ impl Backend {
         }
         // Pump the initial popup configure so the surface is configured before
         // the C side presents a buffer (committing a buffer first is an error).
-        let _ = self.event_queue.roundtrip(&mut self.state);
-        let _ = self.event_queue.roundtrip(&mut self.state);
+        let _ = self.roundtrip_wayland("make popup");
+        let _ = self.roundtrip_wayland("make popup");
         true
     }
 
@@ -1201,7 +1232,7 @@ impl Backend {
                 subsurface.destroy();
                 surface.destroy();
                 parent_surface.commit();
-                let _ = self.conn.flush();
+                let _ = self.flush_wayland("close subsurface");
             }
             // wp_viewport / wp_fractional_scale_v1 are raw wayland-client proxies
             // whose explicit destroy request Drop does NOT send (same reason the
@@ -1219,10 +1250,13 @@ impl Backend {
 
     fn dispatch(&mut self) -> Result<(), String> {
         use std::os::unix::io::AsRawFd;
-        let _ = self.conn.flush();
+        if let Some(e) = self.fatal_error.clone() {
+            return Err(e);
+        }
+        self.flush_wayland("dispatch")?;
         self.event_queue
             .dispatch_pending(&mut self.state)
-            .map_err(|e| format!("dispatch: {e}"))?;
+            .map_err(|e| self.record_fatal(format!("dispatch: {e}")))?;
         if let Some(guard) = self.conn.prepare_read() {
             let fd = self.conn.backend().poll_fd().as_raw_fd();
             let mut pfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
@@ -1231,13 +1265,16 @@ impl Backend {
             if nready < 0 {
                 let e = std::io::Error::last_os_error();
                 if e.kind() != std::io::ErrorKind::Interrupted {
-                    return Err(format!("wayland poll: {e}"));
+                    return Err(self.record_fatal(format!("wayland poll: {e}")));
                 }
             }
             if nready > 0
                 && (pfd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL)) != 0
             {
-                return Err(format!("wayland fd error: revents=0x{:x}", pfd.revents));
+                return Err(self.record_fatal(format!(
+                    "wayland fd error: revents=0x{:x}",
+                    pfd.revents
+                )));
             }
             let ready = nready > 0 && (pfd.revents & libc::POLLIN) != 0;
             if ready {
@@ -1249,16 +1286,22 @@ impl Backend {
                     // of spinning on a dead-but-readable fd.
                     Err(WaylandError::Io(e))
                         if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                    Err(e) => return Err(format!("wayland read: {e}")),
+                    Err(e) => return Err(self.record_fatal(format!("wayland read: {e}"))),
                 }
                 self.event_queue
                     .dispatch_pending(&mut self.state)
-                    .map_err(|e| format!("dispatch: {e}"))?;
+                    .map_err(|e| self.record_fatal(format!("dispatch: {e}")))?;
             }
         }
         self.state.pump_repeat();
         self.drain_pending_drop();
+        if let Some(e) = self.fatal_error.clone() {
+            return Err(e);
+        }
         self.flush_overdue_pending();
+        if let Some(e) = self.fatal_error.clone() {
+            return Err(e);
+        }
         Ok(())
     }
 
@@ -1322,7 +1365,7 @@ impl Backend {
         if retry_pending {
             self.state.arm_present_timer();
         }
-        let _ = self.conn.flush();
+        let _ = self.flush_wayland("flush overdue pending");
     }
 
     /// If a drop landed (set in `drop_performed`), read its data from the
@@ -1331,8 +1374,12 @@ impl Backend {
     /// writes the bytes, and the event queue lives on `Backend`.
     fn drain_pending_drop(&mut self) {
         let Some((pipe, is_uri, x, y, win, offer)) = self.state.pending_drop.take() else { return };
-        let _ = self.conn.flush();
-        let _ = self.event_queue.roundtrip(&mut self.state);
+        if self.flush_wayland("read drop").is_err() {
+            return;
+        }
+        if self.roundtrip_wayland("read drop").is_err() {
+            return;
+        }
         let bytes = read_pipe_timeout(&pipe, 500);
         // The transfer is fully read; only now signal completion to the source.
         offer.finish();
@@ -1404,9 +1451,11 @@ impl Backend {
                 return;
             };
             surface.commit();
-            let _ = self.conn.flush();
-            let _ = self.event_queue.roundtrip(&mut self.state);
-            let _ = self.event_queue.roundtrip(&mut self.state);
+            if self.flush_wayland("configure unconfigured surface").is_err() {
+                return;
+            }
+            let _ = self.roundtrip_wayland("configure unconfigured surface");
+            let _ = self.roundtrip_wayland("configure unconfigured surface");
             // Still unconfigured?  Bail; the frame is garbaged, so the next
             // redisplay presents again and retries.
             if !self.state.windows.get(&id).map(|w| w.configured).unwrap_or(false) {
@@ -1519,7 +1568,7 @@ impl Backend {
                 Some(PendingFrame::new_from_source(src, pw, ph, src_stride, dx, dy, dw, dh));
             self.state.arm_present_timer();
         }
-        let _ = self.conn.flush();
+        let _ = self.flush_wayland("present");
     }
 
     fn set_clipboard(&mut self, text: &[u8]) -> bool {
@@ -1529,7 +1578,7 @@ impl Backend {
         source.set_selection(dd, self.state.serial);
         self.state.clipboard_text = text.to_vec();
         self.state.clipboard_source = Some(source);
-        let _ = self.conn.flush();
+        let _ = self.flush_wayland("set clipboard");
         true
     }
 
@@ -1550,8 +1599,8 @@ impl Backend {
                 .map(|m| m.to_string())
         })?;
         let pipe = offer.receive(mime).ok()?;
-        let _ = self.conn.flush();
-        let _ = self.event_queue.roundtrip(&mut self.state);
+        self.flush_wayland("get clipboard").ok()?;
+        self.roundtrip_wayland("get clipboard").ok()?;
         Some(read_pipe_timeout(&pipe, 500))
     }
 
@@ -1564,7 +1613,7 @@ impl Backend {
         source.set_selection(dev, self.state.serial);
         self.state.primary_text = text.to_vec();
         self.state.primary_source = Some(source);
-        let _ = self.conn.flush();
+        let _ = self.flush_wayland("set primary");
         true
     }
 
@@ -1585,8 +1634,8 @@ impl Backend {
                 .map(|m| m.to_string())
         })?;
         let pipe = offer.receive(mime).ok()?;
-        let _ = self.conn.flush();
-        let _ = self.event_queue.roundtrip(&mut self.state);
+        self.flush_wayland("get primary").ok()?;
+        self.roundtrip_wayland("get primary").ok()?;
         Some(read_pipe_timeout(&pipe, 500))
     }
 }
@@ -2575,7 +2624,7 @@ pub unsafe extern "C" fn wlshm_window_set_title(win: u64, title: *const c_char) 
             if let Some(id) = b.resolve(win) {
                 if let Some(Role::Toplevel(w)) = b.state.windows.get(&id).map(|w| &w.role) {
                     w.set_title(&t);
-                    let _ = b.conn.flush();
+                    let _ = b.flush_wayland("set title");
                 }
             }
         },
@@ -2594,7 +2643,7 @@ pub extern "C" fn wlshm_window_set_cursor(_win: u64, code: c_int) {
             if let Some(dev) = b.state.cursor_shape_device.as_ref() {
                 if b.state.pointer_enter_serial != 0 {
                     dev.set_shape(b.state.pointer_enter_serial, cursor_code_to_shape(code));
-                    let _ = b.conn.flush();
+                    let _ = b.flush_wayland("set cursor");
                 }
             }
         },
@@ -2724,7 +2773,7 @@ pub extern "C" fn wlshm_window_set_subsurface_pos(win: u64, x: c_int, y: c_int) 
             };
             if let Some(ps) = parent_surface {
                 ps.commit();
-                let _ = b.conn.flush();
+                let _ = b.flush_wayland("set subsurface position");
             }
         },
         (),
@@ -2742,7 +2791,7 @@ pub extern "C" fn wlshm_window_set_parent(win: u64, parent: u64) {
             if parent == 0 {
                 if let Some(Role::Toplevel(c)) = b.state.windows.get(&cid).map(|w| &w.role) {
                     c.xdg_toplevel().set_parent(None);
-                    let _ = b.conn.flush();
+                    let _ = b.flush_wayland("clear parent");
                 }
                 return;
             }
@@ -2757,7 +2806,7 @@ pub extern "C" fn wlshm_window_set_parent(win: u64, parent: u64) {
                 };
                 if let (Some(c), Some(p)) = (child, par) {
                     c.set_parent(Some(&p));
-                    let _ = b.conn.flush();
+                    let _ = b.flush_wayland("set parent");
                 }
             }
         },
@@ -2773,7 +2822,7 @@ pub extern "C" fn wlshm_window_minimize(win: u64) {
             if let Some(id) = b.resolve(win) {
                 if let Some(Role::Toplevel(w)) = b.state.windows.get(&id).map(|w| &w.role) {
                     w.set_minimized();
-                    let _ = b.conn.flush();
+                    let _ = b.flush_wayland("minimize");
                 }
             }
         },
@@ -2793,7 +2842,7 @@ pub extern "C" fn wlshm_window_set_fullscreen(win: u64, mode: c_int) {
                     } else {
                         w.unset_fullscreen();
                     }
-                    let _ = b.conn.flush();
+                    let _ = b.flush_wayland("set fullscreen");
                 }
             }
         },
@@ -2825,7 +2874,7 @@ pub extern "C" fn wlshm_window_hide_pointer(_win: u64, hide: bool) {
             } else if let Some(dev) = b.state.cursor_shape_device.as_ref() {
                 dev.set_shape(serial, cursor_code_to_shape(b.state.current_cursor));
             }
-            let _ = b.conn.flush();
+            let _ = b.flush_wayland("hide pointer");
         },
         (),
     );
@@ -2878,7 +2927,7 @@ pub extern "C" fn wlshm_window_unmap(win: u64) {
                     if let Some(ps) = parent {
                         ps.commit();
                     }
-                    let _ = b.conn.flush();
+                    let _ = b.flush_wayland("unmap");
                 }
             }
         },

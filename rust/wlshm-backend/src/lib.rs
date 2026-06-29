@@ -30,9 +30,11 @@ pub extern "C" fn wlshm_backend_init() -> c_int {
     WLSHM_OK
 }
 
-/// Tear down process-global backend state. No-op.
+/// Tear down process-global backend state.
 #[no_mangle]
-pub extern "C" fn wlshm_backend_shutdown() {}
+pub extern "C" fn wlshm_backend_shutdown() {
+    winsys::shutdown_backend();
+}
 
 /// Backend version string (static, NUL-terminated, owned by the backend).
 /// The C side must not free it.

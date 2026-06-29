@@ -156,10 +156,7 @@ DEFUN ("x-create-frame", Fx_create_frame, Sx_create_frame, 1, 1, 0,
 			 "fontBackend", "FontBackend", RES_TYPE_STRING);
   wlshm_default_font_parameter (f, parms);
   if (!FRAME_FONT (f))
-    {
-      delete_frame (frame, Qnoelisp);
-      error ("Invalid frame font");
-    }
+    error ("Invalid frame font");
 
   gui_default_parameter (f, parms, Qborder_width, make_fixnum (0),
 			 "borderWidth", "BorderWidth", RES_TYPE_NUMBER);
@@ -285,6 +282,7 @@ DEFUN ("x-create-frame", Fx_create_frame, Sx_create_frame, 1, 1, 0,
 
   f->terminal->reference_count++;
   FRAME_DISPLAY_INFO (f)->reference_count++;
+  FRAME_WLSHM_OUTPUT (f)->display_refcounted = true;
   Vframe_list = Fcons (frame, Vframe_list);
 
   /* The Wayland window already exists and is mapped; mark visible and force a
@@ -615,10 +613,7 @@ wlshm_create_tip_frame (struct wlshm_display_info *dpyinfo, Lisp_Object parms,
 			 "fontBackend", "FontBackend", RES_TYPE_STRING);
   wlshm_default_font_parameter (f, parms);
   if (!FRAME_FONT (f))
-    {
-      delete_frame (frame, Qnoelisp);
-      error ("Invalid frame font");
-    }
+    error ("Invalid frame font");
 
   gui_default_parameter (f, parms, Qborder_width, make_fixnum (0),
 			 "borderWidth", "BorderWidth", RES_TYPE_NUMBER);
@@ -664,15 +659,13 @@ wlshm_create_tip_frame (struct wlshm_display_info *dpyinfo, Lisp_Object parms,
   {
     uint64_t win = wlshm_window_open (NULL, WLSHM_FRAME_HANDLE (p), 2);
     if (win == 0)
-      {
-	delete_frame (frame, Qnoelisp);
-	error ("wlshm: cannot open a tooltip window");
-      }
+      error ("wlshm: cannot open a tooltip window");
     FRAME_X_OUTPUT (f)->wlshm_frame = win;
   }
 
   FRAME_DISPLAY_INFO (f)->reference_count++;
   f->terminal->reference_count++;
+  FRAME_WLSHM_OUTPUT (f)->display_refcounted = true;
   Vframe_list = Fcons (frame, Vframe_list);
   f->can_set_window_size = true;
   adjust_frame_size (f, FRAME_TEXT_WIDTH (f), FRAME_TEXT_HEIGHT (f),

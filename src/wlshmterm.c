@@ -2215,7 +2215,7 @@ wlshm_free_frame_resources (struct frame *f)
       o->canvas = NULL;
     }
   uint64_t h = WLSHM_FRAME_HANDLE (f);
-  if (h)
+  if (h && !(dpyinfo && dpyinfo->connection_dead))
     wlshm_window_close (h);
   o->wlshm_frame = 0;
 
@@ -2230,6 +2230,14 @@ static void
 wlshm_destroy_window (struct frame *f)
 {
   block_input ();
+  struct wlshm_output *o = FRAME_X_OUTPUT (f);
+  struct wlshm_display_info *dpyinfo = FRAME_DISPLAY_INFO (f);
+  if (o && o->display_refcounted)
+    {
+      if (dpyinfo && dpyinfo->reference_count > 0)
+	dpyinfo->reference_count--;
+      o->display_refcounted = false;
+    }
   wlshm_free_frame_resources (f);
   unblock_input ();
 }
@@ -3792,6 +3800,9 @@ wlshm_read_socket (struct terminal *terminal, struct input_event *hold_quit)
   block_input ();
   if (wlshm_window_dispatch () < 0)
     {
+      struct wlshm_display_info *dpyinfo = terminal->display_info.wlshm;
+      if (dpyinfo)
+	dpyinfo->connection_dead = true;
       wlshm_log ("dispatch failed in read_socket");
       unblock_input ();
       /* termhooks.h specifies -2 for a closed/non-transient terminal error.
@@ -4320,17 +4331,62 @@ wlshm_unregister_wait_descriptors (struct wlshm_display_info *dpyinfo)
   wlshm_unregister_wait_descriptor ("input", &dpyinfo->input_fd);
 }
 
+static void
+wlshm_delete_display (struct wlshm_display_info *dpyinfo)
+{
+  struct terminal *t;
+
+  /* Close all frames and delete the generic terminal for this display.  */
+  for (t = terminal_list; t; t = t->next_terminal)
+    if (t->type == output_wlshm && t->display_info.wlshm == dpyinfo)
+      {
+	delete_terminal (t);
+	break;
+      }
+
+  if (x_display_list == dpyinfo)
+    x_display_list = dpyinfo->next;
+  else
+    {
+      struct wlshm_display_info *tail;
+
+      for (tail = x_display_list; tail; tail = tail->next)
+	if (tail->next == dpyinfo)
+	  {
+	    tail->next = dpyinfo->next;
+	    break;
+	  }
+    }
+
+  xfree (dpyinfo->bitmaps);
+  xfree (dpyinfo->x_id_name);
+  xfree (dpyinfo);
+}
+
 void
 wlshm_delete_terminal (struct terminal *terminal)
 {
   struct wlshm_display_info *dpyinfo = terminal->display_info.wlshm;
-  if (dpyinfo)
-    wlshm_unregister_wait_descriptors (dpyinfo);
 
-  /* Windows are leaked at process exit (the connection is ManuallyDrop on the
-     Rust side to avoid libwayland teardown crashes); per-frame close happens
-     via the delete_frame hook.  */
+  /* Protect against recursive calls.  delete_terminal deletes frames and can
+     call this hook again after terminal->name has been cleared.  */
+  if (!terminal->name)
+    return;
+
+  block_input ();
+
+  if (dpyinfo)
+    {
+      wlshm_unregister_wait_descriptors (dpyinfo);
+    }
+
+  /* The Rust side leaks libwayland objects rather than running destructors on a
+     possibly-dead connection, but it clears its slot so future opens reconnect.  */
   wlshm_backend_shutdown ();
+  if (dpyinfo)
+    wlshm_delete_display (dpyinfo);
+
+  unblock_input ();
 }
 
 /* terminal->get_focus_frame: the frame that currently holds keyboard focus on
@@ -4747,6 +4803,7 @@ wlshm_menu_modal_loop (struct frame *f, uint64_t pw,
 	      if (errno == EINTR)
 		continue;
 	      wlshm_log ("menu poll failed errno=%d", errno);
+	      FRAME_DISPLAY_INFO (f)->connection_dead = true;
 	      cancelled = true;
 	      break;
 	    }
@@ -4755,6 +4812,7 @@ wlshm_menu_modal_loop (struct frame *f, uint64_t pw,
 	    {
 	      wlshm_log ("menu fd error revents=0x%x",
 			 (unsigned int) pfd.revents);
+	      FRAME_DISPLAY_INFO (f)->connection_dead = true;
 	      cancelled = true;
 	      break;
 	    }
@@ -4762,6 +4820,7 @@ wlshm_menu_modal_loop (struct frame *f, uint64_t pw,
       if (wlshm_window_dispatch () < 0)
 	{
 	  wlshm_log ("dispatch failed in menu modal loop");
+	  FRAME_DISPLAY_INFO (f)->connection_dead = true;
 	  cancelled = true;
 	  break;
 	}

@@ -111,6 +111,10 @@ struct wlshm_display_info
   int input_fd;
   int repeat_timer_fd;
   int present_timer_fd;
+
+  /* Set after the Wayland connection reports a non-transient error.  Frame
+     cleanup must then free local resources without sending more requests.  */
+  bool connection_dead;
 };
 
 /* Per-frame backend state, hung off f->output_data.wlshm.  */
@@ -172,6 +176,7 @@ struct wlshm_output
 
   /* The display this frame is on.  */
   struct wlshm_display_info *display_info;
+  bool display_refcounted;
 
   /* Handle to the Rust-side window for this frame (0 if none yet).  The
      Rust FFI uses uint64_t handles, so store it in its natural type.  */
