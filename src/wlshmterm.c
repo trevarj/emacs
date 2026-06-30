@@ -1986,6 +1986,11 @@ wlshm_draw_fringe_bitmap (struct window *w, struct glyph_row *row,
 	     let a tall bitmap bleed past the row down over the mode line.  */
 	  cairo_rectangle (wlshm_cr, p->x, p->y, p->wd, p->h);
 	  cairo_clip (wlshm_cr);
+	  if (!p->overlay_p)
+	    {
+	      unsigned long bg = face ? face->background : FRAME_BACKGROUND_PIXEL (f);
+	      wlshm_fill_rect_pixel (p->x, p->y, p->wd, p->h, bg);
+	    }
 	  cairo_set_source_rgb (wlshm_cr, r, g, b);
 	  /* Offset by -dh so visible rows [dh, dh+h) land at p->y (partial
 	     rows at window edges; dh is 0 in the common case).  Reuses the
