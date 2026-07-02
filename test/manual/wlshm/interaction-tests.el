@@ -123,6 +123,37 @@
 (defun wlshm-test-point () (point))
 (defun wlshm-test-tick () "Heartbeat: returns t once redisplay is reachable." (redisplay t) t)
 
+(defvar wlshm-test-last-key-vector nil)
+(defvar wlshm-test-last-command nil)
+
+(defun wlshm-test--record-key-command ()
+  (setq wlshm-test-last-key-vector (this-command-keys-vector)
+        wlshm-test-last-command this-command))
+
+(defun wlshm-test-setup-key-buffer (&optional text point-at-start)
+  "Reset key-command capture state in `*interact*'."
+  (wlshm-test-prep)
+  (delete-other-windows)
+  (switch-to-buffer (get-buffer-create "*interact*"))
+  (erase-buffer)
+  (insert (or text "alpha beta"))
+  (if point-at-start
+      (goto-char (point-min))
+    (goto-char (point-max)))
+  (setq wlshm-test-last-key-vector nil
+        wlshm-test-last-command nil)
+  (redisplay t)
+  t)
+
+(defun wlshm-test-key-summary ()
+  "Return the last key vector, binding, command, and buffer text."
+  (with-current-buffer "*interact*"
+    (list wlshm-test-last-key-vector
+          (and wlshm-test-last-key-vector
+               (key-binding wlshm-test-last-key-vector))
+          wlshm-test-last-command
+          (buffer-string))))
+
 (defun wlshm-test-mouse-face-active-p ()
   "Non-nil if a mouse-face highlight is currently shown."
   (and (boundp 'mouse-highlight) mouse-highlight
@@ -141,6 +172,8 @@
 (when (display-graphic-p)
   (menu-bar-mode -1)
   (tool-bar-mode -1))
+
+(add-hook 'post-command-hook #'wlshm-test--record-key-command)
 
 (provide 'wlshm-interaction-tests)
 ;;; interaction-tests.el ends here

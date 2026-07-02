@@ -97,10 +97,76 @@ run_tier3 () {
     wlshm_pass "right-click: no crash"
   else wlshm_fail "right-click: crashed/froze (see $WLSHM_TMP/wlshmt3-hang.bt)"; fi
 
+  wlshm_expect_key () {
+    label=$1 expected=$2 setup=$3; shift 3
+    _=$(wlshm_eval wlshmt3 10 "$setup")
+    wlshm_key_chord "$wl" "$@"
+    sleep 0.3
+    got=$(wlshm_eval wlshmt3 10 "(wlshm-test-key-summary)")
+    if [ "$got" = "$expected" ]; then
+      wlshm_pass "$label"
+    else
+      wlshm_fail "$label (got: $got)"
+    fi
+  }
+
+  wlshm_expect_key_prefix () {
+    label=$1 expected=$2 setup=$3; shift 3
+    _=$(wlshm_eval wlshmt3 10 "$setup")
+    wlshm_key_chord "$wl" "$@"
+    sleep 0.3
+    got=$(wlshm_eval wlshmt3 10 "(wlshm-test-key-summary)")
+    case "$got" in
+      "$expected"*) wlshm_pass "$label" ;;
+      *) wlshm_fail "$label (got: $got)" ;;
+    esac
+  }
+
+  wlshm_expect_key \
+    "key chord: C-Backspace kills previous word" \
+    "([C-backspace] backward-kill-word kill-region \"alpha \")" \
+    "(wlshm-test-setup-key-buffer \"alpha beta\")" \
+    Control_L BackSpace
+  wlshm_expect_key \
+    "key chord: C-Delete kills next word" \
+    "([C-delete] kill-word kill-region \" beta\")" \
+    "(wlshm-test-setup-key-buffer \"alpha beta\" t)" \
+    Control_L Delete
+  wlshm_expect_key \
+    "key chord: C-S-Backspace stays shifted" \
+    "([C-S-backspace] kill-whole-line kill-region \"second\")" \
+    "(wlshm-test-setup-key-buffer \"alpha beta\nsecond\" t)" \
+    Control_L Shift_L BackSpace
+  wlshm_expect_key \
+    "key chord: C-Left is symbolic" \
+    "([C-left] left-word left-word \"alpha beta\")" \
+    "(wlshm-test-setup-key-buffer \"alpha beta\")" \
+    Control_L Left
+  wlshm_expect_key \
+    "key chord: C-Right is symbolic" \
+    "([C-right] right-word right-word \"alpha beta\")" \
+    "(wlshm-test-setup-key-buffer \"alpha beta\" t)" \
+    Control_L Right
+  wlshm_expect_key_prefix \
+    "key chord: C-Tab is symbolic" \
+    "([C-tab] " \
+    "(wlshm-test-setup-key-buffer \"alpha beta\")" \
+    Control_L Tab
+  wlshm_expect_key_prefix \
+    "key chord: C-Return is symbolic" \
+    "([C-return] " \
+    "(wlshm-test-setup-key-buffer \"alpha beta\")" \
+    Control_L Return
+  _=$(wlshm_eval wlshmt3 10 "(wlshm-test-setup-key-buffer \"alpha beta\")")
+  wlshm_key_chord "$wl" Control_L g; sleep 0.3
+  if [ "$(wlshm_eval wlshmt3 10 "(wlshm-test-tick)")" = "t" ]; then
+    wlshm_pass "key chord: C-g remains responsive"
+  else wlshm_fail "key chord: C-g hung (see $WLSHM_TMP/wlshmt3-hang.bt)"; fi
+
   # Key repeat: hold a key ~1s, expect several chars inserted.
   _=$(wlshm_eval wlshmt3 10 "(progn (switch-to-buffer \"*interact*\")(goto-char (point-max))(insert \"\n\"))")
   wlshm_key_press "$wl" a; sleep 1; wlshm_key_release "$wl" a; sleep 0.3
-  n=$(wlshm_eval wlshmt3 10 "(- (line-end-position) (line-beginning-position))")
+  n=$(wlshm_eval wlshmt3 10 "(with-current-buffer \"*interact*\" (- (line-end-position) (line-beginning-position)))")
   if [ "${n:-0}" -gt 1 ] 2>/dev/null; then
     wlshm_pass "key repeat: $n chars from held key"
   else wlshm_fail "key repeat: only ${n:-0} char(s) (repeat not working?)"; fi

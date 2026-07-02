@@ -86,6 +86,12 @@ get_keysym_name (int keysym)
   return value;
 }
 
+static bool
+wlshm_ascii_keysym_p (uint32_t keysym)
+{
+  return keysym >= 0x20 && keysym <= 0x7e;
+}
+
 /* Unpack a backend pixel (0xRRGGBB) into linear 0..1 RGB.  */
 void
 wlshm_unpack_pixel (unsigned long pixel, float *r, float *g, float *b)
@@ -3843,6 +3849,8 @@ wlshm_read_socket (struct terminal *terminal, struct input_event *hold_quit)
 
       int mods = 0;
       uint32_t b = evs[i].modifiers;
+      if (b & WLSHM_MOD_SHIFT)
+	mods |= shift_modifier;
       if (b & WLSHM_MOD_CTRL)
 	mods |= ctrl_modifier;
       if (b & WLSHM_MOD_ALT)
@@ -4230,12 +4238,16 @@ wlshm_read_socket (struct terminal *terminal, struct input_event *hold_quit)
 	       through the keysym path so they map to <backspace>, <tab>, etc.
 	       rather than C-h, C-i, ...  */
 	    bool printable = cp >= 32 && cp != 127;
-	    if ((mods & ctrl_modifier) && cp > 0 && cp < 32)
+	    if ((mods & ctrl_modifier) && cp > 0 && cp < 32
+		&& wlshm_ascii_keysym_p (ks))
 	      {
 		/* Some xkb layouts report Ctrl-letter as the resulting ASCII
 		   control code rather than as a printable base keysym plus a
 		   control modifier.  Preserve that as an ASCII keystroke so
-		   C-g is always recognized as quit_char.  */
+		   C-g is always recognized as quit_char.  Restrict this to
+		   ASCII base keysyms: physical Backspace/Tab/Return/Escape
+		   keys can also report control codepoints, but Emacs expects
+		   those as symbolic function-key events with modifiers.  */
 		ie.kind = ASCII_KEYSTROKE_EVENT;
 		ie.code = cp;
 		ie.modifiers = mods;
@@ -4247,7 +4259,7 @@ wlshm_read_socket (struct terminal *terminal, struct input_event *hold_quit)
 			  : MULTIBYTE_CHAR_KEYSTROKE_EVENT;
 		ie.code = cp;
 	      }
-	    else if (ks >= 0x20 && ks <= 0x7e)
+	    else if (wlshm_ascii_keysym_p (ks))
 	      {
 		/* Printable base key with modifiers, e.g. C-x.  */
 		ie.kind = ASCII_KEYSTROKE_EVENT;

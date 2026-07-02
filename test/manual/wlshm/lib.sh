@@ -170,6 +170,33 @@ wlshm_key () { WAYLAND_DISPLAY="$1" wtype -- "$2" 2>/dev/null; }
 # wlshm_key_press/release WAYLAND_DISPLAY KEY  -- hold/release a key.
 wlshm_key_press   () { WAYLAND_DISPLAY="$1" wtype -P "$2" 2>/dev/null; }
 wlshm_key_release () { WAYLAND_DISPLAY="$1" wtype -p "$2" 2>/dev/null; }
+wlshm_wtype_modifier () {
+  case "$1" in
+    Control_L|Control_R|ctrl) printf '%s\n' ctrl ;;
+    Shift_L|Shift_R|shift) printf '%s\n' shift ;;
+    Super_L|Super_R|logo) printf '%s\n' logo ;;
+    Alt_R|altgr) printf '%s\n' altgr ;;
+    *) printf '%s\n' "$1" ;;
+  esac
+}
+wlshm_key_chord () {
+  wd=$1; shift
+  [ "$#" -ge 1 ] || return 2
+  local key i mod
+  local -a cmd
+  key="${!#}"
+  cmd=(wtype)
+  for ((i = 1; i < $#; i++)); do
+    mod=$(wlshm_wtype_modifier "${!i}")
+    cmd+=(-M "$mod")
+  done
+  cmd+=(-k "$key")
+  for ((i = $# - 1; i >= 1; i--)); do
+    mod=$(wlshm_wtype_modifier "${!i}")
+    cmd+=(-m "$mod")
+  done
+  WAYLAND_DISPLAY="$wd" "${cmd[@]}" 2>/dev/null
+}
 
 # wlshm_pointer_move WAYLAND_DISPLAY DX DY  -- relative pointer move.
 wlshm_pointer_move () { WAYLAND_DISPLAY="$1" wlrctl pointer move "$2" "$3" 2>/dev/null; }
