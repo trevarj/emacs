@@ -303,9 +303,12 @@ device scale rasterizes them crisply."
                           (list "/usr/share" "/usr/local/share")))
                 (let ((id (expand-file-name "icons" d)))
                   (when (file-directory-p id) (push id dirs))))
+              (setq dirs (nreverse dirs))
+              ;; Per the freedesktop icon-theme spec, $HOME/.icons is
+              ;; searched FIRST, before the XDG data dirs.
               (let ((h (expand-file-name "~/.icons")))
                 (when (file-directory-p h) (push h dirs)))
-              (delete-dups (nreverse dirs))))))
+              (delete-dups dirs)))))
 
 (defun wlshm--icon-theme-file (theme relpaths)
   "Return the first readable <base>/THEME/REL file across the icon base-dirs.
