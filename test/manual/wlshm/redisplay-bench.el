@@ -16,8 +16,6 @@
 
 (require 'cl-lib)
 
-(defvar wlshm-redisplay-bench--results nil)
-
 (defun wlshm-redisplay-bench--env (name &optional default)
   "Return environment variable NAME, or DEFAULT if unset/empty."
   (let ((value (getenv name)))
@@ -66,7 +64,6 @@
                      (symbol-name window-system)
                      emacs-version)
                "\t")))
-    (push row wlshm-redisplay-bench--results)
     (write-region (concat row "\n") nil
                   (wlshm-redisplay-bench--out-file)
                   'append 'silent)))

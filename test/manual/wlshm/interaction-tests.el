@@ -90,13 +90,18 @@
   ;; The "menu" scene renders a popup-menu surface directly (the interactive
   ;; modal loop can't run unattended); it proves menu drawing.
   (if (equal name "menu")
-      (progn
-        (set-face-attribute 'default nil :height 150)
-        (redisplay t)
-        (wlshm-test-menu-render
-         (list "Open File" "Save" (cons "Save As (disabled)" nil)
-               nil "Copy" "Paste" "Quit")
-         4 path))
+      ;; Restore the default face height afterwards so later scenes (and
+      ;; golden determinism) don't depend on "menu" rendering last.
+      (let ((prev-height (face-attribute 'default :height)))
+        (unwind-protect
+            (progn
+              (set-face-attribute 'default nil :height 150)
+              (redisplay t)
+              (wlshm-test-menu-render
+               (list "Open File" "Save" (cons "Save As (disabled)" nil)
+                     nil "Copy" "Paste" "Quit")
+               4 path))
+          (set-face-attribute 'default nil :height prev-height)))
     (wlshm-test-scene name)
     (redisplay t)
     ;; Two passes: the first present sizes/clears, the second has the scene.
@@ -120,7 +125,6 @@
   (redisplay t)
   (point))
 
-(defun wlshm-test-point () (point))
 (defun wlshm-test-tick () "Heartbeat: returns t once redisplay is reachable." (redisplay t) t)
 
 (defvar wlshm-test-last-key-vector nil)
@@ -153,17 +157,6 @@
                (key-binding wlshm-test-last-key-vector))
           wlshm-test-last-command
           (buffer-string))))
-
-(defun wlshm-test-mouse-face-active-p ()
-  "Non-nil if a mouse-face highlight is currently shown."
-  (and (boundp 'mouse-highlight) mouse-highlight
-       (let ((hl (mouse-highlight-info)))
-         (and hl t))))
-
-;; Fallback if mouse-highlight-info is unavailable: check the frame's
-;; highlight bookkeeping isn't error-prone; just report point for now.
-(unless (fboundp 'mouse-highlight-info)
-  (defun wlshm-test-mouse-face-active-p () 'unknown))
 
 ;; Disable the menu/tool bar ONCE at load, so the initial frame settles
 ;; bar-free before any scene renders.  (Toggling the mode per-scene races the

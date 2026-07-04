@@ -10,7 +10,6 @@
 #
 # Usage:  bash test/manual/wlshm/capture-freeze.sh
 set -u
-ROOT=/home/trev/Workspace/emacs
 pid=""
 for p in $(pgrep emacs 2>/dev/null); do
   case "$(readlink /proc/$p/exe 2>/dev/null)" in

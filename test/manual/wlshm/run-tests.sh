@@ -30,11 +30,14 @@ TIER="${1:-all}"
 # and assert it is a non-trivial PNG (catches a totally-broken render path
 # fast, before the per-scene golden compares in tier 2).
 run_tier1 () {
+  # Per-run socket name so concurrent harness runs sharing $XDG_RUNTIME_DIR
+  # don't collide.
+  local sock="wlshm-t1-$$" out
   echo "== Tier 1: render smoke (weston) =="
   command -v weston >/dev/null 2>&1 || { echo "  SKIP (weston not found)"; return; }
-  wlshm_start_weston wlshm-t1 1000 700 || { wlshm_fail "tier1 weston"; return; }
+  wlshm_start_weston "$sock" 1000 700 || { wlshm_fail "tier1 weston"; return; }
   out="$WLSHM_TMP/smoke.png"; rm -f "$out"
-  WAYLAND_DISPLAY=wlshm-t1 WLSHM_DEBUG=1 "$WLSHM_EMACS" -Q \
+  WAYLAND_DISPLAY="$sock" WLSHM_DEBUG=1 "$WLSHM_EMACS" -Q \
     --eval "(progn (insert \"render smoke\\n\") (dotimes (i 20) (insert (format \"line %d\\n\" i))) (redisplay t) (redisplay t) (wlshm-dump-canvas \"$out\") (kill-emacs 0))" \
     >"$WLSHM_TMP/tier1.log" 2>&1 || true
   # A blank/failed render is a few hundred bytes; a real text frame is several KB.
@@ -45,10 +48,13 @@ run_tier1 () {
 
 # --- Tier 2: on-screen rendering goldens (weston) -------------------------
 run_tier2 () {
+  # Per-run socket name so concurrent harness runs sharing $XDG_RUNTIME_DIR
+  # don't collide.
+  local sock="wlshm-t2-$$" out scene tip
   echo "== Tier 2: on-screen rendering goldens (weston) =="
   command -v weston >/dev/null 2>&1 || { echo "  SKIP (weston not found)"; return; }
-  wlshm_start_weston wlshm-t2 1200 800 || { wlshm_fail "tier2 weston"; return; }
-  wlshm_start_server wlshmt2 wlshm-t2 || { wlshm_fail "tier2 emacs server"; return; }
+  wlshm_start_weston "$sock" 1200 800 || { wlshm_fail "tier2 weston"; return; }
+  wlshm_start_server wlshmt2 "$sock" || { wlshm_fail "tier2 emacs server"; return; }
   for scene in plain region fringe faces dividers image scrollbar menu; do
     out="$WLSHM_TMP/scene-$scene.png"; rm -f "$out"
     _=$(wlshm_eval wlshmt2 25 "(wlshm-test-render \"$scene\" \"$out\")")
@@ -64,6 +70,7 @@ run_tier2 () {
 
 # --- Tier 3: interaction (nested niri) ------------------------------------
 run_tier3 () {
+  local wl n
   echo "== Tier 3: interaction (nested niri) =="
   command -v niri  >/dev/null 2>&1 || { echo "  SKIP (niri not found)"; return; }
   command -v wtype >/dev/null 2>&1 || { echo "  SKIP (wtype not found)"; return; }
@@ -98,6 +105,7 @@ run_tier3 () {
   else wlshm_fail "right-click: crashed/froze (see $WLSHM_TMP/wlshmt3-hang.bt)"; fi
 
   wlshm_expect_key () {
+    local label expected setup got
     label=$1 expected=$2 setup=$3; shift 3
     _=$(wlshm_eval wlshmt3 10 "$setup")
     wlshm_key_chord "$wl" "$@"
@@ -111,6 +119,7 @@ run_tier3 () {
   }
 
   wlshm_expect_key_prefix () {
+    local label expected setup got
     label=$1 expected=$2 setup=$3; shift 3
     _=$(wlshm_eval wlshmt3 10 "$setup")
     wlshm_key_chord "$wl" "$@"

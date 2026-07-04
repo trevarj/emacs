@@ -287,7 +287,7 @@ run_x11 () {
       screen=$2
       el=$3
       xvfb_log=$4
-      Xvfb "$display" -screen 0 "$screen" -nolisten tcp -ac >"$xvfb_log" 2>&1 &
+      Xvfb "$display" -screen 0 "$screen" -nolisten tcp >"$xvfb_log" 2>&1 &
       pid=$!
       trap '"'"'kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true'"'"' EXIT
       sleep 1

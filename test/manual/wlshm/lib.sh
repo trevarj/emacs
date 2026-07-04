@@ -15,6 +15,15 @@
 
 set -u
 
+# Compositors and emacsclient sockets live under $XDG_RUNTIME_DIR; fail fast
+# with a clear message instead of a mid-run `set -u` blowup after weston has
+# already been spawned.
+if [ -z "${XDG_RUNTIME_DIR:-}" ]; then
+  echo "lib.sh: XDG_RUNTIME_DIR is unset; the harness needs it for Wayland" \
+       "sockets. Aborting." >&2
+  exit 1
+fi
+
 # Repo root = two levels up from this file (test/manual/wlshm/lib.sh).
 WLSHM_HERE="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 WLSHM_ROOT="$(cd "$WLSHM_HERE/../../.." && pwd)"
@@ -42,6 +51,7 @@ wlshm_setup_env () {
 wlshm_track () { WLSHM_PIDS="$WLSHM_PIDS $1"; }
 
 wlshm_cleanup () {
+  local p
   for p in $WLSHM_PIDS; do kill -9 "$p" 2>/dev/null || true; done
   WLSHM_PIDS=""
 }
@@ -56,6 +66,7 @@ wlshm_fail () { WLSHM_FAILS=$((WLSHM_FAILS + 1));  echo "  FAIL: $*"; }
 
 # wlshm_gdb_bt PID OUTFILE  -- snapshot all-thread backtrace + debug-log tail.
 wlshm_gdb_bt () {
+  local pid out
   pid=$1 out=$2
   {
     echo "=== gdb backtrace of pid $pid ($(date)) ==="
@@ -73,6 +84,7 @@ wlshm_gdb_bt () {
 # wlshm_emacs WAYLAND_DISPLAY ARGS...  -- run the build-tree emacs,
 # clean load path, WLSHM_DEBUG on.  Runs in the FOREGROUND.
 wlshm_emacs () {
+  local wd
   wd=$1; shift
   WAYLAND_DISPLAY="$wd" WLSHM_DEBUG=1 "$WLSHM_EMACS" -Q "$@"
 }
@@ -86,6 +98,7 @@ wlshm_emacs_batch () {
 
 # wlshm_start_weston SOCKET W H  -- headless weston; waits for the socket.
 wlshm_start_weston () {
+  local sock w h
   sock=$1 w=$2 h=$3
   weston --backend=headless-backend.so --socket="$sock" \
     --width="$w" --height="$h" --idle-time=0 \
@@ -101,6 +114,7 @@ wlshm_start_weston () {
 # wlshm_start_niri  -- nested niri in the parent session; echoes its wayland-N.
 # Requires WLSHM_PARENT_WL (the user's session display, e.g. wayland-1).
 wlshm_start_niri () {
+  local log s
   : "${WLSHM_PARENT_WL:?set WLSHM_PARENT_WL to the parent session display}"
   log="$WLSHM_TMP/niri.log"; : >"$log"
   WAYLAND_DISPLAY="$WLSHM_PARENT_WL" niri -c "$WLSHM_HERE/niri-test.kdl" \
@@ -121,6 +135,7 @@ WLSHM_SERVER_PID=""
 
 # wlshm_start_server NAME WAYLAND_DISPLAY  -- launch a long-lived emacs server.
 wlshm_start_server () {
+  local name wd
   name=$1 wd=$2
   WAYLAND_DISPLAY="$wd" WLSHM_DEBUG=1 "$WLSHM_EMACS" -Q \
     -l "$WLSHM_HERE/interaction-tests.el" \
@@ -151,6 +166,7 @@ wlshm_start_server () {
 # server's redisplay+present complete before we move on; the redirected form
 # races it and the render/dump is dropped.
 wlshm_eval () {
+  local name tmo form out rc
   name=$1 tmo=$2 form=$3
   out=$(timeout "$tmo" emacsclient -s "$name" --eval "$form" 2>/dev/null)
   rc=$?
@@ -180,6 +196,7 @@ wlshm_wtype_modifier () {
   esac
 }
 wlshm_key_chord () {
+  local wd
   wd=$1; shift
   [ "$#" -ge 1 ] || return 2
   local key i mod
@@ -206,11 +223,12 @@ wlshm_click () { WAYLAND_DISPLAY="$1" wlrctl pointer click "${2:-left}" 2>/dev/n
 # --- golden image comparison ----------------------------------------------
 
 # wlshm_compare_png ACTUAL GOLDEN NAME  -- compare a window dump to its golden.
-# Software lavapipe is deterministic on a given machine and the png encoder is
-# byte-stable, so an exact compare is reliable here.  Regenerate (review before
-# commit) with WLSHM_REGEN=1.  Also fails clearly if ACTUAL is missing (the dump
-# never happened, e.g. the scene hung).
+# CPU/Cairo rendering onto wl_shm is deterministic on a given machine and the
+# png encoder is byte-stable, so an exact compare is reliable here.  Regenerate
+# (review before commit) with WLSHM_REGEN=1.  Also fails clearly if ACTUAL is
+# missing (the dump never happened, e.g. the scene hung).
 wlshm_compare_png () {
+  local actual golden name
   actual=$1 golden=$2 name=$3
   # The dump file can land after emacsclient returns; wait so a benign timing
   # skew is not reported as a crash.
