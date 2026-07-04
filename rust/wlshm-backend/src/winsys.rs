@@ -100,7 +100,11 @@ use wayland_protocols::wp::viewporter::client::{
     wp_viewport::WpViewport, wp_viewporter::WpViewporter,
 };
 
-use crate::event::{WlshmEvent, WLSHM_MOD_ALT, WLSHM_MOD_CTRL, WLSHM_MOD_LOGO, WLSHM_MOD_SHIFT};
+// Alias: wayland_client::EventQueue (the connection queue) is also in scope.
+use crate::event::{
+    EventQueue as InputEventQueue, WlshmEvent, WLSHM_MOD_ALT, WLSHM_MOD_CTRL, WLSHM_MOD_LOGO,
+    WLSHM_MOD_SHIFT,
+};
 
 // ManuallyDrop: at process exit we deliberately leak the connection rather than
 // run libwayland's teardown (which can crash).  The OS reclaims everything.
@@ -625,8 +629,11 @@ struct AppState {
     /// only AFTER the bytes are read; some sources free the transfer on
     /// dnd_finished, which would truncate a finish-then-read sequence.
     pending_drop: Option<(ReadPipe, bool, i32, i32, u64, DragOffer)>,
-    /// Bytes of the most recent completed drop, handed to C via the
-    /// `wlshm_window_get_drop` side-channel after it pops the Drop event.
+    /// Completed drop payloads, one per queued Drop event (FIFO), so a second
+    /// drop arriving before C drains the first can't overwrite it.
+    drop_queue: VecDeque<Vec<u8>>,
+    /// The payload most recently popped by `wlshm_window_get_drop`; kept alive
+    /// here because C holds a borrowed pointer into it until its next FFI call.
     drop_text: Vec<u8>,
     // --- IME (zwp_text_input_v3) ---
     /// The manager global, if the compositor exposes text-input-v3.  Absent on
@@ -645,7 +652,7 @@ struct AppState {
     /// `wlshm_window_get_preedit` side-channel after it pops a Preedit event.
     preedit_text: Vec<u8>,
     /// Pending input events for Emacs's read_socket (each stamped .window).
-    events: VecDeque<WlshmEvent>,
+    events: InputEventQueue,
     /// Globals needed to mint new surfaces on demand.
     compositor: CompositorState,
     xdg_shell: XdgShell,
@@ -682,7 +689,7 @@ impl AppState {
     }
 
     fn push(&mut self, e: WlshmEvent) {
-        self.events.push_back(e);
+        self.events.push(e);
     }
 
     /// Turn the IME on for the focused surface: per text-input-v3, enable()
@@ -863,6 +870,7 @@ impl Backend {
             dnd_pos: (0, 0),
             dnd_window: 0,
             pending_drop: None,
+            drop_queue: VecDeque::new(),
             drop_text: Vec::new(),
             text_input_mgr,
             text_input: None,
@@ -870,7 +878,7 @@ impl Backend {
             pending_preedit: String::new(),
             pending_commit: String::new(),
             preedit_text: Vec::new(),
-            events: VecDeque::new(),
+            events: InputEventQueue::new(),
             compositor,
             xdg_shell,
             shm,
@@ -1138,9 +1146,8 @@ impl Backend {
         popup.reposition(&positioner, self.state.reposition_token);
         if let Some(wl) = self.state.windows.get_mut(&id) {
             wl.size = (w.max(1) as u32, h.max(1) as u32);
-            if let Some(vp) = wl.viewport.as_ref() {
-                vp.set_destination(w.max(1), h.max(1));
-            }
+            // Re-arm the viewport destination from the new size.
+            wl.update_viewport();
         }
         // Pump the reposition/configure round-trip so the new geometry is in
         // effect before the C side presents the next buffer.
@@ -1194,15 +1201,14 @@ impl Backend {
             .map(|p| p.scale120).unwrap_or(120).max(120);
         let popup_vp = self.state.viewporter.as_ref()
             .map(|vp| vp.get_viewport(popup.wl_surface(), &self.qh, ()));
-        if let Some(vp) = popup_vp.as_ref() {
-            vp.set_destination(w.max(1), h.max(1));
-        }
         if let Some(wl) = self.state.windows.get_mut(&id) {
             wl.role = Role::Popup(popup);
             wl.size = (w.max(1) as u32, h.max(1) as u32);
             wl.scale120 = parent_scale;
             wl.viewport = popup_vp;
             wl.configured = false;
+            // Arm the viewport destination from the just-set logical size.
+            wl.update_viewport();
         }
         // Pump the initial popup configure so the surface is configured before
         // the C side presents a buffer (committing a buffer first is an error).
@@ -1249,7 +1255,6 @@ impl Backend {
     }
 
     fn dispatch(&mut self) -> Result<(), String> {
-        use std::os::unix::io::AsRawFd;
         if let Some(e) = self.fatal_error.clone() {
             return Err(e);
         }
@@ -1386,7 +1391,10 @@ impl Backend {
         if bytes.is_empty() {
             return;
         }
-        self.state.drop_text = bytes;
+        // Queue the payload rather than storing it directly: the matching Drop
+        // event may still sit behind others in the event queue, and a second
+        // drop must not overwrite the first before C fetches it.
+        self.state.drop_queue.push_back(bytes);
         self.state.push(WlshmEvent::drop(x, y, is_uri).on(win));
     }
 
@@ -1643,8 +1651,9 @@ impl Backend {
 /// Read all data from a clipboard pipe, non-blocking with a total timeout so a
 /// misbehaving source can never hang Emacs's main loop.
 fn read_pipe_timeout(pipe: &ReadPipe, timeout_ms: u64) -> Vec<u8> {
-    use std::os::unix::io::AsRawFd;
-    use std::time::{Duration, Instant};
+    // Cap the accumulated bytes so a hostile/buggy selection or DnD source
+    // can't exhaust memory within the timeout window.
+    const CAP: usize = 64 << 20;
 
     let fd = pipe.as_raw_fd();
     unsafe {
@@ -1657,6 +1666,9 @@ fn read_pipe_timeout(pipe: &ReadPipe, timeout_ms: u64) -> Vec<u8> {
     let mut tmp = [0u8; 8192];
     let deadline = Instant::now() + Duration::from_millis(timeout_ms);
     loop {
+        if out.len() >= CAP {
+            break;
+        }
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             break;
@@ -1691,9 +1703,6 @@ fn read_pipe_timeout(pipe: &ReadPipe, timeout_ms: u64) -> Vec<u8> {
 /// buffer, so a blocking write_all of a large selection would otherwise freeze
 /// the editor until the peer drains (or never).
 fn write_pipe_timeout(pipe: &WritePipe, data: &[u8], timeout_ms: u64) {
-    use std::os::unix::io::AsRawFd;
-    use std::time::{Duration, Instant};
-
     let fd = pipe.as_raw_fd();
     unsafe {
         let flags = libc::fcntl(fd, libc::F_GETFL);
@@ -1910,6 +1919,14 @@ impl SeatHandler for AppState {
                 self.primary_device = Some(mgr.get_selection_device(qh, &seat));
             }
         }
+        // Mirror the data-device/primary lazy creation for IME: a seat that
+        // appears after Backend::connect would otherwise never get a text-input
+        // object, silently disabling the IME.
+        if self.text_input.is_none() {
+            if let Some(mgr) = self.text_input_mgr.as_ref() {
+                self.text_input = Some(mgr.get_text_input(&seat, qh, ()));
+            }
+        }
     }
     fn new_capability(&mut self, _: &Connection, qh: &QueueHandle<Self>, seat: WlSeat, capability: Capability) {
         if capability == Capability::Keyboard && self.keyboard.is_none() {
@@ -1979,6 +1996,9 @@ impl KeyboardHandler for AppState {
             .unwrap_or(0);
         let win = self.primary();
         self.push(WlshmEvent::key(ks, unichar, self.mods).on(win));
+        // NOTE: xkb per-key repeat flags are not consulted (sctk 0.19 doesn't
+        // expose them), so every non-modifier key repeats when held -- e.g. a
+        // held Escape repeats.  Modifiers are already filtered above.
         if self.repeat_rate_ms > 0 {
             self.repeat = Some((event.raw_code, ks, unichar, win));
             self.arm_repeat();
@@ -2181,6 +2201,16 @@ impl Dispatch<WpFractionalScaleV1, u64> for AppState {
     ) {
         if let wp_fractional_scale_v1::Event::PreferredScale { scale } = event {
             let id = *data;
+            // NOTE: unlike scale_factor_changed, this handler intentionally has
+            // NO Role::Subsurface guard.  Subsurface child frames get their own
+            // WpFractionalScaleV1 at creation (open_window kind==3) so they
+            // render crisp at the parent's scale; the Configure pushed below
+            // reaches C (wlshmterm.c: change_frame_size + garbage), which drives
+            // wlshm_ensure_canvas to rebuild the child canvas at the new
+            // physical size.  Guarding here would freeze the child's scale ->
+            // blurry popups at fractional scale.  scale_factor_changed's guard
+            // only covers the integer FALLBACK path, where a subsurface's scale
+            // is fixed at creation via set_buffer_scale.
             let Some(w) = state.windows.get_mut(&id) else { return };
             if scale == 0 || w.scale120 == scale {
                 return;
@@ -2302,8 +2332,11 @@ impl AppState {
                 .map(|m| m.to_string())
         })?;
         // Accept the chosen mime and advertise Copy as both supported and
-        // preferred so the compositor settles on a non-"ask" action.
-        offer.accept_mime_type(self.serial, Some(mime.clone()));
+        // preferred so the compositor settles on a non-"ask" action.  Per
+        // wl_data_device.accept the serial must be the drag's ENTER serial (the
+        // offer carries it); self.serial is the latest input serial and is
+        // wrong mid-drag.
+        offer.accept_mime_type(offer.serial, Some(mime.clone()));
         offer.set_actions(DndAction::Copy, DndAction::Copy);
         Some(mime)
     }
@@ -2576,16 +2609,7 @@ pub unsafe extern "C" fn wlshm_window_poll_events(buf: *mut WlshmEvent, max: c_i
         return 0;
     }
     let out = std::slice::from_raw_parts_mut(buf, max as usize);
-    with_backend(
-        |b| {
-            let n = out.len().min(b.state.events.len());
-            for slot in out.iter_mut().take(n) {
-                *slot = b.state.events.pop_front().unwrap();
-            }
-            n as c_int
-        },
-        0,
-    )
+    with_backend(|b| b.state.events.drain_into(out) as c_int, 0)
 }
 
 /// Present window `win`'s Cairo canvas (XRGB8888, `src_w`x`src_h`, `src_stride`
@@ -2909,12 +2933,17 @@ pub extern "C" fn wlshm_window_unmap(win: u64) {
                     if parent.is_none() {
                         w.configured = false;
                     }
-                    // Drop any buffer coalesced before this unmap.  Frame
-                    // callbacks already requested by older commits are not
-                    // canceled; keep the count so they drain without
-                    // undercounting newer commits.  The deadline path handles
-                    // withheld callbacks after the next present.
+                    // Drop any buffer coalesced before this unmap, and zero the
+                    // frame-callback count: a compositor may never deliver frame
+                    // callbacks for an unmapped surface, so a stranded nonzero
+                    // count would make every post-remap present coalesce and
+                    // commit only at PRESENT_DEADLINE (permanent ~30fps +33ms).
+                    // A late stale callback after remap just saturating_subs to
+                    // 0; it can't commit stale pixels (the eligibility check in
+                    // frame() guards that) -- worst case one extra un-throttled
+                    // commit.
                     w.pending = None;
+                    w.frame_callbacks_pending = 0;
                     // Re-map (the next present) must commit the parent again to
                     // re-apply this subsurface's placement.
                     w.parent_dirty = true;
@@ -3017,8 +3046,11 @@ pub unsafe extern "C" fn wlshm_window_set_clipboard(data: *const u8, len: usize)
     with_backend(|b| if b.set_clipboard(bytes) { 0 } else { -1 }, -1)
 }
 
-/// Read the CLIPBOARD selection.  Writes a pointer/length valid until the next
-/// call into *out_ptr/*out_len and returns 0; -1 if empty.
+/// Read the CLIPBOARD selection.  Writes a pointer/length into
+/// *out_ptr/*out_len and returns 0; -1 if empty.  The pointer targets the ONE
+/// shared thread-local buffer (`CLIPBOARD_BUF`) used by both this getter and
+/// `wlshm_window_get_primary`, so it is valid only until the next call to
+/// EITHER getter.
 ///
 /// # Safety
 /// `out_ptr` and `out_len` must be valid pointers.
@@ -3043,10 +3075,13 @@ pub unsafe extern "C" fn wlshm_window_get_clipboard(
     }
 }
 
-/// Retrieve the payload of the most recently delivered Drop event.  Writes a
+/// Retrieve the payload of the oldest undelivered Drop event.  Writes a
 /// pointer/length valid until the next call into *out_ptr/*out_len and returns
-/// 0; -1 if there is no pending drop text.  C must call this right after it pops
-/// a `WlshmEventKind_Drop` event (whose `.button` flags a `text/uri-list`).
+/// 0; -1 if there is no pending drop payload.  C must call this exactly once,
+/// right after it pops a `WlshmEventKind_Drop` event (whose `.button` flags a
+/// `text/uri-list`): each call consumes one queued payload, so a spurious call
+/// returns -1 rather than replaying a stale drop, and calling twice for one
+/// event would steal the next event's payload.
 ///
 /// # Safety
 /// `out_ptr` and `out_len` must be valid pointers.
@@ -3057,9 +3092,13 @@ pub unsafe extern "C" fn wlshm_window_get_drop(
 ) -> c_int {
     with_backend(
         |b| {
-            if b.state.drop_text.is_empty() {
+            // Pop into drop_text BEFORE taking the pointer: reassigning it here
+            // only invalidates the pointer handed out by the PREVIOUS call,
+            // which expired at this FFI call per the borrow contract above.
+            let Some(bytes) = b.state.drop_queue.pop_front() else {
                 return -1;
-            }
+            };
+            b.state.drop_text = bytes;
             if !out_ptr.is_null() {
                 *out_ptr = b.state.drop_text.as_ptr();
             }
@@ -3074,9 +3113,9 @@ pub unsafe extern "C" fn wlshm_window_get_drop(
 
 /// Retrieve the current IME preedit (composition) string.  Writes a
 /// pointer/length valid until the next call into *out_ptr/*out_len and returns
-/// 0; -1 if there is no preedit object at all.  The buffer is UTF-8 and may be
-/// empty (length 0) to mean "clear the preedit".  C must call this right after
-/// it pops a `WlshmEventKind_Preedit` event.
+/// 0 whenever the backend exists; -1 only means the backend is absent.  The
+/// buffer is UTF-8 and may be empty (length 0) to mean "clear the preedit".
+/// C must call this right after it pops a `WlshmEventKind_Preedit` event.
 ///
 /// # Safety
 /// `out_ptr` and `out_len` must be valid pointers.
@@ -3144,8 +3183,11 @@ pub unsafe extern "C" fn wlshm_window_set_primary(data: *const u8, len: usize) -
     with_backend(|b| if b.set_primary(bytes) { 0 } else { -1 }, -1)
 }
 
-/// Read the PRIMARY selection.  Writes a pointer/length valid until the next
-/// call into *out_ptr/*out_len and returns 0; -1 if empty.
+/// Read the PRIMARY selection.  Writes a pointer/length into
+/// *out_ptr/*out_len and returns 0; -1 if empty.  The pointer targets the ONE
+/// shared thread-local buffer (`CLIPBOARD_BUF`) used by both this getter and
+/// `wlshm_window_get_clipboard`, so it is valid only until the next call to
+/// EITHER getter.
 ///
 /// # Safety
 /// `out_ptr` and `out_len` must be valid pointers.

@@ -28,7 +28,6 @@ wayland-client = "0.31"
 wayland-protocols = { version = "0.32", features = ["client", "unstable", "staging"] }
 # Force the system libwayland backend (matches the libwayland-client we link).
 wayland-backend = { version = "0.3", features = ["client_system"] }
-log = "0.4"
 libc = "0.2"               # timerfd for client-side key repeat
 
 [profile.release]

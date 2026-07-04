@@ -19,7 +19,7 @@ pub enum WlshmEventKind {
     PointerPress = 4,
     /// Pointer button released; button/x/y are set.
     PointerRelease = 5,
-    /// Scroll wheel/axis; axis_x/axis_y carry the (hi-res) deltas.
+    /// Scroll wheel/axis; axis_x/axis_y carry signed notch step counts.
     PointerAxis = 6,
     /// Compositor asked the window to resize; x/y carry the new w/h (pixels).
     Configure = 7,
@@ -68,7 +68,9 @@ pub struct WlshmEvent {
     pub button: u32,
     /// Event timestamp in milliseconds (pointer events).
     pub time: u32,
-    /// Hi-res scroll deltas (PointerAxis); +y scrolls down, +x scrolls right.
+    /// Scroll notch step counts (PointerAxis; see `axis_steps` in winsys.rs --
+    /// NOT hi-res deltas); +y scrolls down, +x scrolls right.  The C consumer
+    /// treats each unit as one wheel notch.
     pub axis_x: i32,
     pub axis_y: i32,
     /// Opaque window handle this event belongs to (0 = unknown/primary).

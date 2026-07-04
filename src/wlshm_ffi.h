@@ -47,7 +47,7 @@ typedef enum {
    */
   WlshmEventKind_PointerRelease = 5,
   /**
-   * Scroll wheel/axis; axis_x/axis_y carry the (hi-res) deltas.
+   * Scroll wheel/axis; axis_x/axis_y carry signed notch step counts.
    */
   WlshmEventKind_PointerAxis = 6,
   /**
@@ -113,7 +113,9 @@ typedef struct {
    */
   uint32_t time;
   /**
-   * Hi-res scroll deltas (PointerAxis); +y scrolls down, +x scrolls right.
+   * Scroll notch step counts (PointerAxis; see `axis_steps` in winsys.rs --
+   * NOT hi-res deltas); +y scrolls down, +x scrolls right.  The C consumer
+   * treats each unit as one wheel notch.
    */
   int32_t axis_x;
   int32_t axis_y;
@@ -133,7 +135,7 @@ extern "C" {
 int wlshm_backend_init(void);
 
 /**
- * Tear down process-global backend state. No-op.
+ * Tear down process-global backend state.
  */
 void wlshm_backend_shutdown(void);
 
@@ -365,8 +367,11 @@ int wlshm_output_get(int idx,
 int wlshm_window_set_clipboard(const uint8_t *data, uintptr_t len);
 
 /**
- * Read the CLIPBOARD selection.  Writes a pointer/length valid until the next
- * call into *out_ptr/*out_len and returns 0; -1 if empty.
+ * Read the CLIPBOARD selection.  Writes a pointer/length into
+ * *out_ptr/*out_len and returns 0; -1 if empty.  The pointer targets the ONE
+ * shared thread-local buffer (`CLIPBOARD_BUF`) used by both this getter and
+ * `wlshm_window_get_primary`, so it is valid only until the next call to
+ * EITHER getter.
  *
  * # Safety
  * `out_ptr` and `out_len` must be valid pointers.
@@ -374,10 +379,13 @@ int wlshm_window_set_clipboard(const uint8_t *data, uintptr_t len);
 int wlshm_window_get_clipboard(const uint8_t **out_ptr, uintptr_t *out_len);
 
 /**
- * Retrieve the payload of the most recently delivered Drop event.  Writes a
+ * Retrieve the payload of the oldest undelivered Drop event.  Writes a
  * pointer/length valid until the next call into *out_ptr/*out_len and returns
- * 0; -1 if there is no pending drop text.  C must call this right after it pops
- * a `WlshmEventKind_Drop` event (whose `.button` flags a `text/uri-list`).
+ * 0; -1 if there is no pending drop payload.  C must call this exactly once,
+ * right after it pops a `WlshmEventKind_Drop` event (whose `.button` flags a
+ * `text/uri-list`): each call consumes one queued payload, so a spurious call
+ * returns -1 rather than replaying a stale drop, and calling twice for one
+ * event would steal the next event's payload.
  *
  * # Safety
  * `out_ptr` and `out_len` must be valid pointers.
@@ -387,9 +395,9 @@ int wlshm_window_get_drop(const uint8_t **out_ptr, uintptr_t *out_len);
 /**
  * Retrieve the current IME preedit (composition) string.  Writes a
  * pointer/length valid until the next call into *out_ptr/*out_len and returns
- * 0; -1 if there is no preedit object at all.  The buffer is UTF-8 and may be
- * empty (length 0) to mean "clear the preedit".  C must call this right after
- * it pops a `WlshmEventKind_Preedit` event.
+ * 0 whenever the backend exists; -1 only means the backend is absent.  The
+ * buffer is UTF-8 and may be empty (length 0) to mean "clear the preedit".
+ * C must call this right after it pops a `WlshmEventKind_Preedit` event.
  *
  * # Safety
  * `out_ptr` and `out_len` must be valid pointers.
@@ -420,8 +428,11 @@ int wlshm_window_clipboard_exists(void);
 int wlshm_window_set_primary(const uint8_t *data, uintptr_t len);
 
 /**
- * Read the PRIMARY selection.  Writes a pointer/length valid until the next
- * call into *out_ptr/*out_len and returns 0; -1 if empty.
+ * Read the PRIMARY selection.  Writes a pointer/length into
+ * *out_ptr/*out_len and returns 0; -1 if empty.  The pointer targets the ONE
+ * shared thread-local buffer (`CLIPBOARD_BUF`) used by both this getter and
+ * `wlshm_window_get_clipboard`, so it is valid only until the next call to
+ * EITHER getter.
  *
  * # Safety
  * `out_ptr` and `out_len` must be valid pointers.

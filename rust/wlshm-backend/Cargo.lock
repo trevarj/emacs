@@ -542,7 +542,6 @@ name = "wlshm-backend"
 version = "0.1.0"
 dependencies = [
  "libc",
- "log",
  "smithay-client-toolkit",
  "wayland-backend",
  "wayland-client",
