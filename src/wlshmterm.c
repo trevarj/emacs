@@ -50,7 +50,8 @@ wlshm_log_enabled (void)
     {
       wlshm_log_state = getenv ("WLSHM_DEBUG") ? 1 : 0;
       if (wlshm_log_state)
-	wlshm_log_fp = fopen ("/tmp/wlshm-debug.log", "a");
+	/* "e" = O_CLOEXEC so the log fd doesn't leak into subprocesses.  */
+	wlshm_log_fp = fopen ("/tmp/wlshm-debug.log", "ae");
     }
   return wlshm_log_state == 1 && wlshm_log_fp != NULL;
 }
@@ -138,14 +139,53 @@ wlshm_canvas_frame (void)
   return NULL;
 }
 
+/* Refresh F's cached window size/scale from the Rust side if the cache is
+   invalid, then return the cache.  Every Rust-side size/scale change surfaces
+   as a Configure event (xdg configure, integer scale_factor_changed, and the
+   fractional-scale handler), and the Configure path invalidates the cache, so
+   serving the draw hot path (ensure_canvas, FRAME_SCALE_FACTOR) from here is
+   safe and avoids two FFI calls per drawing operation.  */
+static struct wlshm_output *
+wlshm_cached_geometry (struct frame *f)
+{
+  struct wlshm_output *o = FRAME_X_OUTPUT (f);
+  if (!o)
+    return NULL;
+  if (!o->geom_cache_valid)
+    {
+      uint32_t w = 0, h = 0;
+      wlshm_window_size (WLSHM_FRAME_HANDLE (f), &w, &h);
+      o->cached_log_w = w;
+      o->cached_log_h = h;
+      o->cached_scale120 = wlshm_window_scale120 (WLSHM_FRAME_HANDLE (f));
+      o->geom_cache_valid = true;
+    }
+  return o;
+}
+
+/* Drop F's cached window size/scale (idempotent).  Called on Configure and
+   after any set_size/set_geometry request.  */
+void
+wlshm_geom_cache_invalidate (struct frame *f)
+{
+  struct wlshm_output *o = FRAME_X_OUTPUT (f);
+  if (o)
+    o->geom_cache_valid = false;
+}
+
 /* Device (HiDPI) scale of frame F as a double (1.0 == no scaling).  Mirrors
    pgtk_frame_scale_factor: FRAME_SCALE_FACTOR uses it so SVG images rasterize
    at the physical resolution and stay crisp on the device-scaled canvas.  */
 double
 wlshm_frame_scale_factor (struct frame *f)
 {
-  uint32_t scale120 = wlshm_window_scale120 (WLSHM_FRAME_HANDLE (f));
-  return scale120 < 120 ? 1.0 : (double) scale120 / 120.0;
+  /* Guard against a NULL output: wlshm_free_frame_resources frees it while
+     the frame can still be reached via FRAME_SCALE_FACTOR /
+     FRAME_SCROLL_COPY_UNSAFE during teardown.  */
+  struct wlshm_output *o = wlshm_cached_geometry (f);
+  if (!o)
+    return 1.0;
+  return o->cached_scale120 < 120 ? 1.0 : (double) o->cached_scale120 / 120.0;
 }
 
 static void
@@ -237,10 +277,11 @@ wlshm_ensure_canvas (void)
       wlshm_cr = NULL;
       return;
     }
-  struct wlshm_output *o = FRAME_X_OUTPUT (f);
+  /* Cached size/scale: skip the two FFI calls on every draw call unless a
+     Configure or a set_size/set_geometry invalidated the cache.  */
+  struct wlshm_output *o = wlshm_cached_geometry (f);
   /* W/H are LOGICAL pixels (the xdg configure size Emacs works in).  */
-  uint32_t w = 0, h = 0;
-  wlshm_window_size (WLSHM_FRAME_HANDLE (f), &w, &h);
+  uint32_t w = o->cached_log_w, h = o->cached_log_h;
   if (w == 0 || h == 0)
     {
       w = 800;
@@ -253,7 +294,7 @@ wlshm_ensure_canvas (void)
      coordinates yet rasterizes crisply at the physical resolution (ftcrfont's
      cairo glyph path honors the device scale).  scale120 == 120 -> 1.0, i.e.
      byte-identical to the non-HiDPI path.  */
-  uint32_t scale120 = wlshm_window_scale120 (WLSHM_FRAME_HANDLE (f));
+  uint32_t scale120 = o->cached_scale120;
   if (scale120 < 120)
     scale120 = 120;
   double scale = (double) scale120 / 120.0;
@@ -346,8 +387,15 @@ wlshm_present_canvas (struct frame *f)
   wlshm_ensure_canvas ();
   if (!wlshm_canvas)
     return;
-  cairo_surface_flush (wlshm_canvas);
   struct wlshm_output *o = FRAME_X_OUTPUT (f);
+  /* Nothing was painted since the last present: SKIP the FFI call entirely.
+     A 0,0,0,0 damage rect means FULL surface on the Rust side (a ~full-canvas
+     memcpy, ~33MB at 4K), not a no-op.  Map/remap safety: a canvas rebuild
+     sets full damage (wlshm_ensure_canvas) and make_frame_visible garbages
+     the frame, so the first present after those always has damage.  */
+  if (o && !o->damage_valid)
+    return;
+  cairo_surface_flush (wlshm_canvas);
   int dx = 0, dy = 0, dw = 0, dh = 0;
   if (o && o->damage_valid)
     {
@@ -448,9 +496,10 @@ static void wlshm_fill_rect_pixel (int x, int y, int w, int h,
 static void wlshm_fill_rect_phys (int x, int y, int w, int h,
 				  unsigned long pixel);
 
-/* 1px-thick rectangle outline in a packed pixel (defined below).  */
-static void wlshm_draw_box_outline (unsigned long color, int x, int y,
-				    int w, int h);
+/* 1px-thick rectangle outline (W+1 x H+1) in a packed pixel (defined
+   below).  */
+static void wlshm_draw_rectangle (struct frame *f, unsigned long color,
+				  int x, int y, int w, int h);
 
 /* Strength of the mouse-face hover tint: how far the background is blended
    toward the foreground.  */
@@ -644,21 +693,6 @@ wlshm_relief_color (unsigned long p, double factor, int delta)
 	  | (unsigned long) (nb >> 8));
 }
 
-/* Draw a 1px-thick rectangle outline in COLOR as four edge rects: the top and
-   bottom edges span width W (at Y and Y+H), the left and right edges span
-   height H (at X and X+W).  Matches the open-coded outline idiom used for the
-   glyphless/composite "no font" boxes.  */
-static void
-wlshm_draw_box_outline (unsigned long color, int x, int y, int w, int h)
-{
-  /* Physical-snapped AA-none edges (like the 3D-relief/divider paths) so a
-     fractional device scale can't ramp a 1px edge across two physical rows.  */
-  wlshm_fill_rect_phys (x, y, w, 1, color);		/* top */
-  wlshm_fill_rect_phys (x, y + h, w, 1, color);		/* bottom */
-  wlshm_fill_rect_phys (x, y, 1, h, color);		/* left */
-  wlshm_fill_rect_phys (x + w, y, 1, h, color);		/* right */
-}
-
 /* Draw the face box around glyph string S: a flat box for FACE_SIMPLE_BOX, or
    a 3D raised/sunken relief (light top/left, dark bottom/right, swapped when
    sunken) otherwise.  */
@@ -790,11 +824,13 @@ wlshm_draw_composite_glyph_string_foreground (struct glyph_string *s)
 
   if (s->font_not_found_p)
     {
-      /* Outline box for an unloadable composition.  */
+      /* Outline box for an unloadable composition.  wlshm_draw_rectangle
+	 draws W+1 x H+1 (like pgtk_draw_rectangle), so the -1 width/height
+	 close the box exactly at the glyph cell, corner pixel included.  */
       if (s->cmp_from == 0)
 	{
 	  int w = s->width - 1, h = s->height - 1;
-	  wlshm_draw_box_outline (s->face->foreground, x, s->y, w, h);
+	  wlshm_draw_rectangle (s->f, s->face->foreground, x, s->y, w, h);
 	}
     }
   else if (!s->first_glyph->u.cmp.automatic)
@@ -1077,10 +1113,11 @@ wlshm_draw_glyphless_glyph_string_foreground (struct glyph_string *s)
 
       if (glyph->u.glyphless.method != GLYPHLESS_DISPLAY_THIN_SPACE)
 	{
-	  /* Outline box.  */
+	  /* Outline box (W+1 x H+1 via wlshm_draw_rectangle; the -1 sizes
+	     close it exactly at the glyph cell, corner pixel included).  */
 	  int bx = x, by = s->ybase - glyph->ascent;
 	  int bw = glyph->pixel_width - 1, bh = glyph->ascent + glyph->descent - 1;
-	  wlshm_draw_box_outline (s->face->foreground, bx, by, bw, bh);
+	  wlshm_draw_rectangle (s->f, s->face->foreground, bx, by, bw, bh);
 	}
       x += glyph->pixel_width;
     }
@@ -1160,7 +1197,8 @@ static void
 wlshm_draw_rectangle (struct frame *f, unsigned long color,
 		      int x, int y, int w, int h)
 {
-  /* Physical-snapped AA-none edges, matching wlshm_draw_box_outline.  */
+  /* Physical-snapped AA-none edges (like the 3D-relief/divider paths) so a
+     fractional device scale can't ramp a 1px edge across two physical rows.  */
   wlshm_fill_rect_phys (x, y, w + 1, 1, color);		/* top */
   wlshm_fill_rect_phys (x, y + h, w + 1, 1, color);	/* bottom */
   wlshm_fill_rect_phys (x, y, 1, h + 1, color);		/* left */
@@ -1561,9 +1599,17 @@ wlshm_draw_glyph_string (struct glyph_string *s)
     }
 
   s->num_clips = 0;
-  wlshm_damage_logical (s->f, s->x - 2, s->y - 2,
-			max (s->width, s->background_width) + 4,
-			s->height + 4);
+  /* Damage slack: at least 2px on every side, widened by the string's real
+     overhangs (computed by the driver) -- a fixed +-2 under-damages large
+     glyph overhangs (e.g. italic/bold bleed) and leaves a stale sliver.  */
+  {
+    int lslack = max (2, s->left_overhang);
+    int rslack = max (2, s->right_overhang);
+    wlshm_damage_logical (s->f, s->x - lslack, s->y - 2,
+			  max (s->width, s->background_width)
+			  + lslack + rslack,
+			  s->height + 4);
+  }
   wlshm_end_cr_clip (s->f);
 }
 
@@ -1941,18 +1987,19 @@ wlshm_draw_fringe_bitmap (struct window *w, struct glyph_row *row,
       return;
     }
 
+  /* This row's band within the window, used both for the clip below and for
+     the damage rect at the end (compute it once).  */
+  int wbx, wby, wbw;
+  window_box (w, ANY_AREA, &wbx, &wby, &wbw, 0);
+  int ry = WINDOW_TO_FRAME_PIXEL_Y (w, max (0, row->y));
+  ry = max (ry, wby);
+
   /* Clip to this row's band within the window so the fringe (background and
      bitmap) never bleeds past the window's text area into the mode line or the
      echo-area window below it (mirrors pgtk_clip_to_row).  */
   cairo_save (wlshm_cr);
-  {
-    int wbx, wby, wbw;
-    window_box (w, ANY_AREA, &wbx, &wby, &wbw, 0);
-    int ry = WINDOW_TO_FRAME_PIXEL_Y (w, max (0, row->y));
-    ry = max (ry, wby);
-    cairo_rectangle (wlshm_cr, wbx, ry, wbw, row->visible_height);
-    cairo_clip (wlshm_cr);
-  }
+  cairo_rectangle (wlshm_cr, wbx, ry, wbw, row->visible_height);
+  cairo_clip (wlshm_cr);
 
   /* Background behind the bitmap.  */
   if (p->bx >= 0 && !p->overlay_p && p->nx > 0 && p->ny > 0)
@@ -2007,13 +2054,7 @@ wlshm_draw_fringe_bitmap (struct window *w, struct glyph_row *row,
     }
 
   cairo_restore (wlshm_cr);
-  {
-    int wbx, wby, wbw;
-    window_box (w, ANY_AREA, &wbx, &wby, &wbw, 0);
-    int ry = WINDOW_TO_FRAME_PIXEL_Y (w, max (0, row->y));
-    ry = max (ry, wby);
-    wlshm_damage_logical (f, wbx, ry, wbw, row->visible_height);
-  }
+  wlshm_damage_logical (f, wbx, ry, wbw, row->visible_height);
   unblock_input ();
 }
 
@@ -2319,12 +2360,12 @@ wlshm_set_window_size (struct frame *f, bool change_gravity,
 		       int width, int height)
 {
   block_input ();
-  FRAME_X_OUTPUT (f)->preferred_width = width;
-  FRAME_X_OUTPUT (f)->preferred_height = height;
   /* Size only: this hook carries no position.  Using set_geometry here would
      anchor a not-yet-positioned tooltip popup at (0,0); the positioned
      placement happens later in Fx_show_tip via wlshm_window_set_geometry.  */
   wlshm_window_set_size (WLSHM_FRAME_HANDLE (f), width, height);
+  /* The Rust-side window size just changed; re-fetch it on the next draw.  */
+  wlshm_geom_cache_invalidate (f);
 
   /* WIDTH/HEIGHT are the native (pixel) size; change_frame_size converts to
      text internally, so pass them straight through (no double conversion).
@@ -2453,6 +2494,8 @@ wlshm_ring_bell (struct frame *f)
   f = wlshm_canvas_frame ();
   if (!f)
     return;
+  /* Two separate block_input sections so input stays blocked only around
+     the canvas snapshot/paint/present work, NOT across the 40ms sleep.  */
   block_input ();
   cairo_surface_flush (wlshm_canvas);
   int stride = cairo_image_surface_get_stride (wlshm_canvas);
@@ -2469,10 +2512,12 @@ wlshm_ring_bell (struct frame *f)
   cairo_restore (wlshm_cr);
   wlshm_damage_full (f);
   wlshm_present_canvas (f);
+  unblock_input ();
 
   struct timespec ts = { 0, 40 * 1000 * 1000 };  /* ~40ms flash */
   nanosleep (&ts, NULL);
 
+  block_input ();
   memcpy (data, snap, nbytes);
   cairo_surface_mark_dirty (wlshm_canvas);
   wlshm_damage_full (f);
@@ -3225,6 +3270,43 @@ wlshm_scroll_bar_redraw (struct scroll_bar *bar)
   if (width <= 0 || height <= 0)
     return;
 
+  /* Skip the repaint when nothing about the bar changed AND the text
+     redisplay did not paint into its rectangle.  The per-update repaint
+     exists only because redisplay may overpaint the bar; repainting it
+     unconditionally would damage the canvas on every update and force a
+     present even for otherwise-undamaged frames.  */
+  {
+    bool changed = (!bar->last_painted
+		    || bar->last_top != top || bar->last_left != left
+		    || bar->last_width != width || bar->last_height != height
+		    || bar->last_start != bar->start
+		    || bar->last_end != bar->end);
+    bool overpainted = false;
+    if (!changed && out->damage_valid)
+      {
+	/* The accumulated damage rect is PHYSICAL; compare against the
+	   bar's logical rect scaled up (floor/ceil = conservative).  */
+	double sc = wlshm_frame_scale_factor (f);
+	int bx0 = (int) floor (left * sc);
+	int by0 = (int) floor (top * sc);
+	int bx1 = (int) ceil ((left + width) * sc);
+	int by1 = (int) ceil ((top + height) * sc);
+	overpainted = (bx0 < out->damage_x + out->damage_w
+		       && out->damage_x < bx1
+		       && by0 < out->damage_y + out->damage_h
+		       && out->damage_y < by1);
+      }
+    if (!changed && !overpainted)
+      return;
+    bar->last_top = top;
+    bar->last_left = left;
+    bar->last_width = width;
+    bar->last_height = height;
+    bar->last_start = bar->start;
+    bar->last_end = bar->end;
+    bar->last_painted = true;
+  }
+
   /* The minibuffer / echo-area window reserves scroll-bar space (every window
      inherits the frame's scroll-bar type via make_window), and redisplay calls
      set/redeem for it, so we must keep the bar object.  But it must not SHOW a
@@ -3339,6 +3421,8 @@ wlshm_scroll_bar_create (struct window *w, int top, int left,
   bar->start = 0;
   bar->end = 0;
   bar->dragging = -1;
+  /* Nothing painted yet: the first redraw must not be skipped.  */
+  bar->last_painted = false;
   bar->horizontal = horizontal;
 
   bar->next = FRAME_SCROLL_BARS (f);
@@ -3822,463 +3906,533 @@ wlshm_read_socket (struct terminal *terminal, struct input_event *hold_quit)
 	 immediate drain loop on the same fatal fd.  */
       return -2;
     }
-  int nev = wlshm_window_poll_events (evs, BATCH);
   unblock_input ();
 
   struct frame *f = wlshm_any_frame (terminal);
   int count = 0;
-  bool need_present = false;	/* set when hover highlight may have changed */
+  /* Frame whose hover highlight may have changed and should be presented
+     after the batch.  It can differ from the last event's frame, so track
+     the frame itself, not a bare flag.  */
+  struct frame *present_frame = NULL;
+  /* Coalesce multiple Configure events per frame in a batch to the last one
+     (each apply is a full resize + garbaged redraw); applied after the
+     loop.  */
+  struct { struct frame *f; int w, h; } configures[8];
+  int nconf = 0;
+  int nev;
 
-  for (int i = 0; f && i < nev; i++)
+  /* Drain the whole Rust event queue: a single poll caps at BATCH, and
+     events stranded beyond it get no further wakeup.  poll_events never
+     re-dispatches, so repeating while it returns a full batch is bounded by
+     the queue length at entry (no livelock).  */
+  do
     {
-      /* Route this event to the frame whose window it belongs to;
-	 fall back to any frame for window-less events.  */
-      struct frame *ef = wlshm_frame_for_handle (terminal, evs[i].window);
-      /* If the event names a window with no live Emacs frame -- a menu/tooltip
-	 popup (Rust-only surface) or a frame deleted since the event was
-	 queued -- drop it.  Falling through to an unrelated frame here and
-	 dereferencing it (FRAME_DISPLAY_INFO / FRAME_PIXEL_TO_TEXT_WIDTH /
-	 change_frame_size / note_mouse_highlight below) is a crash.  */
-      if (evs[i].window != 0 && !ef)
-	continue;
-      if (ef)
-	f = ef;
-      /* Never process an event against a dead or not-yet-initialized frame.  */
-      if (!FRAME_LIVE_P (f) || !FRAME_X_OUTPUT (f))
-	continue;
+      block_input ();
+      nev = wlshm_window_poll_events (evs, BATCH);
+      unblock_input ();
 
-      int mods = 0;
-      uint32_t b = evs[i].modifiers;
-      if (b & WLSHM_MOD_SHIFT)
-	mods |= shift_modifier;
-      if (b & WLSHM_MOD_CTRL)
-	mods |= ctrl_modifier;
-      if (b & WLSHM_MOD_ALT)
-	mods |= meta_modifier;
-      if (b & WLSHM_MOD_LOGO)
-	mods |= super_modifier;
-
-      switch (evs[i].kind)
+      for (int i = 0; f && i < nev; i++)
 	{
-	case WlshmEventKind_Configure:
-	  {
-	    uint32_t cw2 = (uint32_t) evs[i].x, ch2 = (uint32_t) evs[i].y;
-	    if (cw2 >= 16 && ch2 >= 16)
-	      {
-		/* change_frame_size takes the NATIVE (pixel) size and does the
-		   pixel->text conversion itself (see dispnew.c), so pass the
-		   configured surface size straight through -- exactly like
-		   xterm's ConfigureNotify path.  Pre-converting here with
-		   FRAME_PIXEL_TO_TEXT_WIDTH double-subtracted the fringe and
-		   scroll-bar extents, shrinking the frame ~32px below the
-		   surface and leaving an unfilled strip on the right/bottom.  */
-		change_frame_size (f, (int) cw2, (int) ch2, false, true, false);
-		SET_FRAME_GARBAGED (f);
-	      }
-	  }
-	  break;
+	  /* Route this event to the frame whose window it belongs to;
+	     fall back to any frame for window-less events.  */
+	  struct frame *ef = wlshm_frame_for_handle (terminal, evs[i].window);
+	  /* If the event names a window with no live Emacs frame -- a menu/tooltip
+	     popup (Rust-only surface) or a frame deleted since the event was
+	     queued -- drop it.  Falling through to an unrelated frame here and
+	     dereferencing it (FRAME_DISPLAY_INFO / FRAME_PIXEL_TO_TEXT_WIDTH /
+	     change_frame_size / note_mouse_highlight below) is a crash.  */
+	  if (evs[i].window != 0 && !ef)
+	    continue;
+	  if (ef)
+	    f = ef;
+	  /* Never process an event against a dead or not-yet-initialized frame.  */
+	  if (!FRAME_LIVE_P (f) || !FRAME_X_OUTPUT (f))
+	    continue;
 
-	case WlshmEventKind_Close:
-	  {
-	    struct input_event ie;
-	    EVENT_INIT (ie);
-	    ie.kind = DELETE_WINDOW_EVENT;
-	    XSETFRAME (ie.frame_or_window, f);
-	    kbd_buffer_store_event_hold (&ie, hold_quit);
-	    count++;
-	  }
-	  break;
+	  int mods = 0;
+	  uint32_t b = evs[i].modifiers;
+	  if (b & WLSHM_MOD_SHIFT)
+	    mods |= shift_modifier;
+	  if (b & WLSHM_MOD_CTRL)
+	    mods |= ctrl_modifier;
+	  if (b & WLSHM_MOD_ALT)
+	    mods |= meta_modifier;
+	  if (b & WLSHM_MOD_LOGO)
+	    mods |= super_modifier;
 
-	case WlshmEventKind_FocusIn:
-	  {
-	    struct wlshm_display_info *dpyinfo = FRAME_DISPLAY_INFO (f);
-	    if (dpyinfo->x_focus_event_frame != f)
-	      {
-		wlshm_new_focus_frame (dpyinfo, f);
-		dpyinfo->x_focus_event_frame = f;
-		struct input_event ie;
-		EVENT_INIT (ie);
-		ie.kind = FOCUS_IN_EVENT;
-		XSETFRAME (ie.frame_or_window, f);
-		kbd_buffer_store_event_hold (&ie, hold_quit);
-		count++;
-	      }
-	  }
-	  break;
-
-	case WlshmEventKind_FocusOut:
-	  {
-	    struct wlshm_display_info *dpyinfo = FRAME_DISPLAY_INFO (f);
-	    if (dpyinfo->x_focus_event_frame == f)
-	      {
-		dpyinfo->x_focus_event_frame = NULL;
-		wlshm_new_focus_frame (dpyinfo, NULL);
-		struct input_event ie;
-		EVENT_INIT (ie);
-		ie.kind = FOCUS_OUT_EVENT;
-		XSETFRAME (ie.frame_or_window, f);
-		kbd_buffer_store_event_hold (&ie, hold_quit);
-		count++;
-	      }
-	  }
-	  break;
-
-	case WlshmEventKind_PointerMotion:
-	  {
-	    /* Drive hover highlighting (mouse-face, help-echo, buttons).  */
-	    struct wlshm_display_info *dpyinfo = FRAME_DISPLAY_INFO (f);
-	    int mx = evs[i].x, my = evs[i].y;
-	    dpyinfo->last_mouse_movement_time = evs[i].time;
-	    dpyinfo->last_mouse_motion_frame = f;
-	    dpyinfo->last_mouse_motion_x = mx;
-	    dpyinfo->last_mouse_motion_y = my;
-	    /* Scroll-bar drag tracking takes precedence over hover.  */
+	  switch (evs[i].kind)
 	    {
-	      struct scroll_bar *sb = wlshm_scroll_bar_at (f, mx, my);
-	      struct scroll_bar *active
-		= (struct scroll_bar *) dpyinfo->last_mouse_scroll_bar;
-	      if (sb || (active && active->dragging != -1))
-		{
-		  wlshm_scroll_bar_note_movement (sb ? sb : active, mx, my);
-		  need_present = true;
-		  break;
-		}
-	      dpyinfo->last_mouse_scroll_bar = NULL;
-	    }
-	    XRectangle *r = &dpyinfo->last_mouse_glyph;
-	    if (f != dpyinfo->last_mouse_glyph_frame
-		|| mx < r->x || mx >= r->x + r->width
-		|| my < r->y || my >= r->y + r->height)
+	    case WlshmEventKind_Configure:
 	      {
-		f->mouse_moved = true;
-		/* Only touch the glyph matrices when they're consistent: not
-		   mid-redisplay, initialized, and not garbaged.  Calling
-		   note_mouse_highlight otherwise can dereference half-built
-		   matrices and crash.  */
-		if (!redisplaying_p && f->glyphs_initialized_p
+		uint32_t cw2 = (uint32_t) evs[i].x, ch2 = (uint32_t) evs[i].y;
+		if (cw2 >= 16 && ch2 >= 16)
+		  {
+		    /* The Rust-side size/scale changed: drop the cached geometry
+		       BEFORE the resize is applied, so FRAME_SCROLL_COPY_UNSAFE
+		       sees the new scale for the redisplay this Configure
+		       triggers (the copy-scroll gating must not run on a stale
+		       scale).  */
+		    wlshm_geom_cache_invalidate (f);
+		    /* Record for the post-loop apply, keeping only the LAST
+		       Configure per frame in this batch.  change_frame_size takes
+		       the NATIVE (pixel) size and does the pixel->text conversion
+		       itself (see dispnew.c), so the configured surface size is
+		       passed straight through -- exactly like xterm's
+		       ConfigureNotify path.  (Pre-converting with
+		       FRAME_PIXEL_TO_TEXT_WIDTH double-subtracted the fringe and
+		       scroll-bar extents, shrinking the frame ~32px below the
+		       surface and leaving an unfilled strip on the
+		       right/bottom.)  */
+		    int c;
+		    for (c = 0; c < nconf; c++)
+		      if (configures[c].f == f)
+			break;
+		    if (c < nconf)
+		      {
+			configures[c].w = (int) cw2;
+			configures[c].h = (int) ch2;
+		      }
+		    else if (nconf < (int) (sizeof configures / sizeof configures[0]))
+		      {
+			configures[nconf].f = f;
+			configures[nconf].w = (int) cw2;
+			configures[nconf].h = (int) ch2;
+			nconf++;
+		      }
+		    else
+		      {
+			/* Table full (more frames configured in one batch than
+			   slots): apply immediately, uncoalesced.  */
+			change_frame_size (f, (int) cw2, (int) ch2,
+					   false, true, false);
+			SET_FRAME_GARBAGED (f);
+		      }
+		  }
+	      }
+	      break;
+
+	    case WlshmEventKind_Close:
+	      {
+		struct input_event ie;
+		EVENT_INIT (ie);
+		ie.kind = DELETE_WINDOW_EVENT;
+		XSETFRAME (ie.frame_or_window, f);
+		kbd_buffer_store_event_hold (&ie, hold_quit);
+		count++;
+	      }
+	      break;
+
+	    case WlshmEventKind_FocusIn:
+	      {
+		struct wlshm_display_info *dpyinfo = FRAME_DISPLAY_INFO (f);
+		if (dpyinfo->x_focus_event_frame != f)
+		  {
+		    wlshm_new_focus_frame (dpyinfo, f);
+		    dpyinfo->x_focus_event_frame = f;
+		    struct input_event ie;
+		    EVENT_INIT (ie);
+		    ie.kind = FOCUS_IN_EVENT;
+		    XSETFRAME (ie.frame_or_window, f);
+		    kbd_buffer_store_event_hold (&ie, hold_quit);
+		    count++;
+		  }
+	      }
+	      break;
+
+	    case WlshmEventKind_FocusOut:
+	      {
+		struct wlshm_display_info *dpyinfo = FRAME_DISPLAY_INFO (f);
+		if (dpyinfo->x_focus_event_frame == f)
+		  {
+		    dpyinfo->x_focus_event_frame = NULL;
+		    wlshm_new_focus_frame (dpyinfo, NULL);
+		    struct input_event ie;
+		    EVENT_INIT (ie);
+		    ie.kind = FOCUS_OUT_EVENT;
+		    XSETFRAME (ie.frame_or_window, f);
+		    kbd_buffer_store_event_hold (&ie, hold_quit);
+		    count++;
+		  }
+	      }
+	      break;
+
+	    case WlshmEventKind_PointerMotion:
+	      {
+		/* Drive hover highlighting (mouse-face, help-echo, buttons).  */
+		struct wlshm_display_info *dpyinfo = FRAME_DISPLAY_INFO (f);
+		int mx = evs[i].x, my = evs[i].y;
+		dpyinfo->last_mouse_movement_time = evs[i].time;
+		dpyinfo->last_mouse_motion_frame = f;
+		dpyinfo->last_mouse_motion_x = mx;
+		dpyinfo->last_mouse_motion_y = my;
+		/* Scroll-bar drag tracking takes precedence over hover.  */
+		{
+		  struct scroll_bar *sb = wlshm_scroll_bar_at (f, mx, my);
+		  struct scroll_bar *active
+		    = (struct scroll_bar *) dpyinfo->last_mouse_scroll_bar;
+		  if (sb || (active && active->dragging != -1))
+		    {
+		      wlshm_scroll_bar_note_movement (sb ? sb : active, mx, my);
+		      present_frame = f;
+		      break;
+		    }
+		  dpyinfo->last_mouse_scroll_bar = NULL;
+		}
+		XRectangle *r = &dpyinfo->last_mouse_glyph;
+		if (f != dpyinfo->last_mouse_glyph_frame
+		    || mx < r->x || mx >= r->x + r->width
+		    || my < r->y || my >= r->y + r->height)
+		  {
+		    f->mouse_moved = true;
+		    /* Only touch the glyph matrices when they're consistent: not
+		       mid-redisplay, initialized, and not garbaged.  Calling
+		       note_mouse_highlight otherwise can dereference half-built
+		       matrices and crash.  */
+		    if (!redisplaying_p && f->glyphs_initialized_p
+			&& !FRAME_GARBAGED_P (f) && FRAME_X_OUTPUT (f))
+		      {
+			wlshm_log ("motion %d,%d -> note_mouse_highlight", mx, my);
+			/* Track help-echo across this hover so we can post a
+			   HELP_EVENT when it changes (the echo-area / tooltip help
+			   shown over clickable elements, e.g. mode-line buttons).  */
+			previous_help_echo_string = help_echo_string;
+			help_echo_string = Qnil;
+			note_mouse_highlight (f, mx, my);
+			remember_mouse_glyph (f, mx, my, r);
+			dpyinfo->last_mouse_glyph_frame = f;
+			/* note_mouse_highlight draws the mouse-face highlight into
+			   the command list; present it so hover is visible without
+			   waiting for the next redisplay.  */
+			present_frame = f;
+			if (!NILP (help_echo_string)
+			    || !NILP (previous_help_echo_string))
+			  {
+			    Lisp_Object frame;
+			    XSETFRAME (frame, f);
+			    gen_help_event (help_echo_string, frame, help_echo_window,
+					    help_echo_object, help_echo_pos);
+			  }
+			wlshm_log ("motion %d,%d done", mx, my);
+		      }
+		    else
+		      wlshm_log ("motion %d,%d SKIPPED (redisp=%d init=%d garb=%d)",
+				mx, my, redisplaying_p, f->glyphs_initialized_p,
+				FRAME_GARBAGED_P (f));
+		  }
+	      }
+	      break;
+
+	    case WlshmEventKind_PointerLeave:
+	      {
+		/* The pointer left the surface: clear any active mouse-face
+		   highlight (mode-line button, link, ...) so it doesn't linger
+		   until the next redisplay.  Mirrors pgtk's leave_notify_event.
+		   Guarded like the motion path: touching the glyph matrices
+		   mid-redisplay or while garbaged can crash.  */
+		Mouse_HLInfo *hlinfo = MOUSE_HL_INFO (f);
+		if (hlinfo->mouse_face_mouse_frame == f
+		    && !redisplaying_p && f->glyphs_initialized_p
 		    && !FRAME_GARBAGED_P (f) && FRAME_X_OUTPUT (f))
 		  {
-		    wlshm_log ("motion %d,%d -> note_mouse_highlight", mx, my);
-		    /* Track help-echo across this hover so we can post a
-		       HELP_EVENT when it changes (the echo-area / tooltip help
-		       shown over clickable elements, e.g. mode-line buttons).  */
-		    previous_help_echo_string = help_echo_string;
-		    help_echo_string = Qnil;
-		    note_mouse_highlight (f, mx, my);
-		    remember_mouse_glyph (f, mx, my, r);
-		    dpyinfo->last_mouse_glyph_frame = f;
-		    /* note_mouse_highlight draws the mouse-face highlight into
-		       the command list; present it so hover is visible without
-		       waiting for the next redisplay.  */
-		    need_present = true;
-		    if (!NILP (help_echo_string)
-			|| !NILP (previous_help_echo_string))
-		      {
-			Lisp_Object frame;
-			XSETFRAME (frame, f);
-			gen_help_event (help_echo_string, frame, help_echo_window,
-					help_echo_object, help_echo_pos);
-		      }
-		    wlshm_log ("motion %d,%d done", mx, my);
+		    clear_mouse_face (hlinfo);
+		    hlinfo->mouse_face_mouse_frame = NULL;
+		    present_frame = f;
 		  }
-		else
-		  wlshm_log ("motion %d,%d SKIPPED (redisp=%d init=%d garb=%d)",
-			    mx, my, redisplaying_p, f->glyphs_initialized_p,
-			    FRAME_GARBAGED_P (f));
 	      }
-	  }
-	  break;
+	      break;
 
-	case WlshmEventKind_PointerLeave:
-	  {
-	    /* The pointer left the surface: clear any active mouse-face
-	       highlight (mode-line button, link, ...) so it doesn't linger
-	       until the next redisplay.  Mirrors pgtk's leave_notify_event.
-	       Guarded like the motion path: touching the glyph matrices
-	       mid-redisplay or while garbaged can crash.  */
-	    Mouse_HLInfo *hlinfo = MOUSE_HL_INFO (f);
-	    if (hlinfo->mouse_face_mouse_frame == f
-		&& !redisplaying_p && f->glyphs_initialized_p
-		&& !FRAME_GARBAGED_P (f) && FRAME_X_OUTPUT (f))
+	    case WlshmEventKind_PointerPress:
+	    case WlshmEventKind_PointerRelease:
 	      {
-		clear_mouse_face (hlinfo);
-		hlinfo->mouse_face_mouse_frame = NULL;
-		need_present = true;
-	      }
-	  }
-	  break;
+		struct wlshm_display_info *dpyinfo = FRAME_DISPLAY_INFO (f);
+		bool press = (evs[i].kind == WlshmEventKind_PointerPress);
+		wlshm_log ("button %s code=%u at %d,%d mods=%d",
+			  press ? "press" : "release", evs[i].button,
+			  evs[i].x, evs[i].y, mods);
 
-	case WlshmEventKind_PointerPress:
-	case WlshmEventKind_PointerRelease:
-	  {
-	    struct wlshm_display_info *dpyinfo = FRAME_DISPLAY_INFO (f);
-	    bool press = (evs[i].kind == WlshmEventKind_PointerPress);
-	    wlshm_log ("button %s code=%u at %d,%d mods=%d",
-		      press ? "press" : "release", evs[i].button,
-		      evs[i].x, evs[i].y, mods);
+		/* A click on a scroll bar becomes a SCROLL_BAR_CLICK_EVENT.  */
+		struct scroll_bar *sb = wlshm_scroll_bar_at (f, evs[i].x, evs[i].y);
+		if (!sb && !press)
+		  sb = (struct scroll_bar *) dpyinfo->last_mouse_scroll_bar;
+		if (sb)
+		  {
+		    if (press)
+		      {
+			int rel = (sb->horizontal
+				   ? evs[i].x - sb->left - HORIZONTAL_SCROLL_BAR_LEFT_BORDER
+				   : evs[i].y - sb->top - VERTICAL_SCROLL_BAR_TOP_BORDER);
+			int minh = (sb->horizontal
+				    ? HORIZONTAL_SCROLL_BAR_MIN_HANDLE
+				    : VERTICAL_SCROLL_BAR_MIN_HANDLE);
+			if (rel >= sb->start && rel < sb->end + minh)
+			  sb->dragging = rel - sb->start;
+			dpyinfo->grabbed |= wlshm_grab_bit (evs[i].button);
+			dpyinfo->last_mouse_scroll_bar = sb;
+		      }
+		    else
+		      dpyinfo->grabbed &= ~wlshm_grab_bit (evs[i].button);
+		    struct input_event sie;
+		    wlshm_scroll_bar_handle_click (sb, evs[i].button, mods,
+						   evs[i].x, evs[i].y, press, &sie);
+		    sie.timestamp = evs[i].time;
+		    kbd_buffer_store_event_hold (&sie, hold_quit);
+		    count++;
+		    present_frame = f;
+		    break;
+		  }
 
-	    /* A click on a scroll bar becomes a SCROLL_BAR_CLICK_EVENT.  */
-	    struct scroll_bar *sb = wlshm_scroll_bar_at (f, evs[i].x, evs[i].y);
-	    if (!sb && !press)
-	      sb = (struct scroll_bar *) dpyinfo->last_mouse_scroll_bar;
-	    if (sb)
-	      {
+		/* A click in the tab bar becomes a tab-bar event so tabs switch
+		   buffers (mirrors pgtk_handle_event's tab-bar path).  Hover
+		   highlight is already handled by note_mouse_highlight on motion.  */
+		Lisp_Object tab_bar_arg = Qnil;
+		bool tab_bar_p = false;
+		if (WINDOWP (f->tab_bar_window)
+		    && WINDOW_TOTAL_LINES (XWINDOW (f->tab_bar_window)))
+		  {
+		    Lisp_Object window
+		      = window_from_coordinates (f, evs[i].x, evs[i].y, 0,
+						 true, true, true);
+		    tab_bar_p = EQ (window, f->tab_bar_window);
+		    if (tab_bar_p)
+		      tab_bar_arg = handle_tab_bar_click (f, evs[i].x, evs[i].y,
+							  press, mods);
+		  }
+
+		/* A click in the tool bar activates the button: handle_tool_bar_click
+		   highlights it on press and runs its command on release.  Mirrors
+		   xterm/pgtk; without this the Emacs-drawn tool bar was inert.  */
+		bool tool_bar_p = false;
+		if (WINDOWP (f->tool_bar_window)
+		    && WINDOW_TOTAL_LINES (XWINDOW (f->tool_bar_window)))
+		  {
+		    Lisp_Object window
+		      = window_from_coordinates (f, evs[i].x, evs[i].y, 0,
+						 true, true, true);
+		    tool_bar_p = (EQ (window, f->tool_bar_window)
+				  && (press || f->last_tool_bar_item != -1));
+		    /* Only the primary buttons (left/middle/right) activate tool-bar
+		       items; side buttons don't (mirrors xterm's button < 4).  */
+		    if (tool_bar_p && evs[i].button < 3)
+		      handle_tool_bar_click (f, evs[i].x, evs[i].y, press, mods);
+		  }
+
 		if (press)
 		  {
-		    int rel = (sb->horizontal
-			       ? evs[i].x - sb->left - HORIZONTAL_SCROLL_BAR_LEFT_BORDER
-			       : evs[i].y - sb->top - VERTICAL_SCROLL_BAR_TOP_BORDER);
-		    int minh = (sb->horizontal
-				? HORIZONTAL_SCROLL_BAR_MIN_HANDLE
-				: VERTICAL_SCROLL_BAR_MIN_HANDLE);
-		    if (rel >= sb->start && rel < sb->end + minh)
-		      sb->dragging = rel - sb->start;
 		    dpyinfo->grabbed |= wlshm_grab_bit (evs[i].button);
-		    dpyinfo->last_mouse_scroll_bar = sb;
+		    dpyinfo->last_mouse_frame = f;
+		    /* The pointer is stationary at the press; clear any pending
+		       "moved" flag from gliding onto the target.  Otherwise the
+		       first event a down-mouse handler reads under `track-mouse'
+		       (e.g. widget-button-click) is a synthetic motion, which it
+		       treats as a drag and cancels -- so widget/custom buttons
+		       needed a second click.  A real drag re-sets mouse_moved on
+		       the next motion after the press.  */
+		    f->mouse_moved = false;
 		  }
 		else
 		  dpyinfo->grabbed &= ~wlshm_grab_bit (evs[i].button);
-		struct input_event sie;
-		wlshm_scroll_bar_handle_click (sb, evs[i].button, mods,
-					       evs[i].x, evs[i].y, press, &sie);
-		sie.timestamp = evs[i].time;
-		kbd_buffer_store_event_hold (&sie, hold_quit);
-		count++;
-		need_present = true;
-		break;
-	      }
 
-	    /* A click in the tab bar becomes a tab-bar event so tabs switch
-	       buffers (mirrors pgtk_handle_event's tab-bar path).  Hover
-	       highlight is already handled by note_mouse_highlight on motion.  */
-	    Lisp_Object tab_bar_arg = Qnil;
-	    bool tab_bar_p = false;
-	    if (WINDOWP (f->tab_bar_window)
-		&& WINDOW_TOTAL_LINES (XWINDOW (f->tab_bar_window)))
-	      {
-		Lisp_Object window
-		  = window_from_coordinates (f, evs[i].x, evs[i].y, 0,
-					     true, true, true);
-		tab_bar_p = EQ (window, f->tab_bar_window);
-		if (tab_bar_p)
-		  tab_bar_arg = handle_tab_bar_click (f, evs[i].x, evs[i].y,
-						      press, mods);
+		/* Suppress the generic click for a tab-bar press not yet resolved to
+		   a tab, and for any tool-bar click (handled above); otherwise emit
+		   it, carrying the tab-bar arg when present so the tab-bar keymap
+		   runs.  */
+		if (!(tab_bar_p && NILP (tab_bar_arg)) && !tool_bar_p)
+		  {
+		    struct input_event ie;
+		    EVENT_INIT (ie);
+		    ie.kind = MOUSE_CLICK_EVENT;
+		    ie.code = evs[i].button;
+		    ie.timestamp = evs[i].time;
+		    ie.modifiers = mods | (press ? down_modifier : up_modifier);
+		    XSETINT (ie.x, evs[i].x);
+		    XSETINT (ie.y, evs[i].y);
+		    XSETFRAME (ie.frame_or_window, f);
+		    if (!NILP (tab_bar_arg))
+		      ie.arg = tab_bar_arg;
+		    kbd_buffer_store_event_hold (&ie, hold_quit);
+		    count++;
+		  }
+		/* Forget any pressed tool-bar item once the click is not on the tool
+		   bar (mirrors xterm), so a release elsewhere doesn't re-fire it.  */
+		if (!tool_bar_p)
+		  f->last_tool_bar_item = -1;
+		wlshm_log ("button stored");
 	      }
+	      break;
 
-	    /* A click in the tool bar activates the button: handle_tool_bar_click
-	       highlights it on press and runs its command on release.  Mirrors
-	       xterm/pgtk; without this the Emacs-drawn tool bar was inert.  */
-	    bool tool_bar_p = false;
-	    if (WINDOWP (f->tool_bar_window)
-		&& WINDOW_TOTAL_LINES (XWINDOW (f->tool_bar_window)))
+	    case WlshmEventKind_Drop:
 	      {
-		Lisp_Object window
-		  = window_from_coordinates (f, evs[i].x, evs[i].y, 0,
-					     true, true, true);
-		tool_bar_p = (EQ (window, f->tool_bar_window)
-			      && (press || f->last_tool_bar_item != -1));
-		/* Only the primary buttons (left/middle/right) activate tool-bar
-		   items; side buttons don't (mirrors xterm's button < 4).  */
-		if (tool_bar_p && evs[i].button < 3)
-		  handle_tool_bar_click (f, evs[i].x, evs[i].y, press, mods);
+		/* A drag-and-drop drop landed on this frame.  The Rust side has
+		   already received the payload over a pipe; fetch it via the
+		   side-channel getter (the POD event can't carry a string).  Its
+		   `.button` flags whether the payload is a `text/uri-list`.  We
+		   build a DRAG_N_DROP_EVENT whose .arg is `(uri-list . STRING)` or
+		   `(text . STRING)`; the wlshm `[drag-n-drop]` handler in
+		   wlshm-win.el routes it through dnd.el.  */
+		const uint8_t *ptr = NULL;
+		uintptr_t len = 0;
+		if (wlshm_window_get_drop (&ptr, &len) == 0 && ptr && len > 0)
+		  {
+		    /* Payload is UTF-8 (text or uri-list); decode like the
+		       clipboard getter so multibyte text/filenames survive.  */
+		    Lisp_Object bytes
+		      = make_unibyte_string ((const char *) ptr, (ptrdiff_t) len);
+		    Lisp_Object text
+		      = code_convert_string_norecord (bytes, Qutf_8, false);
+		    Lisp_Object tag = evs[i].button ? intern ("uri-list")
+						    : intern ("text");
+		    struct input_event ie;
+		    EVENT_INIT (ie);
+		    ie.kind = DRAG_N_DROP_EVENT;
+		    ie.modifiers = 0;
+		    ie.timestamp = evs[i].time;
+		    ie.arg = Fcons (tag, text);
+		    XSETINT (ie.x, evs[i].x);
+		    XSETINT (ie.y, evs[i].y);
+		    XSETFRAME (ie.frame_or_window, f);
+		    kbd_buffer_store_event_hold (&ie, hold_quit);
+		    count++;
+		  }
 	      }
+	      break;
 
-	    if (press)
+	    case WlshmEventKind_Preedit:
 	      {
-		dpyinfo->grabbed |= wlshm_grab_bit (evs[i].button);
-		dpyinfo->last_mouse_frame = f;
-		/* The pointer is stationary at the press; clear any pending
-		   "moved" flag from gliding onto the target.  Otherwise the
-		   first event a down-mouse handler reads under `track-mouse'
-		   (e.g. widget-button-click) is a synthetic motion, which it
-		   treats as a drag and cancels -- so widget/custom buttons
-		   needed a second click.  A real drag re-sets mouse_moved on
-		   the next motion after the press.  */
-		f->mouse_moved = false;
-	      }
-	    else
-	      dpyinfo->grabbed &= ~wlshm_grab_bit (evs[i].button);
-
-	    /* Suppress the generic click for a tab-bar press not yet resolved to
-	       a tab, and for any tool-bar click (handled above); otherwise emit
-	       it, carrying the tab-bar arg when present so the tab-bar keymap
-	       runs.  */
-	    if (!(tab_bar_p && NILP (tab_bar_arg)) && !tool_bar_p)
-	      {
+		/* The IME (zwp_text_input_v3) updated the in-progress composition.
+		   The text comes via a side-channel getter (the POD event can't
+		   carry a string); an empty string clears the preedit.  We post a
+		   backend-agnostic PREEDIT_TEXT_EVENT whose .arg is the same
+		   list-of-parts shape pgtk/x/android use: ((STRING . ATTRS) ...).
+		   text-input-v3 gives a single unstyled segment, so we build one
+		   part marked underlined; the `[preedit-text]' handler in
+		   wlshm-win.el draws it as a zero-width overlay at point.  Committed
+		   (final) IME text arrives separately as ordinary KeyPress events.  */
+		const uint8_t *ptr = NULL;
+		uintptr_t len = 0;
+		Lisp_Object arg = Qnil;
+		if (wlshm_window_get_preedit (&ptr, &len) == 0 && ptr && len > 0)
+		  {
+		    Lisp_Object bytes
+		      = make_unibyte_string ((const char *) ptr, (ptrdiff_t) len);
+		    Lisp_Object text
+		      = code_convert_string_norecord (bytes, Qutf_8, false);
+		    /* One part: (TEXT (ul . t)) -> underlined composition.  */
+		    Lisp_Object part
+		      = list2 (text, Fcons (intern ("ul"), Qt));
+		    arg = list1 (part);
+		  }
+		/* arg == Qnil clears the preedit (composition ended/empty).  */
 		struct input_event ie;
 		EVENT_INIT (ie);
-		ie.kind = MOUSE_CLICK_EVENT;
-		ie.code = evs[i].button;
-		ie.timestamp = evs[i].time;
-		ie.modifiers = mods | (press ? down_modifier : up_modifier);
-		XSETINT (ie.x, evs[i].x);
-		XSETINT (ie.y, evs[i].y);
-		XSETFRAME (ie.frame_or_window, f);
-		if (!NILP (tab_bar_arg))
-		  ie.arg = tab_bar_arg;
-		kbd_buffer_store_event_hold (&ie, hold_quit);
-		count++;
-	      }
-	    /* Forget any pressed tool-bar item once the click is not on the tool
-	       bar (mirrors xterm), so a release elsewhere doesn't re-fire it.  */
-	    if (!tool_bar_p)
-	      f->last_tool_bar_item = -1;
-	    wlshm_log ("button stored");
-	  }
-	  break;
-
-	case WlshmEventKind_Drop:
-	  {
-	    /* A drag-and-drop drop landed on this frame.  The Rust side has
-	       already received the payload over a pipe; fetch it via the
-	       side-channel getter (the POD event can't carry a string).  Its
-	       `.button` flags whether the payload is a `text/uri-list`.  We
-	       build a DRAG_N_DROP_EVENT whose .arg is `(uri-list . STRING)` or
-	       `(text . STRING)`; the wlshm `[drag-n-drop]` handler in
-	       wlshm-win.el routes it through dnd.el.  */
-	    const uint8_t *ptr = NULL;
-	    uintptr_t len = 0;
-	    if (wlshm_window_get_drop (&ptr, &len) == 0 && ptr && len > 0)
-	      {
-		/* Payload is UTF-8 (text or uri-list); decode like the
-		   clipboard getter so multibyte text/filenames survive.  */
-		Lisp_Object bytes
-		  = make_unibyte_string ((const char *) ptr, (ptrdiff_t) len);
-		Lisp_Object text
-		  = code_convert_string_norecord (bytes, Qutf_8, false);
-		Lisp_Object tag = evs[i].button ? intern ("uri-list")
-						: intern ("text");
-		struct input_event ie;
-		EVENT_INIT (ie);
-		ie.kind = DRAG_N_DROP_EVENT;
+		ie.kind = PREEDIT_TEXT_EVENT;
+		ie.arg = arg;
+		ie.code = 0;
 		ie.modifiers = 0;
 		ie.timestamp = evs[i].time;
-		ie.arg = Fcons (tag, text);
-		XSETINT (ie.x, evs[i].x);
-		XSETINT (ie.y, evs[i].y);
 		XSETFRAME (ie.frame_or_window, f);
 		kbd_buffer_store_event_hold (&ie, hold_quit);
 		count++;
 	      }
-	  }
-	  break;
+	      break;
 
-	case WlshmEventKind_Preedit:
-	  {
-	    /* The IME (zwp_text_input_v3) updated the in-progress composition.
-	       The text comes via a side-channel getter (the POD event can't
-	       carry a string); an empty string clears the preedit.  We post a
-	       backend-agnostic PREEDIT_TEXT_EVENT whose .arg is the same
-	       list-of-parts shape pgtk/x/android use: ((STRING . ATTRS) ...).
-	       text-input-v3 gives a single unstyled segment, so we build one
-	       part marked underlined; the `[preedit-text]' handler in
-	       wlshm-win.el draws it as a zero-width overlay at point.  Committed
-	       (final) IME text arrives separately as ordinary KeyPress events.  */
-	    const uint8_t *ptr = NULL;
-	    uintptr_t len = 0;
-	    Lisp_Object arg = Qnil;
-	    if (wlshm_window_get_preedit (&ptr, &len) == 0 && ptr && len > 0)
+	    case WlshmEventKind_PointerAxis:
 	      {
-		Lisp_Object bytes
-		  = make_unibyte_string ((const char *) ptr, (ptrdiff_t) len);
-		Lisp_Object text
-		  = code_convert_string_norecord (bytes, Qutf_8, false);
-		/* One part: (TEXT (ul . t)) -> underlined composition.  */
-		Lisp_Object part
-		  = list2 (text, Fcons (intern ("ul"), Qt));
-		arg = list1 (part);
+		/* Vertical takes precedence; emit one wheel event per notch.  */
+		int steps = evs[i].axis_y != 0 ? evs[i].axis_y : evs[i].axis_x;
+		bool horiz = (evs[i].axis_y == 0 && evs[i].axis_x != 0);
+		int n = eabs (steps);
+		if (n > 10)
+		  n = 10;
+		for (int s = 0; s < n; s++)
+		  {
+		    struct input_event ie;
+		    EVENT_INIT (ie);
+		    ie.kind = horiz ? HORIZ_WHEEL_EVENT : WHEEL_EVENT;
+		    ie.timestamp = evs[i].time;
+		    ie.modifiers = mods | (steps > 0 ? down_modifier : up_modifier);
+		    XSETINT (ie.x, evs[i].x);
+		    XSETINT (ie.y, evs[i].y);
+		    XSETFRAME (ie.frame_or_window, f);
+		    kbd_buffer_store_event_hold (&ie, hold_quit);
+		    count++;
+		  }
 	      }
-	    /* arg == Qnil clears the preedit (composition ended/empty).  */
-	    struct input_event ie;
-	    EVENT_INIT (ie);
-	    ie.kind = PREEDIT_TEXT_EVENT;
-	    ie.arg = arg;
-	    ie.code = 0;
-	    ie.modifiers = 0;
-	    ie.timestamp = evs[i].time;
-	    XSETFRAME (ie.frame_or_window, f);
-	    kbd_buffer_store_event_hold (&ie, hold_quit);
-	    count++;
-	  }
-	  break;
+	      break;
 
-	case WlshmEventKind_PointerAxis:
-	  {
-	    /* Vertical takes precedence; emit one wheel event per notch.  */
-	    int steps = evs[i].axis_y != 0 ? evs[i].axis_y : evs[i].axis_x;
-	    bool horiz = (evs[i].axis_y == 0 && evs[i].axis_x != 0);
-	    int n = eabs (steps);
-	    if (n > 10)
-	      n = 10;
-	    for (int s = 0; s < n; s++)
+	    case WlshmEventKind_KeyPress:
 	      {
 		struct input_event ie;
 		EVENT_INIT (ie);
-		ie.kind = horiz ? HORIZ_WHEEL_EVENT : WHEEL_EVENT;
-		ie.timestamp = evs[i].time;
-		ie.modifiers = mods | (steps > 0 ? down_modifier : up_modifier);
-		XSETINT (ie.x, evs[i].x);
-		XSETINT (ie.y, evs[i].y);
 		XSETFRAME (ie.frame_or_window, f);
+		uint32_t cp = evs[i].unichar, ks = evs[i].keysym;
+		/* Treat only genuinely printable codepoints as text; control
+		   chars (Backspace -> ^H, Tab, Return, Escape, ...) must go
+		   through the keysym path so they map to <backspace>, <tab>, etc.
+		   rather than C-h, C-i, ...  */
+		bool printable = cp >= 32 && cp != 127;
+		if ((mods & ctrl_modifier) && cp > 0 && cp < 32
+		    && wlshm_ascii_keysym_p (ks))
+		  {
+		    /* Some xkb layouts report Ctrl-letter as the resulting ASCII
+		       control code rather than as a printable base keysym plus a
+		       control modifier.  Preserve that as an ASCII keystroke so
+		       C-g is always recognized as quit_char.  Restrict this to
+		       ASCII base keysyms: physical Backspace/Tab/Return/Escape
+		       keys can also report control codepoints, but Emacs expects
+		       those as symbolic function-key events with modifiers.  */
+		    ie.kind = ASCII_KEYSTROKE_EVENT;
+		    ie.code = cp;
+		    ie.modifiers = mods;
+		  }
+		else if (printable && mods == 0)
+		  {
+		    /* Plain printable text (shift already applied).  */
+		    ie.kind = (cp < 128) ? ASCII_KEYSTROKE_EVENT
+			      : MULTIBYTE_CHAR_KEYSTROKE_EVENT;
+		    ie.code = cp;
+		  }
+		else if (wlshm_ascii_keysym_p (ks))
+		  {
+		    /* Printable base key with modifiers, e.g. C-x.  */
+		    ie.kind = ASCII_KEYSTROKE_EVENT;
+		    ie.code = ks;
+		    ie.modifiers = mods;
+		  }
+		else
+		  {
+		    /* Function/navigation key: the xkb keysym matches X, which
+		       keyboard.c maps to a Lisp symbol.  */
+		    ie.kind = NON_ASCII_KEYSTROKE_EVENT;
+		    ie.code = ks;
+		    ie.modifiers = mods;
+		  }
 		kbd_buffer_store_event_hold (&ie, hold_quit);
 		count++;
 	      }
-	  }
-	  break;
+	      break;
 
-	case WlshmEventKind_KeyPress:
-	default:
-	  {
-	    struct input_event ie;
-	    EVENT_INIT (ie);
-	    XSETFRAME (ie.frame_or_window, f);
-	    uint32_t cp = evs[i].unichar, ks = evs[i].keysym;
-	    /* Treat only genuinely printable codepoints as text; control
-	       chars (Backspace -> ^H, Tab, Return, Escape, ...) must go
-	       through the keysym path so they map to <backspace>, <tab>, etc.
-	       rather than C-h, C-i, ...  */
-	    bool printable = cp >= 32 && cp != 127;
-	    if ((mods & ctrl_modifier) && cp > 0 && cp < 32
-		&& wlshm_ascii_keysym_p (ks))
-	      {
-		/* Some xkb layouts report Ctrl-letter as the resulting ASCII
-		   control code rather than as a printable base keysym plus a
-		   control modifier.  Preserve that as an ASCII keystroke so
-		   C-g is always recognized as quit_char.  Restrict this to
-		   ASCII base keysyms: physical Backspace/Tab/Return/Escape
-		   keys can also report control codepoints, but Emacs expects
-		   those as symbolic function-key events with modifiers.  */
-		ie.kind = ASCII_KEYSTROKE_EVENT;
-		ie.code = cp;
-		ie.modifiers = mods;
-	      }
-	    else if (printable && mods == 0)
-	      {
-		/* Plain printable text (shift already applied).  */
-		ie.kind = (cp < 128) ? ASCII_KEYSTROKE_EVENT
-			  : MULTIBYTE_CHAR_KEYSTROKE_EVENT;
-		ie.code = cp;
-	      }
-	    else if (wlshm_ascii_keysym_p (ks))
-	      {
-		/* Printable base key with modifiers, e.g. C-x.  */
-		ie.kind = ASCII_KEYSTROKE_EVENT;
-		ie.code = ks;
-		ie.modifiers = mods;
-	      }
-	    else
-	      {
-		/* Function/navigation key: the xkb keysym matches X, which
-		   keyboard.c maps to a Lisp symbol.  */
-		ie.kind = NON_ASCII_KEYSTROKE_EVENT;
-		ie.code = ks;
-		ie.modifiers = mods;
-	      }
-	    kbd_buffer_store_event_hold (&ie, hold_quit);
-	    count++;
-	  }
-	  break;
+	    default:
+	      /* An event kind added on the Rust side but not handled here must
+		 never fall through and decode as a keystroke.  */
+	      wlshm_log ("unhandled event kind %d", (int) evs[i].kind);
+	      break;
+	    }
 	}
+    }
+  while (nev == BATCH);
+
+  /* Apply the coalesced Configure sizes (the last one per frame wins).  The
+     cache invalidation is repeated right before each resize (idempotent) so
+     the redisplay triggered by change_frame_size sees the new scale.  */
+  for (int c = 0; c < nconf; c++)
+    {
+      struct frame *cf = configures[c].f;
+      if (!FRAME_LIVE_P (cf) || !FRAME_X_OUTPUT (cf))
+	continue;
+      wlshm_geom_cache_invalidate (cf);
+      change_frame_size (cf, configures[c].w, configures[c].h,
+			 false, true, false);
+      SET_FRAME_GARBAGED (cf);
     }
 
   /* Flush the hover highlight to the screen (mouse-face on buttons, links,
@@ -4286,12 +4440,13 @@ wlshm_read_socket (struct terminal *terminal, struct input_event *hold_quit)
      mid-redisplay, live, initialized, not garbaged, with output data.
      Presenting a half-built frame (e.g. a just-created child frame) can
      dereference an inconsistent glyph matrix and crash.  */
-  if (need_present && !redisplaying_p
-      && FRAME_LIVE_P (f) && FRAME_X_OUTPUT (f)
-      && f->glyphs_initialized_p && !FRAME_GARBAGED_P (f))
+  if (present_frame && !redisplaying_p
+      && FRAME_LIVE_P (present_frame) && FRAME_X_OUTPUT (present_frame)
+      && present_frame->glyphs_initialized_p
+      && !FRAME_GARBAGED_P (present_frame))
     {
       block_input ();
-      wlshm_present_canvas (f);
+      wlshm_present_canvas (present_frame);
       unblock_input ();
     }
 
@@ -5025,25 +5180,30 @@ wlshm_menu_rows (int *nout)
   return rows;
 }
 
-/* menu_show_hook: display the prepared menu_items as a popup and return the
-   selected value (or Qnil if cancelled).  */
-static Lisp_Object
-wlshm_menu_show (struct frame *f, int x, int y, int menuflags,
-		Lisp_Object title, const char **error_name)
+/* Shared popup scaffold for wlshm_menu_show / wlshm_popup_dialog: probe-render
+   ROWS for geometry, open a popup window (kind 1) titled TITLE anchored at the
+   frame-local (X, Y), and run the modal loop.  Takes ownership of ROWS: they
+   are freed on ANY exit (including a non-local one) via the unwind protector,
+   so the chosen row's payload is captured into *SEL_OUT / *VALUE_OUT before
+   the unbind.  Returns the chosen row (>= 0), -1 if the user cancelled, or
+   -2 if the popup could not be set up (render/open failure).  */
+static int
+wlshm_popup_common (struct frame *f, struct wlshm_mrow *rows, int n,
+		    Lisp_Object title, int x, int y,
+		    ptrdiff_t *sel_out, Lisp_Object *value_out)
 {
-  if (error_name)
-    *error_name = NULL;
-  int n;
-  struct wlshm_mrow *rows = wlshm_menu_rows (&n);
-  if (n == 0)
-    { wlshm_free_rows (rows, n); return Qnil; }
+  *sel_out = -1;
+  *value_out = Qnil;
 
   int hi = wlshm_menu_first_selectable (rows, n);
   int mw, mh, rh, seph;
   cairo_surface_t *probe = wlshm_render_menu (f, rows, n, hi, &mw, &mh, &rh, &seph);
   /* Bail if rendering failed: the geometry out-params are then unset.  */
   if (!probe)
-    { wlshm_free_rows (rows, n); return Qnil; }
+    {
+      wlshm_free_rows (rows, n);
+      return -2;
+    }
   cairo_surface_destroy (probe);	/* just for geometry */
 
   /* Free the rows + close the popup on ANY exit (incl. a non-local one).  Arm
@@ -5057,7 +5217,10 @@ wlshm_menu_show (struct frame *f, int x, int y, int menuflags,
   char *tc = STRINGP (title) ? SSDATA (ENCODE_UTF_8 (title)) : NULL;
   uint64_t pw = wlshm_window_open (tc, WLSHM_FRAME_HANDLE (f), 1 /* Popup */);
   if (pw == 0)
-    return unbind_to (count, Qnil);	/* protector frees rows */
+    {
+      unbind_to (count, Qnil);	/* protector frees rows */
+      return -2;
+    }
   md->pw = pw;
 
   wlshm_window_set_geometry (pw, x, y, mw, mh);
@@ -5066,10 +5229,33 @@ wlshm_menu_show (struct frame *f, int x, int y, int menuflags,
   int chosen = wlshm_menu_modal_loop (f, pw, rows, n, mw, mh, rh, seph, &hi);
   unblock_input ();
 
-  /* Capture the selected menu_items slot BEFORE unbind frees `rows'.  */
-  ptrdiff_t sel = (chosen >= 0 && rows[chosen].index >= 0) ? rows[chosen].index : -1;
+  /* Capture the selected row's payload BEFORE unbind frees `rows'.  */
+  if (chosen >= 0)
+    {
+      *sel_out = rows[chosen].index;
+      *value_out = rows[chosen].value;
+    }
   unbind_to (count, Qnil);	/* closes pw + frees rows/strings */
-  return sel >= 0 ? wlshm_menu_value (sel, menuflags) : Qnil;
+  return chosen;
+}
+
+/* menu_show_hook: display the prepared menu_items as a popup and return the
+   selected value (or Qnil if cancelled).  */
+static Lisp_Object
+wlshm_menu_show (struct frame *f, int x, int y, int menuflags,
+		Lisp_Object title, const char **error_name)
+{
+  if (error_name)
+    *error_name = NULL;
+  int n;
+  struct wlshm_mrow *rows = wlshm_menu_rows (&n);
+  if (n == 0)
+    { wlshm_free_rows (rows, n); return Qnil; }
+
+  ptrdiff_t sel;
+  Lisp_Object value;
+  int chosen = wlshm_popup_common (f, rows, n, title, x, y, &sel, &value);
+  return (chosen >= 0 && sel >= 0) ? wlshm_menu_value (sel, menuflags) : Qnil;
 }
 
 /* popup_dialog_hook: CONTENTS is (TITLE (BUTTON . VALUE) ...).  Draw the
@@ -5085,49 +5271,41 @@ wlshm_popup_dialog (struct frame *f, Lisp_Object header, Lisp_Object contents)
   struct wlshm_mrow *rows = xnmalloc (cnt + 1, sizeof *rows);
   int n = 0;
   if (STRINGP (question))
-    rows[n++] = (struct wlshm_mrow) { .label_s = wlshm_dup_utf8 (question),
-      .key_s = NULL, .value = Qnil, .index = -1, .enabled = false,
-      .title = true };
+    {
+      /* Two statements (assign, then increment), matching
+	 Fwlshm_test_menu_render: `rows[n++] = {... .index = n ...}' reads and
+	 modifies N unsequenced, which is undefined behavior.  */
+      rows[n] = (struct wlshm_mrow) { .label_s = wlshm_dup_utf8 (question),
+	.key_s = NULL, .value = Qnil, .index = -1, .enabled = false,
+	.title = true };
+      n++;
+    }
   for (Lisp_Object t = items; CONSP (t); t = CDR (t))
     {
       Lisp_Object it = CAR (t);
       if (CONSP (it) && STRINGP (CAR (it)))
-	rows[n++] = (struct wlshm_mrow) { .label_s = wlshm_dup_utf8 (CAR (it)),
-	  .key_s = NULL, .value = CDR (it), .index = n, .enabled = true,
-	  .title = false };
+	{
+	  rows[n] = (struct wlshm_mrow) { .label_s = wlshm_dup_utf8 (CAR (it)),
+	    .key_s = NULL, .value = CDR (it), .index = n, .enabled = true,
+	    .title = false };
+	  n++;
+	}
       else if (NILP (it))
-	rows[n++] = (struct wlshm_mrow) { .label_s = NULL,
-	  .key_s = NULL, .value = Qnil, .index = -1, .separator = true };
+	{
+	  rows[n] = (struct wlshm_mrow) { .label_s = NULL,
+	    .key_s = NULL, .value = Qnil, .index = -1, .separator = true };
+	  n++;
+	}
     }
   if (n == 0)
     { wlshm_free_rows (rows, n); return Qnil; }
 
-  int hi = wlshm_menu_first_selectable (rows, n);
-  int mw, mh, rh, seph;
-  cairo_surface_t *probe = wlshm_render_menu (f, rows, n, hi, &mw, &mh, &rh, &seph);
-  /* Bail if rendering failed: the geometry out-params are then unset.  */
-  if (!probe)
-    { wlshm_free_rows (rows, n); return Qnil; }
-  cairo_surface_destroy (probe);
-  /* Arm the rows/popup cleanup BEFORE opening the popup (see wlshm_menu_show).  */
-  struct wlshm_menu_data *md = xmalloc (sizeof *md);
-  *md = (struct wlshm_menu_data){ rows, n, 0 };
-  specpdl_ref count = SPECPDL_INDEX ();
-  record_unwind_protect_ptr (wlshm_free_menu_data, md);
-
-  uint64_t pw = wlshm_window_open (STRINGP (question) ? SSDATA (ENCODE_UTF_8 (question)) : NULL,
-				   WLSHM_FRAME_HANDLE (f), 1);
-  if (pw == 0)
-    return unbind_to (count, Qnil);	/* protector frees rows */
-  md->pw = pw;
-
-  wlshm_window_set_geometry (pw, 0, 0, mw, mh);
-  block_input ();
-  int chosen = wlshm_menu_modal_loop (f, pw, rows, n, mw, mh, rh, seph, &hi);
-  unblock_input ();
-  /* Capture the chosen button value BEFORE unbind frees `rows'.  */
-  Lisp_Object result = (chosen >= 0) ? rows[chosen].value : Qnil;
-  unbind_to (count, Qnil);	/* closes pw + frees rows/strings */
+  ptrdiff_t sel;
+  Lisp_Object result;
+  int chosen = wlshm_popup_common (f, rows, n, question, 0, 0, &sel, &result);
+  /* Setup failure (render/open): return nil WITHOUT quitting, as before.  */
+  if (chosen == -2)
+    return Qnil;
   /* A cancelled dialog signals quit, like the other backends.  */
   if (chosen < 0)
     quit ();

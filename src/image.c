@@ -304,7 +304,6 @@ image_pix_container_create_from_bitmap_data (char *data, unsigned int width,
   return pimg;
 }
 
-#ifdef USE_CAIRO
 static cairo_surface_t *
 cr_create_surface_from_pix_containers (Emacs_Pix_Container pimg,
 				       Emacs_Pix_Container mask)
@@ -366,7 +365,6 @@ cr_put_image_to_cr_data (struct image *img)
 
   img->cr_data = pattern;
 }
-#endif	/* USE_CAIRO */
 
 #endif	/* USE_CAIRO (wlshm builds always define USE_CAIRO) */
 

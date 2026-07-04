@@ -151,8 +151,6 @@ struct wlshm_output
   Emacs_Cursor bottom_left_corner_cursor;
   Emacs_Cursor current_pointer;
 
-  Emacs_GC cursor_xgcv;
-
   /* Window ids, kept because generic code expects them.  */
   Window window_desc, parent_desc;
   char explicit_parent;
@@ -190,29 +188,22 @@ struct wlshm_output
   bool damage_valid;
   int damage_x, damage_y, damage_w, damage_h;
 
+  /* Cached Rust-side window geometry (logical px) and scale (scale*120), so
+     the draw hot path doesn't cross the FFI for every fill/glyph.  Invalid
+     (false) at frame creation (xzalloc); invalidated on every Configure and
+     after any set_size/set_geometry request.  */
+  uint32_t cached_log_w, cached_log_h, cached_scale120;
+  bool geom_cache_valid;
+
   int has_been_visible;
   int focus_state;
 
   long hint_flags;
-  int preferred_width, preferred_height;
 
   /* Menu/tool bar geometry (generic code reads these).  */
   int menubar_height;
   int toolbar_top_height, toolbar_bottom_height;
   int toolbar_left_width, toolbar_right_width;
-
-  /* Relief GCs/colors, used by face/relief drawing.  */
-  struct relief
-  {
-    Emacs_GC xgcv;
-    unsigned long pixel;
-  }
-  black_relief, white_relief;
-  unsigned long relief_background;
-  bool_bf relief_background_valid_p : 1;
-
-  /* Most-recently-seen monitor scale factor.  */
-  double watched_scale_factor;
 };
 
 /* Accessors mirroring the other backends' conventions.  */
@@ -288,6 +279,13 @@ struct scroll_bar
      dragging, or -1 when not dragging.  */
   int dragging;
 
+  /* Geometry/handle as last painted (non-GC, wlshm-only): the per-update
+     scroll-bar repaint is skipped -- so it doesn't damage the canvas and
+     force a present -- unless one of these changed or the text redisplay
+     damaged the bar's rectangle.  */
+  int last_top, last_left, last_width, last_height, last_start, last_end;
+  bool last_painted;
+
   /* True if the scroll bar is horizontal.  */
   bool horizontal;
 } GCALIGNED_STRUCT;
@@ -338,6 +336,8 @@ extern cairo_t *wlshm_begin_cr_clip (struct frame *f);
 extern void wlshm_end_cr_clip (struct frame *f);
 /* Device (HiDPI) scale of F; used by FRAME_SCALE_FACTOR (frame.h).  */
 extern double wlshm_frame_scale_factor (struct frame *f);
+/* Drop F's cached window size/scale so the next query re-fetches over FFI.  */
+extern void wlshm_geom_cache_invalidate (struct frame *f);
 extern void wlshm_set_cr_source_with_color (struct frame *f, unsigned long color,
 					   bool respects_alpha_background);
 /* Write the current frame canvas to a PNG (golden/visual test harness).  */

@@ -90,8 +90,6 @@ DEFUN ("x-create-frame", Fx_create_frame, Sx_create_frame, 1, 1, 0,
   f->output_method = output_wlshm;
   FRAME_X_OUTPUT (f) = xzalloc (sizeof (struct wlshm_output));
   FRAME_FONTSET (f) = -1;
-  FRAME_X_OUTPUT (f)->white_relief.pixel = -1;
-  FRAME_X_OUTPUT (f)->black_relief.pixel = -1;
   FRAME_X_OUTPUT (f)->scroll_bar_foreground_pixel = -1;
   FRAME_X_OUTPUT (f)->scroll_bar_background_pixel = -1;
   FRAME_DISPLAY_INFO (f) = dpyinfo;
@@ -247,6 +245,8 @@ DEFUN ("x-create-frame", Fx_create_frame, Sx_create_frame, 1, 1, 0,
     {
       wlshm_window_set_size (WLSHM_FRAME_HANDLE (f),
 			     FRAME_PIXEL_WIDTH (f), FRAME_PIXEL_HEIGHT (f));
+      /* The Rust-side window size just changed; drop the cached geometry.  */
+      wlshm_geom_cache_invalidate (f);
       wlshm_window_set_subsurface_pos (WLSHM_FRAME_HANDLE (f),
 				       f->left_pos, f->top_pos);
       /* A subsurface gets no compositor configure, so adjust_frame_size's
@@ -580,8 +580,6 @@ wlshm_create_tip_frame (struct wlshm_display_info *dpyinfo, Lisp_Object parms,
   f->output_method = output_wlshm;
   FRAME_X_OUTPUT (f) = xzalloc (sizeof (struct wlshm_output));
   FRAME_FONTSET (f) = -1;
-  FRAME_X_OUTPUT (f)->white_relief.pixel = -1;
-  FRAME_X_OUTPUT (f)->black_relief.pixel = -1;
   FRAME_X_OUTPUT (f)->scroll_bar_foreground_pixel = -1;
   FRAME_X_OUTPUT (f)->scroll_bar_background_pixel = -1;
   f->tooltip = true;
@@ -691,6 +689,19 @@ compute_tip_xy (struct frame *f, Lisp_Object parms, Lisp_Object dx,
   struct wlshm_display_info *dpyinfo = FRAME_DISPLAY_INFO (f);
   int min_x = 0, min_y = 0;
   int max_x = 4096, max_y = 4096;
+
+  /* Clamp against the primary output's size when it reports one, so the
+     flip-above/left heuristics below track the real screen instead of a
+     hardcoded 4096.  Keep 4096 as the fallback when no output geometry is
+     available.  */
+  {
+    int ow = 0, oh = 0, ommw = 0, ommh = 0;
+    wlshm_primary_output_geometry (&ow, &oh, &ommw, &ommh);
+    if (ow > 0)
+      max_x = ow;
+    if (oh > 0)
+      max_y = oh;
+  }
 
   /* Best-effort pointer position (surface-local; no Wayland root coords).  */
   *root_x = dpyinfo->last_mouse_motion_x;
@@ -832,6 +843,8 @@ DEFUN ("x-show-tip", Fx_show_tip, Sx_show_tip, 1, 6, 0,
       wlshm_window_set_geometry (WLSHM_FRAME_HANDLE (tip_f), root_x, root_y,
 				 FRAME_PIXEL_WIDTH (tip_f),
 				 FRAME_PIXEL_HEIGHT (tip_f));
+      /* Rust-side geometry changed; drop the cached size/scale.  */
+      wlshm_geom_cache_invalidate (tip_f);
       goto start_timer;
     }
 
@@ -995,6 +1008,8 @@ DEFUN ("x-show-tip", Fx_show_tip, Sx_show_tip, 1, 6, 0,
      frame to match, then force-draw and present.  */
   wlshm_window_set_geometry (WLSHM_FRAME_HANDLE (tip_f), root_x, root_y,
 			     width, height);
+  /* Rust-side geometry changed; drop the cached size/scale.  */
+  wlshm_geom_cache_invalidate (tip_f);
   SET_FRAME_VISIBLE (tip_f, 1);
 
   w->must_be_updated_p = true;
