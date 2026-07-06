@@ -16,6 +16,7 @@ pgtkterm.c.  See wlshm-architecture.md.  */
 #include "buffer.h"
 #include "termchar.h"
 #include "termhooks.h"
+#include "termopts.h"		/* interrupt_input */
 #include "dispextern.h"
 #include <stdarg.h>
 #include <math.h>		/* lround for HiDPI logical<->physical scaling */
@@ -29,6 +30,8 @@ pgtkterm.c.  See wlshm-architecture.md.  */
 #include "process.h"		/* add_non_keyboard_read_fd */
 #include <errno.h>
 #include <poll.h>
+#include <fcntl.h>		/* F_SETOWN for SIGIO input on the Wayland fd */
+#include <unistd.h>		/* getpid */
 #include "systime.h"
 #include "wlshmterm.h"
 
@@ -4484,6 +4487,19 @@ wlshm_register_wait_descriptors (struct wlshm_display_info *dpyinfo)
     {
       wlshm_log ("register wait descriptor input fd=%d", dpyinfo->input_fd);
       add_keyboard_wait_descriptor (dpyinfo->input_fd);
+      /* Arm SIGIO on the Wayland socket so C-g (and any input) can
+	 interrupt busy Lisp.  add_keyboard_wait_descriptor only wakes idle
+	 pselect waits; while Lisp runs, nothing sets pending_signals unless
+	 the kernel raises SIGIO on this fd.  INTERRUPT_INPUT is defined for
+	 this build (interrupt_input == 1), so the polling-atimer fallback is
+	 disabled and SIGIO is the only path that delivers quit.  Mirrors
+	 pgtk/x; only the socket fd is armed (timerfds don't support O_ASYNC
+	 and don't matter for quit).  */
+#ifdef F_SETOWN
+      fcntl (dpyinfo->input_fd, F_SETOWN, getpid ());
+#endif
+      if (interrupt_input)
+	init_sigio (dpyinfo->input_fd);
     }
 
   /* Also wake on the key-repeat timerfd so held keys repeat.  */
