@@ -18,6 +18,7 @@ pgtkterm.c.  See wlshm-architecture.md.  */
 #include "termhooks.h"
 #include "termopts.h"		/* interrupt_input */
 #include "dispextern.h"
+#include "thread.h"		/* main_thread_p, current_thread */
 #include <stdarg.h>
 #include <math.h>		/* lround for HiDPI logical<->physical scaling */
 #include "font.h"
@@ -3895,6 +3896,18 @@ wlshm_read_socket (struct terminal *terminal, struct input_event *hold_quit)
 {
   enum { BATCH = 64 };
   WlshmEvent evs[BATCH];
+
+  /* Only the main Lisp thread owns the Wayland connection.  A Lisp worker
+     thread from make-thread can reach here via
+     maybe_quit -> process_pending_signals -> handle_async_input ->
+     gobble_input (SIGIO is armed on the Wayland fd without SA_RESTART).  On
+     that thread the Rust backend's thread_local BACKEND is None, so
+     wlshm_window_dispatch returns -1 and the code below would falsely mark the
+     connection dead and tear down the terminal (Emacs exits 1).  Make the
+     off-main-thread call a benign no-op: report no input and make no progress;
+     the main thread drains these events at its next wakeup.  */
+  if (!main_thread_p (current_thread))
+    return 0;
 
   block_input ();
   if (wlshm_window_dispatch () < 0)

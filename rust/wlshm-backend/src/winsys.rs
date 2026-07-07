@@ -940,7 +940,17 @@ impl Backend {
     fn flush_wayland(&mut self, context: &str) -> Result<(), String> {
         match self.conn.flush() {
             Ok(()) => Ok(()),
-            Err(WaylandError::Io(e)) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(()),
+            // WouldBlock (send buffer full) and Interrupted (EINTR from a
+            // signal, e.g. the SIGIO armed on the fd without SA_RESTART) are
+            // both benign and transient; don't record a sticky fatal.
+            Err(WaylandError::Io(e))
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                ) =>
+            {
+                Ok(())
+            }
             Err(e) => Err(self.record_fatal(format!("wayland flush {context}: {e}"))),
         }
     }
@@ -1285,12 +1295,18 @@ impl Backend {
             if ready {
                 match guard.read() {
                     Ok(_) => {}
-                    // The socket can be drained between poll and read; that's
-                    // benign.  A real error (disconnect / protocol) must
-                    // propagate so the C side tears the connection down instead
-                    // of spinning on a dead-but-readable fd.
+                    // The socket can be drained between poll and read
+                    // (WouldBlock), or the read can be interrupted by a signal
+                    // (Interrupted/EINTR, e.g. the SIGIO armed on the fd without
+                    // SA_RESTART); both are benign and transient.  A real error
+                    // (disconnect / protocol) must propagate so the C side tears
+                    // the connection down instead of spinning on a
+                    // dead-but-readable fd.
                     Err(WaylandError::Io(e))
-                        if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                        if matches!(
+                            e.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                        ) => {}
                     Err(e) => return Err(self.record_fatal(format!("wayland read: {e}"))),
                 }
                 self.event_queue
