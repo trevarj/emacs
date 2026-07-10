@@ -2357,8 +2357,10 @@ wlshm_fullscreen_hook (struct frame *f)
   unblock_input ();
 }
 
-/* set_window_size_hook: request a new pixel size.  Apply locally and request
-   it from the compositor; a Configure event confirms the final size.  */
+/* set_window_size_hook: apply a new client-controlled content size.  Wayland
+   toplevels have no request-size operation: the client chooses its size by
+   attaching a buffer of that size, so there is no later Configure to confirm
+   an Emacs-initiated resize.  */
 static void
 wlshm_set_window_size (struct frame *f, bool change_gravity,
 		       int width, int height)
@@ -2373,16 +2375,10 @@ wlshm_set_window_size (struct frame *f, bool change_gravity,
 
   /* WIDTH/HEIGHT are the native (pixel) size; change_frame_size converts to
      text internally, so pass them straight through (no double conversion).
-     A child frame is Emacs-driven (no compositor configure), so apply the size
-     SYNCHRONOUSLY (delay=false) -- mirroring pgtk.  Deferring it leaves
-     FRAME_PIXEL_WIDTH/HEIGHT stale until the next redisplay, and corfu runs its
-     popup placement under inhibit-redisplay: a sibling popup (corfu-popupinfo)
-     reading frame-pixel-width right after set-frame-size would then see the
-     freshly-created list frame's tiny figured size and place itself on top of
-     it (the first-call overlap).  Toplevels keep delay=true; their authoritative
-     size comes from the compositor configure.  */
-  bool delay = !FRAME_PARENT_FRAME (f);
-  change_frame_size (f, width, height, false, delay, false);
+     Apply synchronously for every role.  Child frames need this for sibling
+     placement under inhibit-redisplay; toplevels need it because the new
+     buffer size, not a future compositor Configure, is authoritative.  */
+  change_frame_size (f, width, height, false, false, false);
   SET_FRAME_GARBAGED (f);
   unblock_input ();
 }
@@ -5012,6 +5008,8 @@ wlshm_menu_modal_loop (struct frame *f, uint64_t pw,
   int wlfd = wlshm_window_fd ();
   cairo_surface_t *surf = NULL;
   bool need_draw = true;
+  WlshmEvent *deferred = NULL;
+  ptrdiff_t deferred_count = 0, deferred_alloc = 0;
 
   /* Clear any key-repeat armed by the keystroke that opened the menu, so it
      does not auto-fire while we run our own modal loop.  */
@@ -5066,9 +5064,16 @@ wlshm_menu_modal_loop (struct frame *f, uint64_t pw,
 	}
       WlshmEvent evs[64];
       int ne = wlshm_window_poll_events (evs, 64);
-      for (int j = 0; j < ne && !done; j++)
+      for (int j = 0; j < ne; j++)
 	{
 	  WlshmEvent *e = &evs[j];
+	  /* The popup owns its events, and the event that dismisses it must not
+	     click through to the underlying frame.  Everything for another
+	     surface must survive this private modal loop and later pass through
+	     wlshm_read_socket's normal routing/translation path.  */
+	  bool defer = e->window != pw;
+	  if (done)
+	    goto maybe_defer;
 	  switch (e->kind)
 	    {
 	    case WlshmEventKind_PointerMotion:
@@ -5079,6 +5084,12 @@ wlshm_menu_modal_loop (struct frame *f, uint64_t pw,
 		    { hi = r; need_draw = true; }
 		}
 	      break;
+	    case WlshmEventKind_PointerPress:
+	    case WlshmEventKind_PointerAxis:
+	      /* Popup grabs consume pointer button/axis sequences even when the
+		 compositor reports them against the parent surface.  */
+	      defer = false;
+	      break;
 	    case WlshmEventKind_PointerRelease:
 	      if (e->window == pw)
 		{
@@ -5087,9 +5098,17 @@ wlshm_menu_modal_loop (struct frame *f, uint64_t pw,
 		    { result = r; done = true; }
 		}
 	      else
-		{ cancelled = true; done = true; }	/* click outside */
+		{
+		  /* Click outside dismisses the menu and is consumed, matching
+		     popup-grab semantics (never activate the underlying frame).  */
+		  defer = false;
+		  cancelled = true;
+		  done = true;
+		}
 	      break;
 	    case WlshmEventKind_KeyPress:
+	      /* The popup keyboard grab owns keys while the menu is active.  */
+	      defer = false;
 	      switch (e->keysym)
 		{
 		case WLSHM_KS_UP:
@@ -5108,15 +5127,42 @@ wlshm_menu_modal_loop (struct frame *f, uint64_t pw,
 		}
 	      break;
 	    case WlshmEventKind_Close:
-	      if (e->window == pw) { cancelled = true; done = true; }
+	      if (e->window == pw)
+		{
+		  defer = false;
+		  cancelled = true;
+		  done = true;
+		}
 	      break;
 	    default:
 	      break;
+	    }
+
+	maybe_defer:
+	  if (defer)
+	    {
+	      if (deferred_count == deferred_alloc)
+		deferred = xpalloc (deferred, &deferred_alloc, 1, -1,
+				    sizeof *deferred);
+	      deferred[deferred_count++] = *e;
 	    }
 	}
     }
   if (surf)
     cairo_surface_destroy (surf);
+  if (deferred_count > 0)
+    {
+      /* poll_events removed these from the shared FIFO.  Restore them ahead
+	 of any events that remained queued, then drain them immediately: the
+	 Wayland fd wakeup was already consumed by this modal loop, so merely
+	 requeueing could otherwise strand them until unrelated future input.  */
+      block_input ();
+      wlshm_window_requeue_events (deferred, deferred_count);
+      unblock_input ();
+      if (!FRAME_DISPLAY_INFO (f)->connection_dead)
+	(void) wlshm_read_socket (f->terminal, NULL);
+    }
+  xfree (deferred);
   /* A key held while dismissing the menu must not keep repeating afterward.  */
   wlshm_window_disarm_repeat ();
   *hip = hi;

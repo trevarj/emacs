@@ -1770,13 +1770,6 @@ impl CompositorHandler for AppState {
         }
         let id = self.id_for_surface(s);
         let Some(w) = self.windows.get_mut(&id) else { return };
-        // A subsurface child frame is Emacs-driven and inherits its scale at
-        // creation; it has no xdg configure handshake, so pushing a Configure
-        // here would garbage the frame and risk a wp_viewport buffer/scale
-        // divergence (see update_viewport).  Leave its scale as set at creation.
-        if matches!(w.role, Role::Subsurface { .. }) {
-            return;
-        }
         // Integer fallback only: when the fractional-scale protocol is active
         // (per-surface wp_fractional_scale_v1), the preferred_scale event is
         // authoritative and we ignore the wl_output integer scale here.
@@ -2224,9 +2217,9 @@ impl Dispatch<WpFractionalScaleV1, u64> for AppState {
             // reaches C (wlshmterm.c: change_frame_size + garbage), which drives
             // wlshm_ensure_canvas to rebuild the child canvas at the new
             // physical size.  Guarding here would freeze the child's scale ->
-            // blurry popups at fractional scale.  scale_factor_changed's guard
-            // only covers the integer FALLBACK path, where a subsurface's scale
-            // is fixed at creation via set_buffer_scale.
+            // blurry popups at fractional scale.  The integer-fallback
+            // scale_factor_changed path likewise updates subsurfaces directly;
+            // neither path needs an xdg configure handshake.
             let Some(w) = state.windows.get_mut(&id) else { return };
             if scale == 0 || w.scale120 == scale {
                 return;
@@ -2626,6 +2619,22 @@ pub unsafe extern "C" fn wlshm_window_poll_events(buf: *mut WlshmEvent, max: c_i
     }
     let out = std::slice::from_raw_parts_mut(buf, max as usize);
     with_backend(|b| b.state.events.drain_into(out) as c_int, 0)
+}
+
+/// Put `count` events previously returned by `wlshm_window_poll_events` back
+/// at the front of the input queue.  The menu modal loop uses this to preserve
+/// events for non-menu surfaces until the normal Emacs input path can process
+/// them.
+///
+/// # Safety
+/// `buf` must point to readable storage for at least `count` events.
+#[no_mangle]
+pub unsafe extern "C" fn wlshm_window_requeue_events(buf: *const WlshmEvent, count: c_int) {
+    if buf.is_null() || count <= 0 {
+        return;
+    }
+    let events = std::slice::from_raw_parts(buf, count as usize);
+    with_backend(|b| b.state.events.prepend(events), ());
 }
 
 /// Present window `win`'s Cairo canvas (XRGB8888, `src_w`x`src_h`, `src_stride`

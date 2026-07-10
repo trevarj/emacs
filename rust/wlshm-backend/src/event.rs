@@ -184,6 +184,14 @@ impl EventQueue {
         self.q.push_back(e);
     }
 
+    /// Put previously drained events back at the front, preserving their
+    /// original order ahead of events that remained queued.
+    pub fn prepend(&mut self, events: &[WlshmEvent]) {
+        for event in events.iter().rev() {
+            self.q.push_front(*event);
+        }
+    }
+
     /// Drain at most `out.len()` events into `out`, preserving FIFO order.
     /// Returns the number written.
     pub fn drain_into(&mut self, out: &mut [WlshmEvent]) -> usize {
@@ -225,5 +233,15 @@ mod tests {
         let mut q = EventQueue::new();
         let mut out = [WlshmEvent::key(0, 0, 0); 2];
         assert_eq!(q.drain_into(&mut out), 0);
+    }
+
+    #[test]
+    fn prepend_restores_order_before_queued_events() {
+        let mut q = EventQueue::new();
+        q.push(WlshmEvent::key(3, 3, 0));
+        q.prepend(&[WlshmEvent::key(1, 1, 0), WlshmEvent::key(2, 2, 0)]);
+        let mut out = [WlshmEvent::key(0, 0, 0); 3];
+        assert_eq!(q.drain_into(&mut out), 3);
+        assert_eq!(out.map(|event| event.keysym), [1, 2, 3]);
     }
 }

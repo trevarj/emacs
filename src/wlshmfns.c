@@ -275,6 +275,13 @@ DEFUN ("x-create-frame", Fx_create_frame, Sx_create_frame, 1, 1, 0,
       change_frame_size (f, (int) sw, (int) sh, false, true, false);
   }
 
+  /* The frame is now fully initialized, so generic frame-size changes may
+     call wlshm_set_window_size.  Without this, only child/tooltip frames ever
+     enabled the hook: set-frame-size and menu/tool-bar toggles changed Emacs's
+     internal geometry while the Wayland surface and Cairo canvas stayed at
+     their initial 800x600 size.  */
+  f->can_set_window_size = true;
+
   gui_default_parameter (f, parms, Qcursor_type, Qbox,
 			 "cursorType", "CursorType", RES_TYPE_SYMBOL);
   gui_default_parameter (f, parms, Qalpha, Qnil, "alpha", "Alpha",

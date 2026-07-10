@@ -90,7 +90,7 @@
     (define-key map [set-terminal-coding-system]
       '(menu-item "For Terminal" set-terminal-coding-system
         :enable (null (memq initial-window-system '(x w32 ns haiku pgtk
-						    android)))
+						    android wlshm)))
         :help "How to encode terminal output"))
     (define-key map [set-keyboard-coding-system]
       '(menu-item "For Keyboard" set-keyboard-coding-system

@@ -223,6 +223,17 @@ void wlshm_window_size(uint64_t win, uint32_t *w, uint32_t *h);
 int wlshm_window_poll_events(WlshmEvent *buf, int max);
 
 /**
+ * Put `count` events previously returned by `wlshm_window_poll_events` back
+ * at the front of the input queue.  The menu modal loop uses this to preserve
+ * events for non-menu surfaces until the normal Emacs input path can process
+ * them.
+ *
+ * # Safety
+ * `buf` must point to readable storage for at least `count` events.
+ */
+void wlshm_window_requeue_events(const WlshmEvent *buf, int count);
+
+/**
  * Present window `win`'s Cairo canvas (XRGB8888, `src_w`x`src_h`, `src_stride`
  * bytes/row) into a free wl_shm buffer sized to the SOURCE.  Zero damage rect
  * means whole surface.

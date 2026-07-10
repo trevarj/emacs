@@ -102,7 +102,25 @@
                      nil "Copy" "Paste" "Quit")
                4 path))
           (set-face-attribute 'default nil :height prev-height)))
+    ;; Keep the golden canvas at its documented 800x600 size after
+    ;; `wlshm-test-prep' removes the menu/tool bars.  This also exercises the
+    ;; toplevel set_window_size hook: a regression that leaves
+    ;; can_set_window_size false produces a 545px Emacs frame on a stale 600px
+    ;; canvas and fails this assertion before writing a misleading golden.
     (wlshm-test-scene name)
+    (let ((frame (selected-frame)))
+      ;; `set-frame-size' measures the TEXT area even with PIXELWISE non-nil;
+      ;; compensate for fringes, scroll bars, and borders to request an exact
+      ;; outer content size.
+      (set-frame-size
+       frame
+       (+ (frame-text-width frame) (- 800 (frame-pixel-width frame)))
+       (+ (frame-text-height frame) (- 600 (frame-pixel-height frame)))
+       t))
+    (unless (and (= (frame-pixel-width) 800)
+                 (= (frame-pixel-height) 600))
+      (error "wlshm frame resize did not reach 800x600: got %dx%d"
+             (frame-pixel-width) (frame-pixel-height)))
     (redisplay t)
     ;; Two passes: the first present sizes/clears, the second has the scene.
     (redisplay t)
