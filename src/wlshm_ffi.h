@@ -207,7 +207,7 @@ int wlshm_window_scale(uint64_t win);
 uint32_t wlshm_window_scale120(uint64_t win);
 
 /**
- * Current size of window `win` in pixels, written to *w/*h.
+ * Current size of window `win` in pixels, written through `w` and `h`.
  *
  * # Safety
  * `w` and `h` must be valid pointers.
@@ -236,20 +236,21 @@ void wlshm_window_requeue_events(const WlshmEvent *buf, int count);
 /**
  * Present window `win`'s Cairo canvas (XRGB8888, `src_w`x`src_h`, `src_stride`
  * bytes/row) into a free wl_shm buffer sized to the SOURCE.  Zero damage rect
- * means whole surface.
+ * means whole surface.  Returns 0 when the frame was committed or retained for
+ * a deferred commit, -1 when the caller must preserve damage and retry.
  *
  * # Safety
  * `src` must point to at least `src_h * src_stride` readable bytes.
  */
-void wlshm_window_present(uint64_t win,
-                          const uint8_t *src,
-                          uint32_t src_w,
-                          uint32_t src_h,
-                          uint32_t src_stride,
-                          int dmg_x,
-                          int dmg_y,
-                          int dmg_w,
-                          int dmg_h);
+int wlshm_window_present(uint64_t win,
+                         const uint8_t *src,
+                         uint32_t src_w,
+                         uint32_t src_h,
+                         uint32_t src_stride,
+                         int dmg_x,
+                         int dmg_y,
+                         int dmg_w,
+                         int dmg_h);
 
 /**
  * Set window `win`'s title.  `title` is a NUL-terminated C string.
@@ -266,7 +267,8 @@ void wlshm_window_set_title(uint64_t win, const char *title);
 void wlshm_window_set_cursor(uint64_t _win, int code);
 
 /**
- * If window `win` has a pending resize, write it to *w/*h and return 1.
+ * If window `win` has a pending resize, write it through `w` and `h` and
+ * return 1.
  *
  * # Safety
  * `w` and `h` must be valid pointers.
@@ -379,7 +381,7 @@ int wlshm_window_set_clipboard(const uint8_t *data, uintptr_t len);
 
 /**
  * Read the CLIPBOARD selection.  Writes a pointer/length into
- * *out_ptr/*out_len and returns 0; -1 if empty.  The pointer targets the ONE
+ * `out_ptr` and `out_len` and returns 0; -1 if empty.  The pointer targets the ONE
  * shared thread-local buffer (`CLIPBOARD_BUF`) used by both this getter and
  * `wlshm_window_get_primary`, so it is valid only until the next call to
  * EITHER getter.
@@ -391,7 +393,7 @@ int wlshm_window_get_clipboard(const uint8_t **out_ptr, uintptr_t *out_len);
 
 /**
  * Retrieve the payload of the oldest undelivered Drop event.  Writes a
- * pointer/length valid until the next call into *out_ptr/*out_len and returns
+ * pointer/length valid until the next call through `out_ptr` and `out_len`, and returns
  * 0; -1 if there is no pending drop payload.  C must call this exactly once,
  * right after it pops a `WlshmEventKind_Drop` event (whose `.button` flags a
  * `text/uri-list`): each call consumes one queued payload, so a spurious call
@@ -405,7 +407,7 @@ int wlshm_window_get_drop(const uint8_t **out_ptr, uintptr_t *out_len);
 
 /**
  * Retrieve the current IME preedit (composition) string.  Writes a
- * pointer/length valid until the next call into *out_ptr/*out_len and returns
+ * pointer/length valid until the next call through `out_ptr` and `out_len`, and returns
  * 0 whenever the backend exists; -1 only means the backend is absent.  The
  * buffer is UTF-8 and may be empty (length 0) to mean "clear the preedit".
  * C must call this right after it pops a `WlshmEventKind_Preedit` event.
@@ -440,7 +442,7 @@ int wlshm_window_set_primary(const uint8_t *data, uintptr_t len);
 
 /**
  * Read the PRIMARY selection.  Writes a pointer/length into
- * *out_ptr/*out_len and returns 0; -1 if empty.  The pointer targets the ONE
+ * `out_ptr` and `out_len` and returns 0; -1 if empty.  The pointer targets the ONE
  * shared thread-local buffer (`CLIPBOARD_BUF`) used by both this getter and
  * `wlshm_window_get_clipboard`, so it is valid only until the next call to
  * EITHER getter.

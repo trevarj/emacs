@@ -106,17 +106,17 @@ use crate::event::{
     WLSHM_MOD_SHIFT,
 };
 
-// ManuallyDrop: at process exit we deliberately leak the connection rather than
-// run libwayland's teardown (which can crash).  The OS reclaims everything.
-// Individual windows DO drop normally on wlshm_window_close (proper surface
-// destroy for transient popups/tooltips while the connection is alive).
+// The system-libwayland Connection itself must not be dropped after a fatal
+// disconnect: that teardown has crashed in libwayland.  Backend keeps only the
+// Connection in ManuallyDrop; all Rust-owned state is still dropped on terminal
+// deletion, and ConnectionFdGuard closes the socket after those fields drop.
 thread_local! {
-    static BACKEND: RefCell<Option<ManuallyDrop<Backend>>> = const { RefCell::new(None) };
+    static BACKEND: RefCell<Option<Backend>> = const { RefCell::new(None) };
 }
 
 pub fn shutdown_backend() {
     BACKEND.with(|b| {
-        let _ = b.borrow_mut().take();
+        drop(b.borrow_mut().take());
     });
 }
 
@@ -171,6 +171,19 @@ fn make_timer_fd(label: &str) -> i32 {
         );
     }
     fd
+}
+
+fn set_timer_fd(fd: i32, spec: &libc::itimerspec, label: &str) -> bool {
+    if fd < 0 {
+        return false;
+    }
+    let rc = unsafe { libc::timerfd_settime(fd, 0, spec, std::ptr::null_mut()) };
+    if rc != 0 {
+        eprintln!("wlshm: timerfd_settime ({label}) failed: {}",
+                  std::io::Error::last_os_error());
+        return false;
+    }
+    true
 }
 
 /// True for X/xkb modifier and lock keysyms, which must not be delivered as
@@ -403,6 +416,18 @@ impl WlWindow {
 /// so the forced-commit rate stays bounded (no flood) yet stale content clears
 /// promptly.
 const PRESENT_DEADLINE: Duration = Duration::from_millis(33);
+
+fn valid_source_layout(src: *const u8, width: u32, height: u32, stride: u32) -> bool {
+    if src.is_null() || width == 0 || height == 0 {
+        return false;
+    }
+    let Some(row_bytes) = width.checked_mul(4) else { return false };
+    if row_bytes > i32::MAX as u32 || stride < row_bytes {
+        return false;
+    }
+    (height as usize).checked_mul(stride as usize).is_some()
+        && (height as usize).checked_mul(row_bytes as usize).is_some()
+}
 
 unsafe fn copy_source_pixels(
     src: *const u8,
@@ -674,6 +699,23 @@ struct AppState {
     subcompositor: Option<WlSubcompositor>,
 }
 
+impl Drop for AppState {
+    fn drop(&mut self) {
+        for (fd, label) in [
+            (&mut self.timer_fd, "key repeat"),
+            (&mut self.present_timer_fd, "present deadline"),
+        ] {
+            if *fd >= 0 {
+                if unsafe { libc::close(*fd) } != 0 {
+                    eprintln!("wlshm: close {label} timerfd: {}",
+                              std::io::Error::last_os_error());
+                }
+                *fd = -1;
+            }
+        }
+    }
+}
+
 impl AppState {
     /// Window handle of the surface the keyboard/pointer most recently entered,
     /// or any window if none is focused (used for window-less events).
@@ -731,11 +773,8 @@ impl AppState {
 
     /// Arm the repeat timerfd: first fire after `delay`, then every `rate` ms.
     fn arm_repeat(&self) {
-        if self.timer_fd < 0 {
-            return;
-        }
         let spec = repeat_itimerspec(self.repeat_delay_ms, self.repeat_rate_ms);
-        unsafe { libc::timerfd_settime(self.timer_fd, 0, &spec, std::ptr::null_mut()) };
+        set_timer_fd(self.timer_fd, &spec, "arm key repeat");
     }
 
     /// Arm the present-deadline timerfd to fire ONCE after PRESENT_DEADLINE, so
@@ -743,9 +782,6 @@ impl AppState {
     /// arrive.  Idempotent-ish: re-arming just pushes the deadline out by one
     /// interval from the latest coalesce, which is fine.
     fn arm_present_timer(&self) {
-        if self.present_timer_fd < 0 {
-            return;
-        }
         let ms = PRESENT_DEADLINE.as_millis() as i64;
         let spec = libc::itimerspec {
             it_interval: libc::timespec { tv_sec: 0, tv_nsec: 0 },
@@ -754,9 +790,7 @@ impl AppState {
                 tv_nsec: (ms % 1000) * 1_000_000,
             },
         };
-        unsafe {
-            libc::timerfd_settime(self.present_timer_fd, 0, &spec, std::ptr::null_mut())
-        };
+        set_timer_fd(self.present_timer_fd, &spec, "arm present deadline");
     }
 
     /// Drain the present-deadline timerfd (so it stops waking us).
@@ -765,9 +799,16 @@ impl AppState {
             return;
         }
         let mut buf = [0u8; 8];
-        unsafe {
+        let n = unsafe {
             libc::read(self.present_timer_fd, buf.as_mut_ptr() as *mut libc::c_void, 8)
         };
+        if n < 0 {
+            let e = std::io::Error::last_os_error();
+            if e.kind() != std::io::ErrorKind::WouldBlock
+                && e.kind() != std::io::ErrorKind::Interrupted {
+                eprintln!("wlshm: read present timerfd failed: {e}");
+            }
+        }
     }
 
     fn disarm_repeat(&mut self) {
@@ -776,7 +817,7 @@ impl AppState {
             return;
         }
         let spec: libc::itimerspec = unsafe { std::mem::zeroed() };
-        unsafe { libc::timerfd_settime(self.timer_fd, 0, &spec, std::ptr::null_mut()) };
+        set_timer_fd(self.timer_fd, &spec, "disarm key repeat");
     }
 
     fn pump_repeat(&mut self) {
@@ -786,6 +827,13 @@ impl AppState {
         let mut buf = [0u8; 8];
         let n = unsafe { libc::read(self.timer_fd, buf.as_mut_ptr() as *mut libc::c_void, 8) };
         if n != 8 {
+            if n < 0 {
+                let e = std::io::Error::last_os_error();
+                if e.kind() != std::io::ErrorKind::WouldBlock
+                    && e.kind() != std::io::ErrorKind::Interrupted {
+                    eprintln!("wlshm: read key repeat timerfd failed: {e}");
+                }
+            }
             return;
         }
         let expirations = u64::from_ne_bytes(buf);
@@ -801,12 +849,27 @@ impl AppState {
     }
 }
 
+struct ConnectionFdGuard(c_int);
+
+impl Drop for ConnectionFdGuard {
+    fn drop(&mut self) {
+        if self.0 >= 0 && unsafe { libc::close(self.0) } != 0 {
+            eprintln!("wlshm: close Wayland connection fd: {}",
+                      std::io::Error::last_os_error());
+        }
+        self.0 = -1;
+    }
+}
+
 struct Backend {
-    conn: Connection,
-    qh: QueueHandle<AppState>,
-    event_queue: EventQueue<AppState>,
+    // Fields drop in declaration order.  Drop the proxy/state graph while the
+    // connection is live, retain the Connection itself, then close its socket.
     state: AppState,
+    event_queue: EventQueue<AppState>,
+    qh: QueueHandle<AppState>,
     fatal_error: Option<String>,
+    conn: ManuallyDrop<Connection>,
+    _connection_fd: ConnectionFdGuard,
 }
 
 impl Backend {
@@ -927,7 +990,11 @@ impl Backend {
             }
         }
 
-        Ok(Backend { conn, qh, event_queue, state, fatal_error: None })
+        let connection_fd = ConnectionFdGuard(conn.backend().poll_fd().as_raw_fd());
+        Ok(Backend {
+            state, event_queue, qh, fatal_error: None,
+            conn: ManuallyDrop::new(conn), _connection_fd: connection_fd,
+        })
     }
 
     fn record_fatal(&mut self, msg: String) -> String {
@@ -1396,14 +1463,19 @@ impl Backend {
     fn drain_pending_drop(&mut self) {
         let Some((pipe, is_uri, x, y, win, offer)) = self.state.pending_drop.take() else { return };
         if self.flush_wayland("read drop").is_err() {
+            offer.finish();
             return;
         }
         if self.roundtrip_wayland("read drop").is_err() {
+            offer.finish();
             return;
         }
-        let bytes = read_pipe_timeout(&pipe, 500);
-        // The transfer is fully read; only now signal completion to the source.
+        let transfer = read_pipe_timeout(&pipe, 500);
         offer.finish();
+        let bytes = match transfer {
+            Ok(bytes) => bytes,
+            Err(e) => { eprintln!("wlshm: drop transfer failed: {e}"); return; }
+        };
         if bytes.is_empty() {
             return;
         }
@@ -1442,17 +1514,17 @@ impl Backend {
         dmg_y: i32,
         dmg_w: i32,
         dmg_h: i32,
-    ) {
-        let Some(id) = self.resolve(win) else { return };
-        if src.is_null() {
-            return;
+    ) -> bool {
+        let Some(id) = self.resolve(win) else { return false };
+        if !valid_source_layout(src, src_w, src_h, src_stride) {
+            return false;
         }
         // The window may have been torn down between resolve() and this lookup
         // (a close racing a present, e.g. via the menu modal loop or tooltip
         // force-present paths), so guard instead of unwrapping.
         let (configured, is_sub) = match self.state.windows.get(&id) {
             Some(w) => (w.configured, matches!(w.role, Role::Subsurface { .. })),
-            None => return,
+            None => return false,
         };
         // A subsurface is not an xdg surface: it has no unconfigured state and
         // never receives an xdg configure, so the recovery dance below would
@@ -1472,21 +1544,21 @@ impl Backend {
             // are configured up front via make_popup, so they short-circuit here.
             let Some(surface) = self.state.windows.get(&id).and_then(|w| w.wl_surface().cloned())
             else {
-                return;
+                return false;
             };
             surface.commit();
             if self.flush_wayland("configure unconfigured surface").is_err() {
-                return;
+                return false;
             }
             let _ = self.roundtrip_wayland("configure unconfigured surface");
             let _ = self.roundtrip_wayland("configure unconfigured surface");
-            // Still unconfigured?  Bail; the frame is garbaged, so the next
-            // redisplay presents again and retries.
+            // Still unconfigured?  Ask C to retain this frame's damage so its
+            // next update retries instead of treating the canvas as presented.
             if !self.state.windows.get(&id).map(|w| w.configured).unwrap_or(false) {
-                return;
+                return false;
             }
         }
-        let Some(w) = self.state.windows.get_mut(&id) else { return };
+        let Some(w) = self.state.windows.get_mut(&id) else { return false };
         // Size the buffer and copy from the SOURCE dimensions, NOT the window's
         // compositor-driven size.  The source (an Emacs frame canvas or a
         // fixed-size menu/tooltip surface) can differ from w.size: the
@@ -1494,9 +1566,6 @@ impl Backend {
         // a frame resize before the canvas is rebuilt).  Using w.size here read
         // past the end of `src` and crashed (SIGSEGV in memmove).
         let (pw, ph) = (src_w, src_h);
-        if pw == 0 || ph == 0 {
-            return;
-        }
         // Resolve damage to a concrete rect (full buffer when none was given).
         let (dx, dy, dw, dh) = if dmg_w > 0 && dmg_h > 0 {
             (dmg_x, dmg_y, dmg_w, dmg_h)
@@ -1542,7 +1611,7 @@ impl Backend {
             if !had_pending {
                 self.state.arm_present_timer();
             }
-            return;
+            return true;
         }
         // We are about to commit the CURRENT (newest) buffer.  Drop any older
         // coalesced buffer so frame() can't later commit it on top of this one
@@ -1553,14 +1622,14 @@ impl Backend {
             w.pending =
                 Some(PendingFrame::new_from_source(src, pw, ph, src_stride, dx, dy, dw, dh));
             self.state.arm_present_timer();
-            return;
+            return true;
         };
         // Set the viewport SOURCE to the crisp logical*scale crop, CLAMPED to
         // this buffer (pw x ph) so it can never exceed the content area (a
         // wp_viewport out_of_buffer protocol error).  Applied on the commit
         // below, so source and buffer always agree.
         set_viewport_source(w, pw, ph);
-        let Some(surface) = w.wl_surface().cloned() else { return };
+        let Some(surface) = w.wl_surface().cloned() else { return false };
         let parent_surface = if let Role::Subsurface { parent_surface, .. } = &w.role {
             Some(parent_surface.clone())
         } else {
@@ -1593,6 +1662,7 @@ impl Backend {
             self.state.arm_present_timer();
         }
         let _ = self.flush_wayland("present");
+        true
     }
 
     fn set_clipboard(&mut self, text: &[u8]) -> bool {
@@ -1602,8 +1672,7 @@ impl Backend {
         source.set_selection(dd, self.state.serial);
         self.state.clipboard_text = text.to_vec();
         self.state.clipboard_source = Some(source);
-        let _ = self.flush_wayland("set clipboard");
-        true
+        self.flush_wayland("set clipboard").is_ok()
     }
 
     fn disown_clipboard(&mut self) {
@@ -1625,7 +1694,10 @@ impl Backend {
         let pipe = offer.receive(mime).ok()?;
         self.flush_wayland("get clipboard").ok()?;
         self.roundtrip_wayland("get clipboard").ok()?;
-        Some(read_pipe_timeout(&pipe, 500))
+        match read_pipe_timeout(&pipe, 500) {
+            Ok(bytes) => Some(bytes),
+            Err(e) => { eprintln!("wlshm: clipboard transfer failed: {e}"); None }
+        }
     }
 
     // --- PRIMARY selection: parallel to the clipboard methods above. ---
@@ -1637,8 +1709,7 @@ impl Backend {
         source.set_selection(dev, self.state.serial);
         self.state.primary_text = text.to_vec();
         self.state.primary_source = Some(source);
-        let _ = self.flush_wayland("set primary");
-        true
+        self.flush_wayland("set primary").is_ok()
     }
 
     fn disown_primary(&mut self) {
@@ -1660,13 +1731,37 @@ impl Backend {
         let pipe = offer.receive(mime).ok()?;
         self.flush_wayland("get primary").ok()?;
         self.roundtrip_wayland("get primary").ok()?;
-        Some(read_pipe_timeout(&pipe, 500))
+        match read_pipe_timeout(&pipe, 500) {
+            Ok(bytes) => Some(bytes),
+            Err(e) => { eprintln!("wlshm: primary transfer failed: {e}"); None }
+        }
+    }
+}
+
+#[derive(Debug)]
+enum PipeTransferError {
+    Timeout,
+    TooLarge,
+    Io(std::io::Error),
+    Closed,
+}
+
+impl std::fmt::Display for PipeTransferError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Timeout => f.write_str("timed out"),
+            Self::TooLarge => f.write_str("exceeded 64 MiB limit"),
+            Self::Io(e) => write!(f, "I/O error: {e}"),
+            Self::Closed => f.write_str("peer closed before transfer completed"),
+        }
     }
 }
 
 /// Read all data from a clipboard pipe, non-blocking with a total timeout so a
 /// misbehaving source can never hang Emacs's main loop.
-fn read_pipe_timeout(pipe: &ReadPipe, timeout_ms: u64) -> Vec<u8> {
+fn read_pipe_timeout(pipe: &ReadPipe, timeout_ms: u64)
+    -> Result<Vec<u8>, PipeTransferError>
+{
     // Cap the accumulated bytes so a hostile/buggy selection or DnD source
     // can't exhaust memory within the timeout window.
     const CAP: usize = 64 << 20;
@@ -1674,8 +1769,11 @@ fn read_pipe_timeout(pipe: &ReadPipe, timeout_ms: u64) -> Vec<u8> {
     let fd = pipe.as_raw_fd();
     unsafe {
         let flags = libc::fcntl(fd, libc::F_GETFL);
-        if flags >= 0 {
-            libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        if flags < 0 {
+            return Err(PipeTransferError::Io(std::io::Error::last_os_error()));
+        }
+        if libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) < 0 {
+            return Err(PipeTransferError::Io(std::io::Error::last_os_error()));
         }
     }
     let mut out = Vec::new();
@@ -1683,33 +1781,41 @@ fn read_pipe_timeout(pipe: &ReadPipe, timeout_ms: u64) -> Vec<u8> {
     let deadline = Instant::now() + Duration::from_millis(timeout_ms);
     loop {
         if out.len() >= CAP {
-            break;
+            return Err(PipeTransferError::TooLarge);
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            break;
+            return Err(PipeTransferError::Timeout);
         }
         let mut pfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
         let pr = unsafe {
             libc::poll(&mut pfd, 1, remaining.as_millis().min(i32::MAX as u128) as i32)
         };
-        if pr <= 0 {
-            break;
+        if pr == 0 {
+            return Err(PipeTransferError::Timeout);
         }
-        let n = unsafe { libc::read(fd, tmp.as_mut_ptr() as *mut libc::c_void, tmp.len()) };
+        if pr < 0 {
+            let e = std::io::Error::last_os_error();
+            if e.kind() == std::io::ErrorKind::Interrupted { continue; }
+            return Err(PipeTransferError::Io(e));
+        }
+        if pfd.revents & (libc::POLLERR | libc::POLLNVAL) != 0 {
+            return Err(PipeTransferError::Closed);
+        }
+        let want = tmp.len().min(CAP - out.len());
+        let n = unsafe { libc::read(fd, tmp.as_mut_ptr() as *mut libc::c_void, want) };
         if n == 0 {
-            break;
+            return Ok(out);
         } else if n > 0 {
             out.extend_from_slice(&tmp[..n as usize]);
         } else {
             let e = std::io::Error::last_os_error();
             match e.raw_os_error() {
                 Some(libc::EAGAIN) | Some(libc::EINTR) => continue,
-                _ => break,
+                _ => return Err(PipeTransferError::Io(e)),
             }
         }
     }
-    out
 }
 
 /// Write all of `data` to a selection pipe, non-blocking with a total timeout so
@@ -1718,12 +1824,17 @@ fn read_pipe_timeout(pipe: &ReadPipe, timeout_ms: u64) -> Vec<u8> {
 /// thread inside the event-queue dispatch, and a POSIX pipe has a bounded kernel
 /// buffer, so a blocking write_all of a large selection would otherwise freeze
 /// the editor until the peer drains (or never).
-fn write_pipe_timeout(pipe: &WritePipe, data: &[u8], timeout_ms: u64) {
+fn write_pipe_timeout(pipe: &WritePipe, data: &[u8], timeout_ms: u64)
+    -> Result<(), PipeTransferError>
+{
     let fd = pipe.as_raw_fd();
     unsafe {
         let flags = libc::fcntl(fd, libc::F_GETFL);
-        if flags >= 0 {
-            libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        if flags < 0 {
+            return Err(PipeTransferError::Io(std::io::Error::last_os_error()));
+        }
+        if libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) < 0 {
+            return Err(PipeTransferError::Io(std::io::Error::last_os_error()));
         }
     }
     let deadline = Instant::now() + Duration::from_millis(timeout_ms);
@@ -1731,18 +1842,23 @@ fn write_pipe_timeout(pipe: &WritePipe, data: &[u8], timeout_ms: u64) {
     while off < data.len() {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            break;
+            return Err(PipeTransferError::Timeout);
         }
         let mut pfd = libc::pollfd { fd, events: libc::POLLOUT, revents: 0 };
         let pr = unsafe {
             libc::poll(&mut pfd, 1, remaining.as_millis().min(i32::MAX as u128) as i32)
         };
-        if pr <= 0 {
-            break;
+        if pr == 0 {
+            return Err(PipeTransferError::Timeout);
+        }
+        if pr < 0 {
+            let e = std::io::Error::last_os_error();
+            if e.kind() == std::io::ErrorKind::Interrupted { continue; }
+            return Err(PipeTransferError::Io(e));
         }
         // Reader closed its end: stop before writing to avoid EPIPE/SIGPIPE.
         if pfd.revents & (libc::POLLERR | libc::POLLHUP) != 0 {
-            break;
+            return Err(PipeTransferError::Closed);
         }
         let n = unsafe {
             libc::write(fd, data[off..].as_ptr() as *const libc::c_void, data.len() - off)
@@ -1753,12 +1869,13 @@ fn write_pipe_timeout(pipe: &WritePipe, data: &[u8], timeout_ms: u64) {
             let e = std::io::Error::last_os_error();
             match e.raw_os_error() {
                 Some(libc::EAGAIN) | Some(libc::EINTR) => continue,
-                _ => break,
+                _ => return Err(PipeTransferError::Io(e)),
             }
         } else {
-            break;
+            return Err(PipeTransferError::Closed);
         }
     }
+    Ok(())
 }
 
 // ----- sctk handlers -------------------------------------------------------
@@ -2405,7 +2522,9 @@ impl DataSourceHandler for AppState {
     fn accept_mime(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataSource, _: Option<String>) {}
     fn send_request(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataSource,
                     _mime: String, fd: WritePipe) {
-        write_pipe_timeout(&fd, &self.clipboard_text, 500);
+        if let Err(e) = write_pipe_timeout(&fd, &self.clipboard_text, 500) {
+            eprintln!("wlshm: clipboard send failed: {e}");
+        }
     }
     fn cancelled(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataSource) {
         self.clipboard_source = None;
@@ -2433,7 +2552,9 @@ impl PrimarySelectionSourceHandler for AppState {
     // DataSourceHandler::send_request for the clipboard.
     fn send_request(&mut self, _: &Connection, _: &QueueHandle<Self>,
                     _: &ZwpPrimarySelectionSourceV1, _mime: String, write_pipe: WritePipe) {
-        write_pipe_timeout(&write_pipe, &self.primary_text, 500);
+        if let Err(e) = write_pipe_timeout(&write_pipe, &self.primary_text, 500) {
+            eprintln!("wlshm: primary send failed: {e}");
+        }
     }
     fn cancelled(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &ZwpPrimarySelectionSourceV1) {
         self.primary_source = None;
@@ -2465,7 +2586,7 @@ delegate_registry!(AppState);
 
 fn with_backend<R>(f: impl FnOnce(&mut Backend) -> R, default: R) -> R {
     BACKEND.with(|b| match b.borrow_mut().as_mut() {
-        Some(be) => f(&mut **be),
+        Some(be) => f(be),
         None => default,
     })
 }
@@ -2487,7 +2608,7 @@ pub unsafe extern "C" fn wlshm_window_open(title: *const c_char, parent: u64, ki
         let mut slot = b.borrow_mut();
         if slot.is_none() {
             match Backend::connect() {
-                Ok(be) => *slot = Some(ManuallyDrop::new(be)),
+                Ok(be) => *slot = Some(be),
                 Err(e) => {
                     eprintln!("wlshm_window_open: {e}");
                     return 0;
@@ -2509,7 +2630,7 @@ pub extern "C" fn wlshm_backend_connect() -> c_int {
         }
         match Backend::connect() {
             Ok(be) => {
-                *slot = Some(ManuallyDrop::new(be));
+                *slot = Some(be);
                 0
             }
             Err(e) => {
@@ -2590,7 +2711,7 @@ pub extern "C" fn wlshm_window_scale120(win: u64) -> u32 {
     )
 }
 
-/// Current size of window `win` in pixels, written to *w/*h.
+/// Current size of window `win` in pixels, written through `w` and `h`.
 ///
 /// # Safety
 /// `w` and `h` must be valid pointers.
@@ -2639,7 +2760,8 @@ pub unsafe extern "C" fn wlshm_window_requeue_events(buf: *const WlshmEvent, cou
 
 /// Present window `win`'s Cairo canvas (XRGB8888, `src_w`x`src_h`, `src_stride`
 /// bytes/row) into a free wl_shm buffer sized to the SOURCE.  Zero damage rect
-/// means whole surface.
+/// means whole surface.  Returns 0 when the frame was committed or retained for
+/// a deferred commit, -1 when the caller must preserve damage and retry.
 ///
 /// # Safety
 /// `src` must point to at least `src_h * src_stride` readable bytes.
@@ -2654,8 +2776,12 @@ pub unsafe extern "C" fn wlshm_window_present(
     dmg_y: c_int,
     dmg_w: c_int,
     dmg_h: c_int,
-) {
-    with_backend(|b| b.present(win, src, src_w, src_h, src_stride, dmg_x, dmg_y, dmg_w, dmg_h), ());
+) -> c_int {
+    with_backend(
+        |b| if b.present(win, src, src_w, src_h, src_stride,
+                         dmg_x, dmg_y, dmg_w, dmg_h) { 0 } else { -1 },
+        -1,
+    )
 }
 
 /// Set window `win`'s title.  `title` is a NUL-terminated C string.
@@ -2700,7 +2826,8 @@ pub extern "C" fn wlshm_window_set_cursor(_win: u64, code: c_int) {
     );
 }
 
-/// If window `win` has a pending resize, write it to *w/*h and return 1.
+/// If window `win` has a pending resize, write it through `w` and `h` and
+/// return 1.
 ///
 /// # Safety
 /// `w` and `h` must be valid pointers.
@@ -3072,7 +3199,7 @@ pub unsafe extern "C" fn wlshm_window_set_clipboard(data: *const u8, len: usize)
 }
 
 /// Read the CLIPBOARD selection.  Writes a pointer/length into
-/// *out_ptr/*out_len and returns 0; -1 if empty.  The pointer targets the ONE
+/// `out_ptr` and `out_len` and returns 0; -1 if empty.  The pointer targets the ONE
 /// shared thread-local buffer (`CLIPBOARD_BUF`) used by both this getter and
 /// `wlshm_window_get_primary`, so it is valid only until the next call to
 /// EITHER getter.
@@ -3101,7 +3228,7 @@ pub unsafe extern "C" fn wlshm_window_get_clipboard(
 }
 
 /// Retrieve the payload of the oldest undelivered Drop event.  Writes a
-/// pointer/length valid until the next call into *out_ptr/*out_len and returns
+/// pointer/length valid until the next call through `out_ptr` and `out_len`, and returns
 /// 0; -1 if there is no pending drop payload.  C must call this exactly once,
 /// right after it pops a `WlshmEventKind_Drop` event (whose `.button` flags a
 /// `text/uri-list`): each call consumes one queued payload, so a spurious call
@@ -3137,7 +3264,7 @@ pub unsafe extern "C" fn wlshm_window_get_drop(
 }
 
 /// Retrieve the current IME preedit (composition) string.  Writes a
-/// pointer/length valid until the next call into *out_ptr/*out_len and returns
+/// pointer/length valid until the next call through `out_ptr` and `out_len`, and returns
 /// 0 whenever the backend exists; -1 only means the backend is absent.  The
 /// buffer is UTF-8 and may be empty (length 0) to mean "clear the preedit".
 /// C must call this right after it pops a `WlshmEventKind_Preedit` event.
@@ -3209,7 +3336,7 @@ pub unsafe extern "C" fn wlshm_window_set_primary(data: *const u8, len: usize) -
 }
 
 /// Read the PRIMARY selection.  Writes a pointer/length into
-/// *out_ptr/*out_len and returns 0; -1 if empty.  The pointer targets the ONE
+/// `out_ptr` and `out_len` and returns 0; -1 if empty.  The pointer targets the ONE
 /// shared thread-local buffer (`CLIPBOARD_BUF`) used by both this getter and
 /// `wlshm_window_get_clipboard`, so it is valid only until the next call to
 /// EITHER getter.
@@ -3269,7 +3396,7 @@ pub extern "C" fn wlshm_window_primary_exists() -> c_int {
 
 #[cfg(test)]
 mod tests {
-    use super::repeat_itimerspec;
+    use super::{repeat_itimerspec, valid_source_layout};
 
     #[test]
     fn itimerspec_splits_milliseconds() {
@@ -3285,5 +3412,15 @@ mod tests {
         let s = repeat_itimerspec(0, 0);
         assert_eq!(s.it_value.tv_nsec, 1_000_000);
         assert_eq!(s.it_interval.tv_nsec, 1_000_000);
+    }
+
+    #[test]
+    fn source_layout_rejects_invalid_dimensions_and_stride() {
+        let ptr = std::ptr::NonNull::<u8>::dangling().as_ptr();
+        assert!(valid_source_layout(ptr, 16, 8, 64));
+        assert!(!valid_source_layout(std::ptr::null(), 16, 8, 64));
+        assert!(!valid_source_layout(ptr, 0, 8, 0));
+        assert!(!valid_source_layout(ptr, 16, 8, 63));
+        assert!(!valid_source_layout(ptr, u32::MAX, 1, u32::MAX));
     }
 }

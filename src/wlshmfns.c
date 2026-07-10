@@ -428,8 +428,9 @@ DEFUN ("x-display-screens", Fx_display_screens, Sx_display_screens, 0, 1, 0,
   return make_fixnum (1);
 }
 
-/* Read the primary output's geometry (pixels in *W/*H, millimeters in
-   *MMW/*MMH).  Reports the display size, unlike wlshm_window_size which is a
+/* Read the primary output's geometry (pixels through W and H, millimeters
+   through MMW and MMH).  Reports the display size, unlike wlshm_window_size,
+   which is a
    per-window dimension.  Leaves the outputs at 0 if no output is available.  */
 static void
 wlshm_primary_output_geometry (int *w, int *h, int *mmw, int *mmh)
@@ -1065,13 +1066,14 @@ compatibility.  */)
 {
   CHECK_STRING (value);
   Lisp_Object enc = ENCODE_UTF_8 (value);
-  if (wlshm_is_primary (selection))
-    wlshm_window_set_primary ((const uint8_t *) SDATA (enc),
-			      (uintptr_t) SBYTES (enc));
-  else
-    wlshm_window_set_clipboard ((const uint8_t *) SDATA (enc),
-			       (uintptr_t) SBYTES (enc));
-  return value;
+  int rc = wlshm_is_primary (selection)
+    ? wlshm_window_set_primary ((const uint8_t *) SDATA (enc),
+				(uintptr_t) SBYTES (enc))
+    : wlshm_window_set_clipboard ((const uint8_t *) SDATA (enc),
+				  (uintptr_t) SBYTES (enc));
+  /* PRIMARY is optional in Wayland, and CLIPBOARD can be unavailable before a
+     seat/data-device is bound.  Do not claim ownership when Rust rejected it.  */
+  return rc == 0 ? value : Qnil;
 }
 
 DEFUN ("wlshm-disown-selection-internal", Fwlshm_disown_selection_internal,

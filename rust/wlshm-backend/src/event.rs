@@ -244,4 +244,11 @@ mod tests {
         assert_eq!(q.drain_into(&mut out), 3);
         assert_eq!(out.map(|event| event.keysym), [1, 2, 3]);
     }
+
+    #[test]
+    fn ffi_event_layout_is_stable() {
+        assert_eq!(std::mem::size_of::<WlshmEventKind>(), 4);
+        assert_eq!(std::mem::offset_of!(WlshmEvent, window), 40);
+        assert_eq!(std::mem::size_of::<WlshmEvent>(), 48);
+    }
 }

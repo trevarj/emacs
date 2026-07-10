@@ -36,6 +36,13 @@ pgtkterm.c.  See wlshm-architecture.md.  */
 #include "systime.h"
 #include "wlshmterm.h"
 
+/* Keep the generated C view of the Rust event ABI honest.  A cbindgen change
+   or compiler option such as short enums must fail at build time, not corrupt
+   the input queue at runtime.  */
+static_assert (sizeof (WlshmEventKind) == 4);
+static_assert (offsetof (WlshmEvent, window) == 40);
+static_assert (sizeof (WlshmEvent) == 48);
+
 /* Chain of all wlshm displays.  */
 struct wlshm_display_info *x_display_list;
 
@@ -408,13 +415,14 @@ wlshm_present_canvas (struct frame *f)
       dw = o->damage_w;
       dh = o->damage_h;
     }
-  wlshm_window_present (WLSHM_FRAME_HANDLE (f),
-			cairo_image_surface_get_data (wlshm_canvas),
-			(uint32_t) cairo_image_surface_get_width (wlshm_canvas),
-			(uint32_t) cairo_image_surface_get_height (wlshm_canvas),
-			(uint32_t) cairo_image_surface_get_stride (wlshm_canvas),
-			dx, dy, dw, dh);
-  wlshm_damage_reset (o);
+  if (wlshm_window_present (WLSHM_FRAME_HANDLE (f),
+			    cairo_image_surface_get_data (wlshm_canvas),
+			    (uint32_t) cairo_image_surface_get_width (wlshm_canvas),
+			    (uint32_t) cairo_image_surface_get_height (wlshm_canvas),
+			    (uint32_t) cairo_image_surface_get_stride (wlshm_canvas),
+			    dx, dy, dw, dh)
+      == 0)
+    wlshm_damage_reset (o);
 }
 
 /* Public wrapper: present frame F's canvas (used by the tooltip code, which
@@ -5025,12 +5033,15 @@ wlshm_menu_modal_loop (struct frame *f, uint64_t pw,
 	  surf = wlshm_render_menu (f, rows, n, hi, &tw, &th, &trh, &tsh);
 	  /* Skip presenting if the surface failed to allocate (NULL data).  */
 	  if (surf)
-	    wlshm_window_present (pw, cairo_image_surface_get_data (surf),
-				 (uint32_t) cairo_image_surface_get_width (surf),
-				 (uint32_t) cairo_image_surface_get_height (surf),
-				 cairo_image_surface_get_stride (surf),
-				 0, 0, 0, 0);
-	  need_draw = false;
+	    need_draw
+	      = wlshm_window_present (
+		  pw, cairo_image_surface_get_data (surf),
+		  (uint32_t) cairo_image_surface_get_width (surf),
+		  (uint32_t) cairo_image_surface_get_height (surf),
+		  cairo_image_surface_get_stride (surf), 0, 0, 0, 0)
+		!= 0;
+	  else
+	    need_draw = false;
 	}
       if (wlfd >= 0)
 	{
