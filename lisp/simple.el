@@ -11090,6 +11090,20 @@ call `normal-erase-is-backspace-mode' (which see) instead."
 	   (normal-erase-is-backspace-mode (or value 0)))
 	 (set-default symbol value)))
 
+(defun normal-erase-is-backspace--default-p ()
+  "Return non-nil when Backspace and Delete should remain distinct."
+  (and (not noninteractive)
+       (or (memq system-type '(ms-dos windows-nt))
+           (memq window-system '(w32 ns pgtk wlshm haiku android))
+           (and (eq window-system 'x)
+                (fboundp 'x-backspace-delete-keys-p)
+                (x-backspace-delete-keys-p))
+           ;; If the terminal Emacs is running on has erase char set to ^H,
+           ;; use Backspace for deleting backward and Delete for deleting
+           ;; forward.
+           (and (null window-system)
+                (eq tty-erase-char ?\^H)))))
+
 (defun normal-erase-is-backspace-setup-frame (&optional frame)
   "Set up `normal-erase-is-backspace-mode' on FRAME, if necessary."
   (unless frame (setq frame (selected-frame)))
@@ -11097,17 +11111,7 @@ call `normal-erase-is-backspace-mode' (which see) instead."
     (unless (terminal-parameter nil 'normal-erase-is-backspace)
       (normal-erase-is-backspace-mode
        (if (if (eq normal-erase-is-backspace 'maybe)
-               (and (not noninteractive)
-                    (or (memq system-type '(ms-dos windows-nt))
-			(memq window-system '(w32 ns pgtk haiku android))
-                        (and (eq window-system 'x)
-                             (fboundp 'x-backspace-delete-keys-p)
-                             (x-backspace-delete-keys-p))
-                        ;; If the terminal Emacs is running on has erase char
-                        ;; set to ^H, use the Backspace key for deleting
-                        ;; backward, and the Delete key for deleting forward.
-                        (and (null window-system)
-                             (eq tty-erase-char ?\^H))))
+               (normal-erase-is-backspace--default-p)
              normal-erase-is-backspace)
            1 0)))))
 

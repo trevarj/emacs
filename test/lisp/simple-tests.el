@@ -24,6 +24,14 @@
 (require 'ert-x)
 (eval-when-compile (require 'cl-lib))
 
+(declare-function normal-erase-is-backspace--default-p "simple")
+
+(ert-deftest simple-test-normal-erase-is-backspace-wlshm ()
+  "Treat a wlshm frame as having distinct Backspace and Delete keys."
+  (let ((window-system 'wlshm)
+        (noninteractive nil))
+    (should (normal-erase-is-backspace--default-p))))
+
 (defun simple-test--buffer-substrings ()
   "Return cons of buffer substrings before and after point."
   (cons (buffer-substring (point-min) (point))
